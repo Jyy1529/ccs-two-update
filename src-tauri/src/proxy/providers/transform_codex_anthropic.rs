@@ -2861,6 +2861,27 @@ mod tests {
     }
 
     #[test]
+    fn test_request_tool_schema_type_is_normalized_to_object() {
+        let input = json!({
+            "model": "c",
+            "max_output_tokens": 100,
+            "input": [{ "role": "user", "content": "hi" }],
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "parameters": { "type": null, "properties": { "id": { "type": "string" } } }
+            }]
+        });
+
+        let result = responses_request_to_anthropic(input, 4096).unwrap();
+        assert_eq!(result["tools"][0]["input_schema"]["type"], "object");
+        assert_eq!(
+            result["tools"][0]["input_schema"]["properties"]["id"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
     fn test_request_unknown_object_tool_choice_degrades_to_auto() {
         let input = json!({
             "model": "c",

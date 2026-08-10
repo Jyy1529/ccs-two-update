@@ -7,6 +7,8 @@
 use axum::http::header::HeaderMap;
 use std::io::Read;
 
+const LIMITED_DECODER_WINDOW_LOG_MAX: u32 = 23;
+
 /// 把 content-encoding 值拆成有序 coding 列表（去掉 identity 与空值）。
 ///
 /// HTTP 允许堆叠编码（如 `gzip, zstd`），各 coding 以逗号分隔；亦允许重复
@@ -65,22 +67,273 @@ impl From<DecompressError> for std::io::Error {
     }
 }
 
-/// 从解码器读取解压输出，最多 `max_bytes`；一旦输出超过预算立即中止读取并返回
-/// [`DecompressError::TooLarge`] —— 压缩炸弹在预算耗尽处被截停，而不是先在内存里
-/// 完整展开再比较大小。
-fn read_with_output_limit<R: Read>(
-    reader: R,
-    max_bytes: usize,
-) -> Result<Vec<u8>, DecompressError> {
-    // saturating_add：无界调用（max_bytes = usize::MAX）时预算保持 usize::MAX
-    let budget = max_bytes.saturating_add(1) as u64;
-    let mut limited = reader.take(budget);
-    let mut out = Vec::new();
-    limited.read_to_end(&mut out)?;
-    if out.len() > max_bytes {
-        return Err(DecompressError::TooLarge { limit: max_bytes });
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LimitedDecompressedBody {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) truncated: bool,
+}
+
+fn brotli_window_log(body: &[u8]) -> Result<u32, std::io::Error> {
+    let first = *body.first().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "brotli header is incomplete",
+        )
+    })?;
+
+    if first & 1 == 0 {
+        return Ok(16);
     }
-    Ok(out)
+    if let Some(window_log) = match first & 0x0f {
+        0x03 => Some(18),
+        0x05 => Some(19),
+        0x07 => Some(20),
+        0x09 => Some(21),
+        0x0b => Some(22),
+        0x0d => Some(23),
+        0x0f => Some(24),
+        _ => None,
+    } {
+        return Ok(window_log);
+    }
+    if let Some(window_log) = match first & 0x7f {
+        0x71 => Some(15),
+        0x61 => Some(14),
+        0x51 => Some(13),
+        0x41 => Some(12),
+        0x31 => Some(11),
+        0x21 => Some(10),
+        0x01 => Some(17),
+        _ => None,
+    } {
+        return Ok(window_log);
+    }
+    if first & 0x80 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid brotli window bits",
+        ));
+    }
+
+    let second = *body.get(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "brotli large-window header is incomplete",
+        )
+    })?;
+    let window_log = u32::from(second & 0x3f);
+    if !(10..=30).contains(&window_log) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid brotli large-window bits",
+        ));
+    }
+    Ok(window_log)
+}
+
+fn validate_brotli_window(body: &[u8]) -> Result<(), std::io::Error> {
+    let window_log = brotli_window_log(body)?;
+    if window_log > LIMITED_DECODER_WINDOW_LOG_MAX {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "brotli window log {window_log} exceeds limit {LIMITED_DECODER_WINDOW_LOG_MAX}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_data(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
+}
+
+fn has_zlib_framing(body: &[u8]) -> Result<bool, std::io::Error> {
+    let Some((&cmf, rest)) = body.split_first() else {
+        return Err(invalid_data("deflate body is empty"));
+    };
+    let Some(&flg) = rest.first() else {
+        return Err(invalid_data("deflate header is incomplete"));
+    };
+    let header = (u16::from(cmf) << 8) | u16::from(flg);
+    Ok(cmf & 0x0f == 8 && cmf >> 4 <= 7 && header % 31 == 0)
+}
+
+fn decompress_deflate(
+    body: &[u8],
+    output_limit: Option<usize>,
+    input_truncated: bool,
+) -> Result<LimitedDecompressedBody, std::io::Error> {
+    // RFC 9110 的 deflate 使用 zlib framing。只有 CMF/FLG 明确不构成
+    // RFC 1950 header 时才兼容 raw deflate；合法 zlib header 后的损坏不得回退。
+    let zlib_header = has_zlib_framing(body)?;
+    let format = if zlib_header { "zlib" } else { "raw deflate" };
+    let mut decoder = flate2::Decompress::new(zlib_header);
+    let sentinel_limit = output_limit.map(|limit| limit.saturating_add(1));
+    let mut output = Vec::with_capacity(output_limit.unwrap_or(8 * 1024).min(8 * 1024));
+    let mut buffer = [0u8; 8 * 1024];
+
+    loop {
+        let output_capacity = sentinel_limit
+            .map(|sentinel| sentinel.saturating_sub(output.len()))
+            .unwrap_or(buffer.len())
+            .min(buffer.len());
+        if output_capacity == 0 {
+            return Ok(LimitedDecompressedBody {
+                bytes: output,
+                truncated: true,
+            });
+        }
+
+        let input_offset = decoder.total_in() as usize;
+        let before_in = decoder.total_in();
+        let before_out = decoder.total_out();
+        let flush = if input_offset == body.len() {
+            flate2::FlushDecompress::Finish
+        } else {
+            flate2::FlushDecompress::None
+        };
+        let result =
+            decoder.decompress(&body[input_offset..], &mut buffer[..output_capacity], flush);
+        let consumed = (decoder.total_in() - before_in) as usize;
+        let produced = (decoder.total_out() - before_out) as usize;
+        output.extend_from_slice(&buffer[..produced]);
+
+        if let Some(limit) = output_limit {
+            if output.len() > limit {
+                output.truncate(limit);
+                return Ok(LimitedDecompressedBody {
+                    bytes: output,
+                    truncated: true,
+                });
+            }
+        }
+
+        match result {
+            Ok(flate2::Status::StreamEnd) => {
+                if decoder.total_in() != body.len() as u64 {
+                    return Err(invalid_data(format!("{format} stream has trailing bytes")));
+                }
+                if input_truncated && output.is_empty() {
+                    return Err(invalid_data(format!(
+                        "{format} truncated input produced no output"
+                    )));
+                }
+                return Ok(LimitedDecompressedBody {
+                    bytes: output,
+                    truncated: input_truncated,
+                });
+            }
+            Ok(flate2::Status::Ok | flate2::Status::BufError) => {}
+            Err(error) => {
+                if input_truncated && !output.is_empty() {
+                    return Ok(LimitedDecompressedBody {
+                        bytes: output,
+                        truncated: true,
+                    });
+                }
+                return Err(invalid_data(format!("invalid {format} stream: {error}")));
+            }
+        }
+
+        if consumed == 0 && produced == 0 {
+            if input_truncated && !output.is_empty() {
+                return Ok(LimitedDecompressedBody {
+                    bytes: output,
+                    truncated: true,
+                });
+            }
+            return Err(invalid_data(format!("incomplete {format} stream")));
+        }
+    }
+}
+
+fn read_prefix<R: Read>(
+    mut reader: R,
+    limit: usize,
+    input_truncated: bool,
+) -> Result<LimitedDecompressedBody, std::io::Error> {
+    let sentinel_limit = limit.saturating_add(1);
+    let mut output = Vec::with_capacity(limit.min(8 * 1024));
+    let mut buffer = [0u8; 8 * 1024];
+    let mut saw_eof = false;
+
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(read) => read,
+            Err(_) if input_truncated && !output.is_empty() => {
+                return Ok(LimitedDecompressedBody {
+                    bytes: output,
+                    truncated: true,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        if read == 0 {
+            if saw_eof {
+                return Ok(LimitedDecompressedBody {
+                    bytes: output,
+                    truncated: input_truncated,
+                });
+            }
+            saw_eof = true;
+            continue;
+        }
+        saw_eof = false;
+        let remaining = sentinel_limit.saturating_sub(output.len());
+        let take = read.min(remaining);
+        output.extend_from_slice(&buffer[..take]);
+        if output.len() > limit {
+            output.truncate(limit);
+            return Ok(LimitedDecompressedBody {
+                bytes: output,
+                truncated: true,
+            });
+        }
+    }
+}
+
+fn decompress_brotli(
+    body: &[u8],
+    limit: usize,
+    input_truncated: bool,
+    enforce_window_limit: bool,
+) -> Result<LimitedDecompressedBody, std::io::Error> {
+    if enforce_window_limit {
+        validate_brotli_window(body)?;
+    }
+
+    let cursor = std::io::Cursor::new(body);
+    let mut decoder = brotli::Decompressor::new(cursor, 8 * 1024);
+    let decoded = read_prefix(&mut decoder, limit, input_truncated)?;
+    if !decoded.truncated && decoder.get_ref().position() != body.len() as u64 {
+        return Err(invalid_data("brotli stream has trailing bytes"));
+    }
+    Ok(decoded)
+}
+
+fn decompress_single_limited(
+    coding: &str,
+    body: &[u8],
+    limit: usize,
+    input_truncated: bool,
+) -> Result<Option<LimitedDecompressedBody>, std::io::Error> {
+    match coding {
+        "gzip" | "x-gzip" => read_prefix(
+            flate2::read::MultiGzDecoder::new(body),
+            limit,
+            input_truncated,
+        )
+        .map(Some),
+        "deflate" => decompress_deflate(body, Some(limit), input_truncated).map(Some),
+        "br" => decompress_brotli(body, limit, input_truncated, true).map(Some),
+        "zstd" | "zst" => {
+            let mut decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(body))?;
+            decoder.window_log_max(LIMITED_DECODER_WINDOW_LOG_MAX)?;
+            read_prefix(decoder, limit, input_truncated).map(Some)
+        }
+        _ => Ok(None),
+    }
 }
 
 /// 解压单个 content-coding，输出上限 `max_output_bytes`。未知编码返回 `Ok(None)`。
@@ -89,35 +342,37 @@ fn decompress_single(
     body: &[u8],
     max_output_bytes: usize,
 ) -> Result<Option<Vec<u8>>, DecompressError> {
+    if max_output_bytes != usize::MAX {
+        return decompress_single_limited(coding, body, max_output_bytes, false)
+            .map_err(DecompressError::Io)?
+            .map(|decoded| {
+                if decoded.truncated {
+                    Err(DecompressError::TooLarge {
+                        limit: max_output_bytes,
+                    })
+                } else {
+                    Ok(decoded.bytes)
+                }
+            })
+            .transpose();
+    }
+
     match coding {
         "gzip" | "x-gzip" => {
-            let decoder = flate2::read::GzDecoder::new(body);
-            Ok(Some(read_with_output_limit(decoder, max_output_bytes)?))
+            let mut decoder = flate2::read::MultiGzDecoder::new(body);
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed)?;
+            Ok(Some(decompressed))
         }
-        "deflate" => {
-            // RFC 9110: deflate 指 zlib 包裹格式；但部分上游 / 客户端发 raw deflate 流。
-            // 先按规范尝试 zlib，失败再回退 raw —— 否则合规来源必然解压失败，
-            // 原始压缩字节会被 fail-open 透传给 JSON 解析（#2234 形态 C 之一）。
-            let zlib = flate2::read::ZlibDecoder::new(body);
-            match read_with_output_limit(zlib, max_output_bytes) {
-                Ok(decompressed) => Ok(Some(decompressed)),
-                Err(zlib_err) => {
-                    // TooLarge 也要回退：raw 流被误判为 zlib 时可能在预算处截停，
-                    // 回退后若真是炸弹，raw 解码同样会触发 TooLarge。
-                    log::debug!("deflate 按 zlib 解压失败（{zlib_err}），回退 raw deflate");
-                    let raw = flate2::read::DeflateDecoder::new(body);
-                    Ok(Some(read_with_output_limit(raw, max_output_bytes)?))
-                }
-            }
-        }
-        "br" => {
-            let decoder = brotli::Decompressor::new(std::io::Cursor::new(body), 4096);
-            Ok(Some(read_with_output_limit(decoder, max_output_bytes)?))
-        }
+        "deflate" => decompress_deflate(body, None, false)
+            .map(|decoded| Some(decoded.bytes))
+            .map_err(DecompressError::Io),
+        "br" => decompress_brotli(body, usize::MAX, false, false)
+            .map(|decoded| Some(decoded.bytes))
+            .map_err(DecompressError::Io),
         "zstd" | "zst" => {
-            // Codex 登录态对请求体启用 zstd（Compression::Zstd）；上游也可能 zstd 压缩响应。
-            let decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(body))?;
-            Ok(Some(read_with_output_limit(decoder, max_output_bytes)?))
+            let decompressed = zstd::stream::decode_all(std::io::Cursor::new(body))?;
+            Ok(Some(decompressed))
         }
         _ => Ok(None),
     }
@@ -167,6 +422,42 @@ pub(crate) fn decompress_body(
     decompress_body_with_limit(content_encoding, body, usize::MAX).map_err(Into::into)
 }
 
+/// 有界解压错误正文。每一层解码输入与输出最多保留 `limit` 字节，
+/// `initial_input_truncated` 表示调用方传入的已经是 wire body 前缀。
+pub(crate) fn decompress_body_limited(
+    content_encoding: &str,
+    body: &[u8],
+    limit: usize,
+    initial_input_truncated: bool,
+) -> Result<Option<LimitedDecompressedBody>, std::io::Error> {
+    let codings = split_codings(content_encoding);
+    if codings.is_empty() {
+        return Ok(None);
+    }
+    if !codings.iter().all(|coding| is_single_supported(coding)) {
+        log::warn!("不支持的 content-encoding: {content_encoding}，跳过有界解压");
+        return Ok(None);
+    }
+
+    let initial_input = &body[..body.len().min(limit)];
+    let mut data: Option<Vec<u8>> = None;
+    let mut input_truncated = initial_input_truncated || body.len() > limit;
+    for coding in codings.iter().rev() {
+        let input = data.as_deref().unwrap_or(initial_input);
+        let Some(decoded) = decompress_single_limited(coding, input, limit, input_truncated)?
+        else {
+            return Ok(None);
+        };
+        input_truncated = decoded.truncated;
+        data = Some(decoded.bytes);
+    }
+
+    Ok(data.map(|bytes| LimitedDecompressedBody {
+        bytes,
+        truncated: input_truncated,
+    }))
+}
+
 /// 该 content-encoding（含堆叠，如 `gzip, zstd`）是否全部可被解压。
 ///
 /// 请求侧用它做闸门：无法解压的压缩体不能透传给 JSON 解析，需直接拒绝。
@@ -200,6 +491,87 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
 
+    fn gzip_member(payload: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, payload).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn brotli_stream(payload: &[u8]) -> Vec<u8> {
+        let mut encoder = brotli::CompressorWriter::new(Vec::new(), 4096, 5, 22);
+        std::io::Write::write_all(&mut encoder, payload).unwrap();
+        encoder.into_inner()
+    }
+
+    fn brotli_stream_with_window(payload: &[u8], window_log: u32) -> Vec<u8> {
+        let mut encoder = brotli::CompressorWriter::new(Vec::new(), 4096, 5, window_log);
+        std::io::Write::write_all(&mut encoder, payload).unwrap();
+        encoder.into_inner()
+    }
+
+    fn zlib_stream(payload: &[u8]) -> Vec<u8> {
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, payload).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn raw_deflate_stream(payload: &[u8]) -> Vec<u8> {
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, payload).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn deterministic_payload(len: usize) -> Vec<u8> {
+        let mut state = 0x7a5b_31d2_u32;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect()
+    }
+
+    fn brotli_stream_with_exact_len(target_len: usize) -> (Vec<u8>, Vec<u8>) {
+        let source = deterministic_payload(target_len + 256);
+        for payload_len in target_len.saturating_sub(128)..=target_len + 128 {
+            let payload = source[..payload_len].to_vec();
+            let compressed = brotli_stream(&payload);
+            if compressed.len() == target_len {
+                return (payload, compressed);
+            }
+        }
+        panic!("failed to construct deterministic {target_len}-byte brotli stream");
+    }
+
+    #[test]
+    fn decompress_body_gzip_reads_all_members() {
+        let mut compressed = gzip_member(b"first-");
+        compressed.extend_from_slice(&gzip_member(b"second"));
+
+        for coding in ["gzip", "x-gzip"] {
+            let decompressed = decompress_body(coding, &compressed).unwrap().unwrap();
+            assert_eq!(decompressed, b"first-second", "{coding}");
+        }
+    }
+
+    #[test]
+    fn decompress_body_limited_gzip_reads_all_members() {
+        let mut compressed = gzip_member(b"first-");
+        compressed.extend_from_slice(&gzip_member(b"second"));
+
+        for coding in ["gzip", "x-gzip"] {
+            let decompressed = decompress_body_limited(coding, &compressed, 1024, false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(decompressed.bytes, b"first-second", "{coding}");
+            assert!(!decompressed.truncated, "{coding}");
+        }
+    }
+
     #[test]
     fn decompress_body_deflate_handles_zlib_wrapped_per_rfc9110() {
         // RFC 9110 规范的 deflate = zlib 包裹格式（合规来源发的就是这个）
@@ -227,12 +599,254 @@ mod tests {
     }
 
     #[test]
+    fn decompress_body_limited_deflate_distinguishes_exact_limit_from_expansion() {
+        const LIMIT: usize = 8 * 1024;
+        let encoders: [(&str, fn(&[u8]) -> Vec<u8>); 2] =
+            [("zlib", zlib_stream), ("raw", raw_deflate_stream)];
+
+        for (format, encode) in encoders {
+            for payload_len in [LIMIT, LIMIT + 1] {
+                let payload = vec![b'x'; payload_len];
+                let compressed = encode(&payload);
+                assert!(
+                    compressed.len() < LIMIT,
+                    "{format} fixture must exercise the decoded-output cap"
+                );
+
+                let decoded = decompress_body_limited("deflate", &compressed, LIMIT, false)
+                    .unwrap()
+                    .unwrap();
+
+                assert_eq!(decoded.bytes, payload[..LIMIT], "{format} {payload_len}");
+                assert_eq!(
+                    decoded.truncated,
+                    payload_len > LIMIT,
+                    "{format} {payload_len}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decompress_body_deflate_rejects_zlib_trailing_garbage() {
+        let compressed = [zlib_stream(b"hello").as_slice(), b"trailing"].concat();
+
+        let error = decompress_body("deflate", &compressed).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decompress_body_deflate_rejects_raw_trailing_garbage() {
+        let compressed = [raw_deflate_stream(b"hello").as_slice(), b"trailing"].concat();
+
+        let error = decompress_body("deflate", &compressed).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decompress_body_deflate_rejects_empty_body() {
+        let error = decompress_body("deflate", b"").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decompress_body_limited_deflate_rejects_zlib_trailing_garbage() {
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, b"hello").unwrap();
+        let compressed = [encoder.finish().unwrap().as_slice(), b"trailing"].concat();
+
+        let error = decompress_body_limited("deflate", &compressed, 1024, false).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decompress_body_limited_deflate_rejects_raw_trailing_garbage() {
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, b"hello").unwrap();
+        let compressed = [encoder.finish().unwrap().as_slice(), b"trailing"].concat();
+
+        let error = decompress_body_limited("deflate", &compressed, 1024, false).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decompress_body_limited_deflate_rejects_truncated_zlib_adler() {
+        let mut compressed = zlib_stream(&deterministic_payload(4096));
+        compressed.pop();
+
+        let error = decompress_body_limited("deflate", &compressed, 8192, false).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decompress_body_limited_deflate_rejects_truncated_zlib_payload() {
+        let mut compressed = zlib_stream(&deterministic_payload(4096));
+        compressed.truncate(compressed.len() / 2);
+
+        let error = decompress_body_limited("deflate", &compressed, 8192, false).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decompress_body_limited_deflate_rejects_truncated_raw_stream() {
+        let mut compressed = raw_deflate_stream(&deterministic_payload(4096));
+        compressed.pop();
+
+        let error = decompress_body_limited("deflate", &compressed, 8192, false).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decompress_body_limited_deflate_allows_truncated_input_after_output() {
+        let payload = deterministic_payload(4096);
+        let mut compressed = zlib_stream(&payload);
+        compressed.truncate(compressed.len() - 4);
+
+        let decoded = decompress_body_limited("deflate", &compressed, 8192, true)
+            .unwrap()
+            .unwrap();
+
+        assert!(decoded.truncated);
+        assert!(!decoded.bytes.is_empty());
+        assert!(payload.starts_with(&decoded.bytes));
+    }
+
+    #[test]
+    fn decompress_body_limited_deflate_rejects_truncated_input_without_output() {
+        let compressed = zlib_stream(b"hello");
+
+        let error = decompress_body_limited("deflate", &compressed[..2], 1024, true).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decompress_body_limited_rejects_truncated_inner_raw_deflate() {
+        let mut inner = raw_deflate_stream(&deterministic_payload(4096));
+        inner.pop();
+        let stacked = zstd::stream::encode_all(std::io::Cursor::new(inner), 0).unwrap();
+
+        let error = decompress_body_limited("deflate, zstd", &stacked, 8192, false).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn decompress_body_zstd_roundtrip() {
         // Codex 登录态发的就是 zstd 压缩请求体
         let payload = br#"{"hello":"world","n":42}"#;
         let compressed = zstd::stream::encode_all(std::io::Cursor::new(&payload[..]), 0).unwrap();
         let decompressed = decompress_body("zstd", &compressed).unwrap().unwrap();
         assert_eq!(decompressed, payload);
+    }
+
+    #[test]
+    fn brotli_window_preflight_rejects_over_budget_header() {
+        validate_brotli_window(&[0x0b]).unwrap();
+
+        let error = validate_brotli_window(&[0x11, 30]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decompress_body_limited_brotli_rejects_valid_window_24_stream() {
+        let payload = b"valid brotli window 24 stream";
+        let compressed = brotli_stream_with_window(payload, 24);
+        assert_eq!(brotli_window_log(&compressed).unwrap(), 24);
+
+        let unrestricted = decompress_body("br", &compressed).unwrap().unwrap();
+        assert_eq!(unrestricted, payload);
+
+        let error = decompress_body_limited("br", &compressed, 1024, false).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("window log 24 exceeds limit 23"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn decompress_body_limited_brotli_rejects_trailing_garbage() {
+        let compressed = brotli_stream(b"hello");
+        let decoded = decompress_body_limited("br", &compressed, 1024, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.bytes, b"hello");
+        assert!(!decoded.truncated);
+
+        let with_trailing = [compressed.as_slice(), b"trailing garbage"].concat();
+        let error = decompress_body_limited("br", &with_trailing, 1024, false).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decompress_body_brotli_rejects_trailing_garbage() {
+        let compressed = [brotli_stream(b"hello").as_slice(), b"trailing garbage"].concat();
+
+        let error = decompress_body("br", &compressed).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decompress_body_brotli_rejects_trailing_after_exact_input_buffers() {
+        for compressed_len in [8 * 1024, 16 * 1024] {
+            let (payload, compressed) = brotli_stream_with_exact_len(compressed_len);
+            let limit = compressed_len * 2;
+
+            let unrestricted = decompress_body("br", &compressed).unwrap().unwrap();
+            assert_eq!(unrestricted, payload, "{compressed_len}");
+            let limited = decompress_body_limited("br", &compressed, limit, false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(limited.bytes, payload, "{compressed_len}");
+            assert!(!limited.truncated, "{compressed_len}");
+
+            let with_trailing = [compressed.as_slice(), b"trailing"].concat();
+            let unrestricted_error = decompress_body("br", &with_trailing).unwrap_err();
+            assert_eq!(
+                unrestricted_error.kind(),
+                std::io::ErrorKind::InvalidData,
+                "{compressed_len}"
+            );
+            let limited_error =
+                decompress_body_limited("br", &with_trailing, limit, false).unwrap_err();
+            assert_eq!(
+                limited_error.kind(),
+                std::io::ErrorKind::InvalidData,
+                "{compressed_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn decompress_body_limited_zstd_rejects_over_budget_window() {
+        let over_budget_empty_frame = [
+            0x28, 0xb5, 0x2f, 0xfd, // magic
+            0x00, // frame header descriptor: non-single-segment, no content size
+            0x70, // window descriptor: 1 << 24
+            0x01, 0x00, 0x00, // empty last raw block
+        ];
+
+        let unrestricted = decompress_body("zstd", &over_budget_empty_frame)
+            .unwrap()
+            .unwrap();
+        assert!(unrestricted.is_empty());
+
+        let error =
+            decompress_body_limited("zstd", &over_budget_empty_frame, 1024, false).unwrap_err();
+        let message = error.to_string().to_ascii_lowercase();
+        assert!(
+            message.contains("window") || message.contains("memory"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn decompress_body_limited_zstd_rejects_trailing_garbage() {
+        let compressed = zstd::stream::encode_all(std::io::Cursor::new(b"hello"), 0).unwrap();
+        let with_trailing = [compressed.as_slice(), b"trailing"].concat();
+
+        decompress_body_limited("zstd", &with_trailing, 1024, false).unwrap_err();
     }
 
     #[test]
@@ -253,6 +867,117 @@ mod tests {
         // 堆叠里只要有一个不支持，就整体保头透传
         let result = decompress_body("snappy, zstd", b"\x00\x01\x02\x03").unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn decompress_body_limited_caps_gzip_expansion() {
+        let payload = vec![b'x'; 64 * 1024];
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let decompressed = decompress_body_limited("gzip", &compressed, 1024, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decompressed.bytes.len(), 1024);
+        assert!(decompressed.truncated);
+    }
+
+    #[test]
+    fn decompress_body_limited_caps_brotli_expansion() {
+        let payload = vec![b'x'; 64 * 1024];
+        let compressed = brotli_stream(&payload);
+
+        let decompressed = decompress_body_limited("br", &compressed, 1024, false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(decompressed.bytes.len(), 1024);
+        assert!(decompressed.truncated);
+        assert!(payload.starts_with(&decompressed.bytes));
+    }
+
+    #[test]
+    fn decompress_body_limited_caps_zstd_expansion() {
+        let payload = vec![b'x'; 64 * 1024];
+        let compressed = zstd::stream::encode_all(std::io::Cursor::new(&payload), 0).unwrap();
+
+        let decompressed = decompress_body_limited("zstd", &compressed, 1024, false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(decompressed.bytes.len(), 1024);
+        assert!(decompressed.truncated);
+        assert!(payload.starts_with(&decompressed.bytes));
+    }
+
+    #[test]
+    fn decompress_body_limited_preserves_small_payload() {
+        let payload = br#"{"ok":true}"#;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let decompressed = decompress_body_limited("gzip", &compressed, 1024, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decompressed.bytes, payload);
+        assert!(!decompressed.truncated);
+    }
+
+    #[test]
+    fn decompress_body_limited_stacked_small_payload_roundtrip() {
+        let payload = br#"{"stacked":true}"#;
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gzip, payload).unwrap();
+        let gzipped = gzip.finish().unwrap();
+        let stacked = zstd::stream::encode_all(std::io::Cursor::new(gzipped), 0).unwrap();
+
+        let decompressed = decompress_body_limited("gzip, zstd", &stacked, 1024, false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(decompressed.bytes, payload);
+        assert!(!decompressed.truncated);
+    }
+
+    #[test]
+    fn decompress_body_limited_stacked_truncation_preserves_decoded_prefix() {
+        let payload = vec![b'x'; 4096];
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
+        std::io::Write::write_all(&mut gzip, &payload).unwrap();
+        let gzipped = gzip.finish().unwrap();
+        let stacked = zstd::stream::encode_all(std::io::Cursor::new(gzipped), 0).unwrap();
+        let limit = 128;
+        assert!(stacked.len() <= limit);
+
+        let decompressed = decompress_body_limited("gzip, zstd", &stacked, limit, false)
+            .unwrap()
+            .unwrap();
+
+        assert!(decompressed.truncated);
+        assert!(!decompressed.bytes.is_empty());
+        assert!(decompressed.bytes.len() <= limit);
+        assert!(payload.starts_with(&decompressed.bytes));
+    }
+
+    #[test]
+    fn decompress_body_limited_truncated_wire_preserves_decoded_prefix() {
+        let payload = vec![b'x'; 4096];
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
+        std::io::Write::write_all(&mut gzip, &payload).unwrap();
+        let compressed = gzip.finish().unwrap();
+        let limit = 128;
+        assert!(compressed.len() > limit);
+
+        let decompressed = decompress_body_limited("gzip", &compressed[..limit], limit, true)
+            .unwrap()
+            .unwrap();
+
+        assert!(decompressed.truncated);
+        assert!(!decompressed.bytes.is_empty());
+        assert!(decompressed.bytes.len() <= limit);
+        assert!(payload.starts_with(&decompressed.bytes));
     }
 
     #[test]

@@ -5,6 +5,7 @@
 pub mod body_filter;
 pub mod cache_injector;
 pub mod circuit_breaker;
+pub(crate) mod codex_auto_review;
 pub(crate) mod content_encoding;
 pub mod copilot_optimizer;
 pub mod error;
@@ -21,6 +22,7 @@ pub(crate) mod json_canonical;
 pub mod log_codes;
 pub mod media_sanitizer;
 pub mod model_mapper;
+pub(crate) mod provider_retry;
 pub mod provider_router;
 pub mod providers;
 pub mod response_processor;

@@ -29,6 +29,10 @@ fn merge_settings_for_save(
         }
         _ => {}
     }
+    if incoming.provider_retry_enabled.is_none() {
+        incoming.provider_retry_enabled = existing.provider_retry_enabled;
+    }
+
     match (&mut incoming.s3_sync, &existing.s3_sync) {
         // incoming 没有 s3 → 保留现有
         (None, _) => {
@@ -174,19 +178,41 @@ pub async fn restore_codex_unified_history() -> Result<CodexUnifyHistoryRestoreR
 #[tauri::command]
 pub async fn restart_app(app: AppHandle) -> Result<bool, String> {
     crate::save_window_state_before_exit(&app);
+    // app_config_dir 变更后的新实例会切到新数据库，拿不到旧库里的 Live 备份。
+    // 因此必须在返回成功并安排重启前同步完成旧实例清理；Role 禁用失败会取消重启。
+    crate::cleanup_before_exit(&app)
+        .await
+        .map_err(|error| format!("重启前禁用 Codex Agent Role 失败，重启已取消: {error}"))?;
 
     // 在后台延迟重启，让函数有时间返回响应
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         // app.restart() 走 RESTART_EXIT_CODE 路径，ExitRequested 处理器会直接
-        // 放行给 Tauri 默认 re-exec，不执行代理/Live 清理。但本命令用于
-        // app_config_dir 变更后的重启：新实例会切到新数据库，拿不到旧库里的
-        // Live 备份，无法恢复被接管的 Live 配置。因此必须趁旧实例的事件循环
-        // 仍存活，在这里同步完成恢复（保留代理状态，新实例启动时自动重新接管）。
-        crate::cleanup_before_exit(&app).await;
+        // 放行给 Tauri 默认 re-exec，不重复执行代理/Live 清理。
         app.restart();
     });
     Ok(true)
+}
+
+async fn install_update_after_cleanup<C, CleanupFut, I, R>(
+    cleanup: C,
+    install: I,
+    recover: R,
+) -> Result<(), String>
+where
+    C: FnOnce() -> CleanupFut,
+    CleanupFut: std::future::Future<Output = Result<(), String>>,
+    I: FnOnce() -> Result<(), String>,
+    R: FnOnce(&str),
+{
+    cleanup().await?;
+    match install() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            recover(&error);
+            Err(error)
+        }
+    }
 }
 
 /// 下载并安装应用更新，然后由后端直接重启应用。
@@ -238,27 +264,52 @@ pub async fn install_update_and_restart(app: AppHandle) -> Result<bool, String> 
         // NIM_DELETE，会残留死图标——与托盘"退出"路径相同的问题）。
         // 因此清理只能放在 install 前执行，且必须显式移除托盘图标。
         crate::save_window_state_before_exit(&app);
-        crate::cleanup_before_exit(&app).await;
-        crate::remove_tray_icon_before_exit(&app);
-        crate::destroy_single_instance_lock(&app);
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        update.install(bytes).map_err(|e| {
-            format!(
-                "Windows 更新安装失败: {e}。已执行退出前清理，代理或 Live 接管可能已暂停；请重启应用或重新开启代理后再试。"
-            )
-        })?;
+        let recovery_app = app.clone();
+        install_update_after_cleanup(
+            || async {
+                crate::cleanup_before_exit(&app).await.map_err(|error| {
+                    format!("更新安装前禁用 Codex Agent Role 失败，安装已取消: {error}")
+                })?;
+                crate::remove_tray_icon_before_exit(&app);
+                crate::destroy_single_instance_lock(&app);
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                Ok(())
+            },
+            move || {
+                update
+                    .install(bytes)
+                    .map_err(|e| format!("Windows 更新安装失败: {e}"))
+            },
+            move |error| {
+                log::error!("{error}；正在重启当前版本以恢复代理和 Codex Agent Role");
+                crate::restart_process(&recovery_app);
+            },
+        )
+        .await?;
         Ok(true)
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        // macOS/Linux install() 会返回；先安装，避免安装失败时误停代理/撤回接管。
-        update
-            .install(bytes)
-            .map_err(|e| format!("安装更新失败: {e}"))?;
-
         crate::save_window_state_before_exit(&app);
-        crate::cleanup_before_exit(&app).await;
+        let recovery_app = app.clone();
+        install_update_after_cleanup(
+            || async {
+                crate::cleanup_before_exit(&app).await.map_err(|error| {
+                    format!("更新安装前禁用 Codex Agent Role 失败，安装已取消: {error}")
+                })
+            },
+            move || {
+                update
+                    .install(bytes)
+                    .map_err(|e| format!("安装更新失败: {e}"))
+            },
+            move |error| {
+                log::error!("{error}；正在重启当前版本以恢复代理和 Codex Agent Role");
+                crate::restart_process(&recovery_app);
+            },
+        )
+        .await?;
 
         log::info!("应用更新安装完成，正在重启应用");
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -314,13 +365,86 @@ pub async fn set_auto_launch(enabled: bool) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::merge_settings_for_save;
+    use super::{install_update_after_cleanup, merge_settings_for_save};
     use crate::settings::{
         AppSettings, CodexOfficialHistoryUnifyMigration, CodexProviderTemplateMigration,
         CodexThirdPartyHistoryProviderBucketMigration, LocalMigrations, S3SyncSettings,
         WebDavSyncSettings,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
+    #[tokio::test]
+    async fn update_cleanup_failure_blocks_install_and_recovery() {
+        let install_called = Arc::new(AtomicBool::new(false));
+        let recover_called = Arc::new(AtomicBool::new(false));
+        let install_observer = Arc::clone(&install_called);
+        let recover_observer = Arc::clone(&recover_called);
+
+        let result = install_update_after_cleanup(
+            || async { Err("injected role disable failure".to_string()) },
+            move || {
+                install_observer.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            move |_| {
+                recover_observer.store(true, Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!install_called.load(Ordering::SeqCst));
+        assert!(!recover_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn update_install_failure_runs_recovery_after_cleanup() {
+        let recover_called = Arc::new(AtomicBool::new(false));
+        let recover_observer = Arc::clone(&recover_called);
+
+        let result = install_update_after_cleanup(
+            || async { Ok(()) },
+            || Err("injected install failure".to_string()),
+            move |error| {
+                assert_eq!(error, "injected install failure");
+                recover_observer.store(true, Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert_eq!(result, Err("injected install failure".to_string()));
+        assert!(recover_called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn save_settings_should_preserve_existing_provider_retry_switch_when_omitted() {
+        let existing = AppSettings {
+            provider_retry_enabled: Some(false),
+            ..AppSettings::default()
+        };
+        let incoming = AppSettings::default();
+
+        let merged = merge_settings_for_save(incoming, &existing);
+
+        assert_eq!(merged.provider_retry_enabled, Some(false));
+    }
+
+    #[test]
+    fn save_settings_should_keep_incoming_provider_retry_switch() {
+        let existing = AppSettings {
+            provider_retry_enabled: Some(false),
+            ..AppSettings::default()
+        };
+        let incoming = AppSettings {
+            provider_retry_enabled: Some(true),
+            ..AppSettings::default()
+        };
+
+        let merged = merge_settings_for_save(incoming, &existing);
+
+        assert_eq!(merged.provider_retry_enabled, Some(true));
+    }
     #[test]
     fn save_settings_should_preserve_existing_webdav_when_payload_omits_it() {
         let existing = AppSettings {

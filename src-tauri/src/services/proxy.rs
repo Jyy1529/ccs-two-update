@@ -6,20 +6,23 @@ use crate::app_config::AppType;
 use crate::config::{get_claude_settings_path, read_json_file, write_json_file};
 use crate::database::Database;
 use crate::provider::Provider;
-use crate::proxy::server::ProxyServer;
+use crate::proxy::server::{ProxyServer, ProxyServerReuseState};
 use crate::proxy::switch_lock::SwitchLockManager;
 use crate::proxy::types::*;
 use crate::services::provider::{
     build_effective_settings_with_common_config, write_live_with_common_config,
 };
 use serde_json::{json, Map, Value};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use tauri::Emitter;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 /// 用于接管 Live 配置时的占位符（避免客户端提示缺少 key，同时不泄露真实 Token）
 const PROXY_TOKEN_PLACEHOLDER: &str = "PROXY_MANAGED";
+const CODEX_AGENT_ROLE_LOOPBACK_REQUIRED: &str = "codex_agent_role_loopback_required";
+const TAKEOVER_APP_LOCK_ORDER: [&str; 4] = ["claude", "codex", "gemini", "grokbuild"];
 
 /// 代理接管模式下需要从 Claude Live 配置中移除的"模型覆盖"字段。
 ///
@@ -57,10 +60,32 @@ enum ClaudeTakeoverAuthPolicy {
 #[derive(Clone)]
 pub struct ProxyService {
     db: Arc<Database>,
+    /// Serializes compound proxy mutations without replacing the v3.19 lifecycle locks.
+    transaction_lock: Arc<Mutex<()>>,
+    lifecycle: Arc<Mutex<()>>,
     server: Arc<RwLock<Option<ProxyServer>>>,
     /// AppHandle，用于传递给 ProxyServer 以支持故障转移时的 UI 更新
     app_handle: Arc<RwLock<Option<tauri::AppHandle>>>,
     switch_locks: SwitchLockManager,
+    #[cfg(test)]
+    start_barrier: Arc<RwLock<Option<Arc<tokio::sync::Barrier>>>>,
+    #[cfg(test)]
+    stop_pause: Arc<RwLock<Option<StopPause>>>,
+    #[cfg(test)]
+    start_install_pause: Arc<RwLock<Option<StopPause>>>,
+    #[cfg(test)]
+    restore_cleanup_pause: Arc<RwLock<Option<StopPause>>>,
+    #[cfg(test)]
+    plain_stop_takeover_check_pause: Arc<RwLock<Option<StopPause>>>,
+    #[cfg(test)]
+    takeover_write_failure: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct StopPause {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -68,14 +93,301 @@ pub struct HotSwitchOutcome {
     pub logical_target_changed: bool,
 }
 
+#[derive(Debug, Clone)]
+struct ProxyRuntimeSnapshot {
+    address: String,
+    port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProxyFileState {
+    Missing,
+    Bytes(Vec<u8>),
+}
+
+#[derive(Debug, Clone)]
+struct ProxyFileSnapshot {
+    path: PathBuf,
+    state: ProxyFileState,
+    rollback_guard: Option<ProxyFileState>,
+}
+
+impl ProxyFileSnapshot {
+    fn capture(path: PathBuf) -> Result<Self, String> {
+        let state = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(format!("事务快照拒绝符号链接: {}", path.display()));
+                }
+                if !metadata.is_file() {
+                    return Err(format!("事务快照目标不是普通文件: {}", path.display()));
+                }
+                ProxyFileState::Bytes(std::fs::read(&path).map_err(|error| {
+                    format!("读取事务快照文件 {} 失败: {error}", path.display())
+                })?)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ProxyFileState::Missing,
+            Err(error) => {
+                return Err(format!("检查事务快照文件 {} 失败: {error}", path.display()));
+            }
+        };
+        Ok(Self {
+            path,
+            state,
+            rollback_guard: None,
+        })
+    }
+
+    fn capture_rollback_guard(&mut self) -> Result<(), String> {
+        self.rollback_guard = Some(self.current_state("记录事务文件产物")?);
+        Ok(())
+    }
+
+    fn restore_if_changed(&self) -> Result<(), String> {
+        let current = self.current_state("读取事务回滚文件")?;
+
+        if current == self.state {
+            return Ok(());
+        }
+        let rollback_guard = self.rollback_guard.as_ref().ok_or_else(|| {
+            format!(
+                "事务回滚文件缺少产物保护状态，保留当前文件: {}",
+                self.path.display()
+            )
+        })?;
+        if &current != rollback_guard {
+            return Err(format!(
+                "事务回滚检测到外部修改，保留当前文件: {}",
+                self.path.display()
+            ));
+        }
+
+        match &self.state {
+            ProxyFileState::Missing => std::fs::remove_file(&self.path).map_err(|error| {
+                format!("删除事务中新建文件 {} 失败: {error}", self.path.display())
+            }),
+            ProxyFileState::Bytes(bytes) => crate::config::atomic_write(&self.path, bytes)
+                .map_err(|error| format!("恢复事务文件 {} 失败: {error}", self.path.display())),
+        }
+    }
+
+    fn current_state(&self, operation: &str) -> Result<ProxyFileState, String> {
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(format!("事务回滚拒绝符号链接: {}", self.path.display()));
+                }
+                if !metadata.is_file() {
+                    return Err(format!("事务回滚目标不是普通文件: {}", self.path.display()));
+                }
+                Ok(ProxyFileState::Bytes(std::fs::read(&self.path).map_err(
+                    |error| format!("{operation} {} 失败: {error}", self.path.display()),
+                )?))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(ProxyFileState::Missing)
+            }
+            Err(error) => Err(format!(
+                "检查事务回滚文件 {} 失败: {error}",
+                self.path.display()
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProxyTransactionSnapshot {
+    proxy_config: ProxyConfig,
+    global_config: GlobalProxyConfig,
+    app_configs: Vec<AppProxyConfig>,
+    live_backups: Vec<(String, Option<LiveBackup>)>,
+    live_files: Vec<ProxyFileSnapshot>,
+    runtime: Option<ProxyRuntimeSnapshot>,
+    active_targets: Vec<ActiveTarget>,
+}
+
+impl ProxyTransactionSnapshot {
+    pub(crate) fn capture_rollback_file_guards(&mut self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for file in &mut self.live_files {
+            if let Err(error) = file.capture_rollback_guard() {
+                errors.push(error);
+            }
+        }
+        errors
+    }
+}
+
+fn codex_agent_role_connect_host(listen_address: &str) -> Result<String, String> {
+    let address = listen_address
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let ip = address.parse::<std::net::IpAddr>().map_err(|error| {
+        format!(
+            "{CODEX_AGENT_ROLE_LOOPBACK_REQUIRED}: 无法解析代理监听地址 {listen_address}: {error}"
+        )
+    })?;
+    let connect_ip = match ip {
+        std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        }
+        std::net::IpAddr::V6(ip) if ip.is_unspecified() => {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        }
+        ip if ip.is_loopback() => ip,
+        _ => {
+            return Err(format!(
+                "{CODEX_AGENT_ROLE_LOOPBACK_REQUIRED}: Codex Agent Role 路由要求代理监听地址为 loopback 或 wildcard，当前地址为 {listen_address}"
+            ));
+        }
+    };
+
+    Ok(match connect_ip {
+        std::net::IpAddr::V4(ip) => ip.to_string(),
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+    })
+}
+
 impl ProxyService {
     pub fn new(db: Arc<Database>) -> Self {
         Self {
             db,
+            transaction_lock: Arc::new(Mutex::new(())),
+            lifecycle: Arc::new(Mutex::new(())),
             server: Arc::new(RwLock::new(None)),
             app_handle: Arc::new(RwLock::new(None)),
             switch_locks: SwitchLockManager::new(),
+            #[cfg(test)]
+            start_barrier: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            stop_pause: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            start_install_pause: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            restore_cleanup_pause: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            plain_stop_takeover_check_pause: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            takeover_write_failure: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    #[cfg(test)]
+    async fn set_start_barrier_for_test(&self, barrier: Arc<tokio::sync::Barrier>) {
+        *self.start_barrier.write().await = Some(barrier);
+    }
+
+    #[cfg(test)]
+    async fn wait_at_start_barrier_for_test(&self) {
+        let barrier = self.start_barrier.read().await.clone();
+        if let Some(barrier) = barrier {
+            barrier.wait().await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn set_stop_pause_for_test(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.stop_pause.write().await = Some(StopPause { entered, release });
+    }
+
+    #[cfg(test)]
+    async fn wait_at_stop_pause_for_test(&self) {
+        let pause = self.stop_pause.write().await.take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn set_start_install_pause_for_test(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.start_install_pause.write().await = Some(StopPause { entered, release });
+    }
+
+    #[cfg(test)]
+    async fn wait_at_start_install_pause_for_test(&self) {
+        let pause = self.start_install_pause.write().await.take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn set_restore_cleanup_pause_for_test(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.restore_cleanup_pause.write().await = Some(StopPause { entered, release });
+    }
+
+    #[cfg(test)]
+    async fn wait_at_restore_cleanup_pause_for_test(&self) {
+        let pause = self.restore_cleanup_pause.write().await.take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn set_plain_stop_takeover_check_pause_for_test(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.plain_stop_takeover_check_pause.write().await = Some(StopPause { entered, release });
+    }
+
+    #[cfg(test)]
+    async fn wait_at_plain_stop_takeover_check_pause_for_test(&self) {
+        let pause = self.plain_stop_takeover_check_pause.write().await.take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn fail_next_takeover_write_for_test(&self, app_type: &str) {
+        *self
+            .takeover_write_failure
+            .lock()
+            .expect("lock takeover write failure") = Some(app_type.to_string());
+    }
+
+    #[cfg(test)]
+    fn maybe_fail_takeover_write_for_test(&self, app_type: &AppType) -> Result<(), String> {
+        let mut failure = self
+            .takeover_write_failure
+            .lock()
+            .expect("lock takeover write failure");
+        if failure.as_deref() == Some(app_type.as_str()) {
+            failure.take();
+            return Err(format!(
+                "injected {} takeover Live write failure",
+                app_type.as_str()
+            ));
+        }
+        Ok(())
+    }
+
+    async fn lock_all_takeover_apps(&self) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+        let mut guards = Vec::with_capacity(TAKEOVER_APP_LOCK_ORDER.len());
+        for app_type in TAKEOVER_APP_LOCK_ORDER {
+            guards.push(self.switch_locks.lock_for_app(app_type).await);
+        }
+        guards
     }
 
     #[cfg(test)]
@@ -524,8 +836,252 @@ impl ProxyService {
         self.switch_locks.lock_for_app(app_type).await
     }
 
+    pub(crate) async fn lock_transaction(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.transaction_lock.clone().lock_owned().await
+    }
+
+    pub(crate) async fn snapshot_transaction_state(
+        &self,
+    ) -> Result<ProxyTransactionSnapshot, String> {
+        let live_files = [
+            get_claude_settings_path(),
+            crate::codex_config::get_codex_config_path(),
+            crate::codex_config::get_codex_auth_path(),
+            crate::codex_config::get_codex_model_catalog_path(),
+            crate::gemini_config::get_gemini_env_path(),
+            crate::grok_config::get_grok_config_path(),
+        ]
+        .into_iter()
+        .map(ProxyFileSnapshot::capture)
+        .collect::<Result<Vec<_>, _>>()?;
+
+        let proxy_config = self
+            .db
+            .get_proxy_config()
+            .await
+            .map_err(|error| format!("读取代理配置快照失败: {error}"))?;
+        let global_config = self
+            .db
+            .get_global_proxy_config()
+            .await
+            .map_err(|error| format!("读取全局代理配置快照失败: {error}"))?;
+
+        let mut app_configs = Vec::new();
+        let mut live_backups = Vec::new();
+        for app_type in [
+            AppType::Claude,
+            AppType::Codex,
+            AppType::Gemini,
+            AppType::GrokBuild,
+        ] {
+            let app_type_str = app_type.as_str();
+            app_configs.push(
+                self.db
+                    .get_proxy_config_for_app(app_type_str)
+                    .await
+                    .map_err(|error| format!("读取 {app_type_str} 代理配置快照失败: {error}"))?,
+            );
+            live_backups.push((
+                app_type_str.to_string(),
+                self.db
+                    .get_live_backup(app_type_str)
+                    .await
+                    .map_err(|error| format!("读取 {app_type_str} Live 备份快照失败: {error}"))?,
+            ));
+        }
+
+        let status = self.get_status().await?;
+        let runtime = status.running.then_some(ProxyRuntimeSnapshot {
+            address: status.address.clone(),
+            port: status.port,
+        });
+        Ok(ProxyTransactionSnapshot {
+            proxy_config,
+            global_config,
+            app_configs,
+            live_backups,
+            live_files,
+            runtime,
+            active_targets: status.active_targets,
+        })
+    }
+
+    pub(crate) async fn restore_transaction_state(
+        &self,
+        snapshot: &ProxyTransactionSnapshot,
+    ) -> Vec<String> {
+        let _lifecycle_guard = self.lifecycle.lock().await;
+        let mut errors = Vec::new();
+        let current_status = self.get_status().await.unwrap_or_default();
+        let runtime_matches = snapshot.runtime.as_ref().is_some_and(|expected| {
+            current_status.running
+                && current_status.address == expected.address
+                && current_status.port == expected.port
+        });
+
+        if current_status.running && !runtime_matches {
+            if let Err(error) = self.stop_runtime_only().await {
+                errors.push(format!("停止当前代理监听器失败: {error}"));
+            }
+        }
+
+        if let Err(error) = self
+            .db
+            .update_proxy_config(snapshot.proxy_config.clone())
+            .await
+        {
+            errors.push(format!("恢复原代理配置失败: {error}"));
+        }
+        for app_config in &snapshot.app_configs {
+            if let Err(error) = self
+                .db
+                .update_proxy_config_for_app(app_config.clone())
+                .await
+            {
+                errors.push(format!(
+                    "恢复 {} 应用代理配置失败: {error}",
+                    app_config.app_type
+                ));
+            }
+        }
+        for (app_type, backup) in &snapshot.live_backups {
+            let result = match backup {
+                Some(backup) => {
+                    self.db
+                        .save_live_backup(app_type, &backup.original_config)
+                        .await
+                }
+                None => self.db.delete_live_backup(app_type).await,
+            };
+            if let Err(error) = result {
+                errors.push(format!("恢复 {app_type} Live 备份失败: {error}"));
+            }
+        }
+        for file in &snapshot.live_files {
+            if let Err(error) = file.restore_if_changed() {
+                errors.push(error);
+            }
+        }
+
+        match &snapshot.runtime {
+            Some(expected) => {
+                let status = self.get_status().await.unwrap_or_default();
+                if status.running
+                    && status.address == expected.address
+                    && status.port == expected.port
+                {
+                    if let Some(server) = self.server.read().await.as_ref() {
+                        server.apply_runtime_config(&snapshot.proxy_config).await;
+                    }
+                } else if !status.running {
+                    if let Err(error) = self
+                        .start_runtime_at(&snapshot.proxy_config, &expected.address, expected.port)
+                        .await
+                    {
+                        errors.push(format!(
+                            "恢复原代理监听地址 {}:{} 失败: {error}",
+                            expected.address, expected.port
+                        ));
+                    }
+                } else {
+                    errors.push(format!(
+                        "当前代理仍监听于 {}:{}，无法恢复 {}:{}",
+                        status.address, status.port, expected.address, expected.port
+                    ));
+                }
+            }
+            None => {
+                if self.is_running().await {
+                    if let Err(error) = self.stop_runtime_only().await {
+                        errors.push(format!("停止本次新启动的代理失败: {error}"));
+                    }
+                }
+            }
+        }
+
+        if let Some(server) = self.server.read().await.as_ref() {
+            server
+                .replace_active_targets(&snapshot.active_targets)
+                .await;
+        }
+        if let Err(error) = self
+            .db
+            .update_global_proxy_config(snapshot.global_config.clone())
+            .await
+        {
+            errors.push(format!("恢复全局代理配置失败: {error}"));
+        }
+        errors
+    }
+
+    async fn stop_runtime_only(&self) -> Result<(), String> {
+        let mut server_guard = self.server.write().await;
+        let Some(server) = server_guard.as_ref() else {
+            return Ok(());
+        };
+        let stop_result = server
+            .stop()
+            .await
+            .map_err(|error| format!("停止代理服务器失败: {error}"));
+        server_guard.take();
+        stop_result
+    }
+
+    async fn start_runtime_at(
+        &self,
+        config: &ProxyConfig,
+        address: &str,
+        port: u16,
+    ) -> Result<(), String> {
+        let mut server_guard = self.server.write().await;
+        if let Some(existing) = server_guard.as_ref() {
+            match existing.reuse_state().await {
+                ProxyServerReuseState::Reusable => {
+                    return Err("代理服务器已在运行".to_string());
+                }
+                ProxyServerReuseState::NeedsReap => {
+                    if let Err(error) = existing.stop().await {
+                        log::warn!("恢复代理运行态时回收旧任务收到终止结果: {error}");
+                    }
+                }
+                ProxyServerReuseState::Stopped => {}
+            }
+            server_guard.take();
+        }
+        let mut runtime_config = config.clone();
+        runtime_config.listen_address = address.to_string();
+        runtime_config.listen_port = port;
+        let app_handle = self.app_handle.read().await.clone();
+        let server = ProxyServer::new(runtime_config, self.db.clone(), app_handle);
+        let info = server
+            .start()
+            .await
+            .map_err(|error| format!("启动代理服务器失败: {error}"))?;
+        if info.address != address || info.port != port {
+            let _ = server.stop().await;
+            return Err(format!(
+                "代理监听地址恢复不一致，期望 {address}:{port}，实际 {}:{}",
+                info.address, info.port
+            ));
+        }
+        *server_guard = Some(server);
+        Ok(())
+    }
+
     /// 启动代理服务器
     pub async fn start(&self) -> Result<ProxyServerInfo, String> {
+        #[cfg(test)]
+        self.wait_at_start_barrier_for_test().await;
+
+        let _transaction = self.lock_transaction().await;
+        self.start_inner().await
+    }
+
+    /// Caller holds the proxy transaction guard.
+    pub(crate) async fn start_inner(&self) -> Result<ProxyServerInfo, String> {
+        // Serializes the full state transition, including persisted enablement.
+        let _lifecycle_guard = self.lifecycle.lock().await;
+
         // 1. 启动时自动设置 proxy_enabled = true
         let mut global_config = self
             .db
@@ -549,33 +1105,63 @@ impl ProxyService {
             .map_err(|e| format!("获取代理配置失败: {e}"))?;
 
         // 3. 若已在运行：确保持久化状态（如需要）并返回当前信息
-        if let Some(server) = self.server.read().await.as_ref() {
-            let status = server.get_status().await;
-            return Ok(ProxyServerInfo {
-                address: status.address,
-                port: status.port,
-                // 无法精确取回首次启动时间，返回当前时间用于 UI 展示即可
-                started_at: chrono::Utc::now().to_rfc3339(),
-            });
+        let mut server_guard = self.server.write().await;
+        if let Some(server) = server_guard.as_ref() {
+            match server.reuse_state().await {
+                ProxyServerReuseState::Reusable => {
+                    let status = server.get_status().await;
+                    if status.running {
+                        return Ok(ProxyServerInfo {
+                            address: status.address,
+                            port: status.port,
+                            // 无法精确取回首次启动时间，返回当前时间用于 UI 展示即可
+                            started_at: chrono::Utc::now().to_rfc3339(),
+                        });
+                    }
+                    if let Err(error) = server.stop().await {
+                        log::warn!("回收刚结束的代理服务器任务时收到终止结果: {error}");
+                    }
+                }
+                ProxyServerReuseState::NeedsReap => {
+                    if let Err(error) = server.stop().await {
+                        log::warn!("回收不可复用的代理服务器任务时收到终止结果: {error}");
+                    }
+                }
+                ProxyServerReuseState::Stopped => {}
+            }
+            server_guard.take();
         }
 
         // 4. 创建并启动服务器
         let app_handle = self.app_handle.read().await.clone();
         let server = ProxyServer::new(config.clone(), self.db.clone(), app_handle);
-        let info = server
-            .start()
-            .await
-            .map_err(|e| format!("启动代理服务器失败: {e}"))?;
+        let info = match server.start().await {
+            Ok(info) => info,
+            Err(error) => {
+                server_guard.take();
+                let start_error = format!("启动代理服务器失败: {error}");
+                self.persist_proxy_disabled_after_failure("代理启动失败")
+                    .await;
+                return Err(start_error);
+            }
+        };
+        *server_guard = Some(server);
+
+        #[cfg(test)]
+        self.wait_at_start_install_pause_for_test().await;
+
         if let Err(e) = self
             .persist_ephemeral_listen_port_if_needed(&config, info.port)
             .await
         {
-            let _ = server.stop().await;
+            if let Some(server) = server_guard.as_ref() {
+                let _ = server.stop().await;
+            }
+            server_guard.take();
+            self.persist_proxy_disabled_after_failure("保存动态代理端口失败")
+                .await;
             return Err(e);
         }
-
-        // 5. 保存服务器实例
-        *self.server.write().await = Some(server);
 
         log::info!("代理服务器已启动: {}:{}", info.address, info.port);
         Ok(info)
@@ -608,12 +1194,18 @@ impl ProxyService {
             return Ok(false);
         }
 
-        self.start().await?;
+        self.start_inner().await?;
         Ok(true)
     }
 
     /// 启动代理服务器（带 Live 配置接管）
     pub async fn start_with_takeover(&self) -> Result<ProxyServerInfo, String> {
+        let _transaction = self.lock_transaction().await;
+        self.start_with_takeover_inner().await
+    }
+
+    /// Caller holds the proxy transaction guard.
+    async fn start_with_takeover_inner(&self) -> Result<ProxyServerInfo, String> {
         // 1. 备份各应用的 Live 配置
         self.backup_live_configs().await?;
 
@@ -645,7 +1237,7 @@ impl ProxyService {
                 log::warn!("清理 Live 备份失败: {clean_err}");
             }
             if started_proxy_before_takeover {
-                let _ = self.stop().await;
+                let _ = self.stop_runtime_inner(true).await;
             }
             return Err(format!("设置接管状态失败: {e}"));
         }
@@ -664,13 +1256,13 @@ impl ProxyService {
                 }
             }
             if started_proxy_before_takeover {
-                let _ = self.stop().await;
+                let _ = self.stop_runtime_inner(true).await;
             }
             return Err(e);
         }
 
         // 5. 启动代理服务器
-        match self.start().await {
+        match self.start_inner().await {
             Ok(info) => Ok(info),
             Err(e) => {
                 // 启动失败，恢复原始配置
@@ -685,7 +1277,7 @@ impl ProxyService {
                     }
                 }
                 if started_proxy_before_takeover {
-                    let _ = self.stop().await;
+                    let _ = self.stop_runtime_inner(true).await;
                 }
                 Err(e)
             }
@@ -738,14 +1330,43 @@ impl ProxyService {
     /// - 开启：自动启动代理服务，仅接管当前 app 的 Live 配置
     /// - 关闭：仅恢复当前 app 的 Live 配置；若无其它接管，则自动停止代理服务
     pub async fn set_takeover_for_app(&self, app_type: &str, enabled: bool) -> Result<(), String> {
+        let _transaction = self.lock_transaction().await;
+        self.set_takeover_for_app_inner(app_type, enabled).await
+    }
+
+    /// Caller holds the proxy transaction guard.
+    pub(crate) async fn set_takeover_for_app_inner(
+        &self,
+        app_type: &str,
+        enabled: bool,
+    ) -> Result<(), String> {
+        self.set_takeover_for_app_inner_with_health_reset(app_type, enabled, true)
+            .await
+    }
+
+    pub(crate) async fn set_takeover_for_app_inner_preserving_health(
+        &self,
+        app_type: &str,
+        enabled: bool,
+    ) -> Result<(), String> {
+        self.set_takeover_for_app_inner_with_health_reset(app_type, enabled, false)
+            .await
+    }
+
+    async fn set_takeover_for_app_inner_with_health_reset(
+        &self,
+        app_type: &str,
+        enabled: bool,
+        reset_health_on_disable: bool,
+    ) -> Result<(), String> {
         let app = AppType::from_str(app_type).map_err(|e| format!("无效的应用类型: {e}"))?;
         let app_type_str = app.as_str();
-        let _guard = self.switch_locks.lock_for_app(app_type_str).await;
+        let guard = self.switch_locks.lock_for_app(app_type_str).await;
 
         if enabled {
             // 1) 代理服务未运行则自动启动
             if !self.is_running().await {
-                self.start().await?;
+                self.start_inner().await?;
             }
 
             // 2) 已接管则直接返回（幂等）；但如果缺少备份或占位符残留，需要重建接管
@@ -898,10 +1519,12 @@ impl ProxyService {
             .map_err(|e| format!("清除 {app_type_str} enabled 状态失败: {e}"))?;
 
         // 4) 清除该应用的健康状态（关闭代理时重置队列状态）
-        self.db
-            .clear_provider_health_for_app(app_type_str)
-            .await
-            .map_err(|e| format!("清除 {app_type_str} 健康状态失败: {e}"))?;
+        if reset_health_on_disable {
+            self.db
+                .clear_provider_health_for_app(app_type_str)
+                .await
+                .map_err(|e| format!("清除 {app_type_str} 健康状态失败: {e}"))?;
+        }
 
         // 5) 若无其它接管，更新旧标志，并停止代理服务
         // 检查是否还有其它 app 的 enabled = true
@@ -914,9 +1537,13 @@ impl ProxyService {
         if !any_enabled {
             let _ = self.db.set_live_takeover_active(false).await;
 
+            // Release this app's guard before the authoritative all-app stop
+            // path acquires the complete fixed-order guard set.
+            drop(guard);
+
             if self.is_running().await {
                 // 此时没有任何 app 处于接管状态，停止服务即可
-                let _ = self.stop().await;
+                let _ = self.stop_inner().await;
             }
         }
 
@@ -933,32 +1560,54 @@ impl ProxyService {
     /// 代理服务本身保持运行；当最后一个应用也关闭接管后，下次用户手动关闭
     /// 代理或程序退出时会自然停止。
     pub fn disable_takeover_for_app_sync(&self, app_type: &AppType) -> Result<(), String> {
+        futures::executor::block_on(async {
+            let _transaction = self.lock_transaction().await;
+            let _switch_guard = self.switch_locks.lock_for_app(app_type.as_str()).await;
+            self.disable_takeover_for_app_without_stop_inner(app_type)
+                .await
+        })
+    }
+
+    /// Caller holds the proxy transaction and matching app switch guards.
+    pub(crate) async fn disable_takeover_for_app_without_stop_inner(
+        &self,
+        app_type: &AppType,
+    ) -> Result<(), String> {
         let app_type_str = app_type.as_str();
 
         // 1) 恢复原始 Live 配置（备份 → SSOT → 清理占位符 三层兜底）
-        futures::executor::block_on(self.restore_live_config_for_app_with_fallback_inner(app_type))
+        self.restore_live_config_for_app_with_fallback_inner(app_type)
+            .await
             .map_err(|e| format!("恢复 {app_type_str} Live 配置失败: {e}"))?;
 
         // 2) 删除该 app 的备份
-        futures::executor::block_on(self.db.delete_live_backup(app_type_str))
+        self.db
+            .delete_live_backup(app_type_str)
+            .await
             .map_err(|e| format!("删除 {app_type_str} Live 备份失败: {e}"))?;
 
         // 3) 设置 proxy_config.enabled = false
-        let mut config =
-            futures::executor::block_on(self.db.get_proxy_config_for_app(app_type_str))
-                .map_err(|e| format!("获取 {app_type_str} 配置失败: {e}"))?;
+        let mut config = self
+            .db
+            .get_proxy_config_for_app(app_type_str)
+            .await
+            .map_err(|e| format!("获取 {app_type_str} 配置失败: {e}"))?;
         if config.enabled {
             config.enabled = false;
-            futures::executor::block_on(self.db.update_proxy_config_for_app(config))
+            self.db
+                .update_proxy_config_for_app(config)
+                .await
                 .map_err(|e| format!("清除 {app_type_str} enabled 状态失败: {e}"))?;
         }
 
         // 4) 清除该应用的健康状态
-        futures::executor::block_on(self.db.clear_provider_health_for_app(app_type_str))
+        self.db
+            .clear_provider_health_for_app(app_type_str)
+            .await
             .map_err(|e| format!("清除 {app_type_str} 健康状态失败: {e}"))?;
 
         // 5) 清旧标志
-        let _ = futures::executor::block_on(self.db.set_live_takeover_active(false));
+        let _ = self.db.set_live_takeover_active(false).await;
 
         Ok(())
     }
@@ -1267,32 +1916,193 @@ impl ProxyService {
         Ok(())
     }
 
+    async fn persist_proxy_disabled(&self) -> Result<(), String> {
+        let mut global_config = self
+            .db
+            .get_global_proxy_config()
+            .await
+            .map_err(|e| format!("获取全局代理配置失败: {e}"))?;
+
+        if global_config.proxy_enabled {
+            global_config.proxy_enabled = false;
+            self.db
+                .update_global_proxy_config(global_config)
+                .await
+                .map_err(|e| format!("更新代理总开关失败: {e}"))?;
+        }
+
+        Ok(())
+    }
+
+    async fn persist_proxy_disabled_after_failure(&self, context: &str) {
+        if let Err(error) = self.persist_proxy_disabled().await {
+            log::warn!("{context}后持久化 disabled 状态失败: {error}");
+        }
+    }
+
+    /// Caller holds every supported app switch guard and the lifecycle guard.
+    async fn has_takeover_ownership_evidence(&self) -> Result<bool, String> {
+        if self
+            .db
+            .is_live_takeover_active()
+            .await
+            .map_err(|e| format!("检查接管状态失败: {e}"))?
+        {
+            return Ok(true);
+        }
+
+        if self
+            .db
+            .has_any_live_backup()
+            .await
+            .map_err(|e| format!("检查 Live 备份失败: {e}"))?
+        {
+            return Ok(true);
+        }
+
+        Ok(self.detect_takeover_in_live_configs())
+    }
+
     /// 停止代理服务器
     pub async fn stop(&self) -> Result<(), String> {
-        if let Some(server) = self.server.write().await.take() {
-            server
-                .stop()
-                .await
-                .map_err(|e| format!("停止代理服务器失败: {e}"))?;
+        let _transaction = self.lock_transaction().await;
+        self.stop_inner().await
+    }
 
-            // 停止时设置 proxy_enabled = false
-            let mut global_config = self
-                .db
-                .get_global_proxy_config()
-                .await
-                .map_err(|e| format!("获取全局代理配置失败: {e}"))?;
+    /// Caller holds the proxy transaction guard.
+    pub(crate) async fn stop_inner(&self) -> Result<(), String> {
+        #[cfg(test)]
+        self.wait_at_plain_stop_takeover_check_pause_for_test()
+            .await;
 
-            if global_config.proxy_enabled {
-                global_config.proxy_enabled = false;
-                if let Err(e) = self.db.update_global_proxy_config(global_config).await {
-                    log::warn!("更新代理总开关失败: {e}");
+        let _switch_guards = self.lock_all_takeover_apps().await;
+
+        // Keep ownership until the old task is fully reaped and persisted state
+        // reflects the stopped generation.
+        let _lifecycle_guard = self.lifecycle.lock().await;
+
+        if self.has_takeover_ownership_evidence().await? {
+            return Err(
+                "仍有应用处于代理接管状态或检测到接管异常残留，请先在设置中关闭对应应用接管后再停止本地路由；若开关已关闭，请使用“停止并恢复 Live 配置”（stop_with_restore）清理异常残留。"
+                    .to_string(),
+            );
+        }
+
+        self.stop_runtime_locked(false).await
+    }
+
+    /// Caller holds the lifecycle guard.
+    async fn stop_runtime_locked(&self, not_running_is_ok: bool) -> Result<(), String> {
+        let mut server_guard = self.server.write().await;
+        if server_guard.is_none() {
+            if !not_running_is_ok {
+                return Err("代理服务器未运行".to_string());
+            }
+            drop(server_guard);
+            return self.persist_proxy_disabled().await;
+        }
+
+        #[cfg(test)]
+        self.wait_at_stop_pause_for_test().await;
+
+        let stop_result = match server_guard
+            .as_ref()
+            .expect("server presence checked")
+            .stop()
+            .await
+        {
+            Ok(()) | Err(crate::proxy::ProxyError::NotRunning) if not_running_is_ok => Ok(()),
+            Ok(()) => Ok(()),
+            Err(error) => Err(format!("停止代理服务器失败: {error}")),
+        };
+        server_guard.take();
+        drop(server_guard);
+
+        let persist_result = self.persist_proxy_disabled().await;
+
+        if let Err(persist_error) = persist_result {
+            if let Err(stop_error) = stop_result {
+                log::warn!("代理停止后持久化 stopped 状态失败: {persist_error}");
+                return Err(stop_error);
+            }
+            return Err(persist_error);
+        }
+
+        stop_result?;
+        log::info!("代理服务器已停止");
+        Ok(())
+    }
+
+    /// Caller holds the proxy transaction guard.
+    async fn stop_runtime_inner(&self, not_running_is_ok: bool) -> Result<(), String> {
+        let _lifecycle_guard = self.lifecycle.lock().await;
+        self.stop_runtime_locked(not_running_is_ok).await
+    }
+
+    fn combine_stop_and_cleanup_results(
+        stop_result: Result<(), String>,
+        cleanup_result: Result<(), String>,
+    ) -> Result<(), String> {
+        match (stop_result, cleanup_result) {
+            (Err(stop_error), Err(cleanup_error)) => {
+                log::warn!(
+                    "代理停止与 Live 恢复/清理均失败；向调用方保留停止错误。cleanup={cleanup_error}"
+                );
+                Err(format!("{stop_error}；Live 恢复/清理失败: {cleanup_error}"))
+            }
+            (Err(stop_error), Ok(())) => Err(stop_error),
+            (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    /// Caller holds every supported app switch guard and the lifecycle guard.
+    async fn restore_and_cleanup_takeover_state(&self, keep_state: bool) -> Result<(), String> {
+        self.restore_live_configs_inner().await?;
+
+        let mut errors = Vec::new();
+        if keep_state {
+            match self.db.get_proxy_config().await {
+                Ok(mut config) => {
+                    config.live_takeover_active = false;
+                    if let Err(error) = self.db.update_proxy_config(config).await {
+                        errors.push(format!("更新接管状态失败: {error}"));
+                    }
                 }
+                Err(error) => errors.push(format!("获取代理配置失败: {error}")),
+            }
+        } else {
+            if let Err(error) = self.db.set_live_takeover_active(false).await {
+                errors.push(format!("清除接管状态失败: {error}"));
             }
 
-            log::info!("代理服务器已停止");
+            for app_type in TAKEOVER_APP_LOCK_ORDER {
+                match self.db.get_proxy_config_for_app(app_type).await {
+                    Ok(mut config) if config.enabled => {
+                        config.enabled = false;
+                        if let Err(error) = self.db.update_proxy_config_for_app(config).await {
+                            errors.push(format!("清除 {app_type} enabled 状态失败: {error}"));
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        errors.push(format!("获取 {app_type} enabled 状态失败: {error}"));
+                    }
+                }
+            }
+        }
+
+        if let Err(error) = self.db.delete_all_live_backups().await {
+            errors.push(format!("删除备份失败: {error}"));
+        }
+        if let Err(error) = self.db.clear_all_provider_health().await {
+            errors.push(format!("重置健康状态失败: {error}"));
+        }
+
+        if errors.is_empty() {
             Ok(())
         } else {
-            Err("代理服务器未运行".to_string())
+            Err(errors.join("；"))
         }
     }
 
@@ -1300,82 +2110,51 @@ impl ProxyService {
     ///
     /// 会清除 settings 表中的代理状态，下次启动不会自动恢复。
     pub async fn stop_with_restore(&self) -> Result<(), String> {
-        // 1. 停止代理服务器（即使未运行也继续执行恢复逻辑）
-        if let Err(e) = self.stop().await {
-            log::warn!("停止代理服务器失败（将继续恢复 Live 配置）: {e}");
+        let _transaction = self.lock_transaction().await;
+        self.stop_with_restore_inner().await
+    }
+
+    /// Caller holds the proxy transaction guard.
+    pub(crate) async fn stop_with_restore_inner(&self) -> Result<(), String> {
+        let _switch_guards = self.lock_all_takeover_apps().await;
+        let _lifecycle_guard = self.lifecycle.lock().await;
+        let stop_result = self.stop_runtime_locked(true).await;
+
+        #[cfg(test)]
+        self.wait_at_restore_cleanup_pause_for_test().await;
+
+        let cleanup_result = self.restore_and_cleanup_takeover_state(false).await;
+        let result = Self::combine_stop_and_cleanup_results(stop_result, cleanup_result);
+        if result.is_ok() {
+            // 注意：不清除故障转移队列和开关状态，保留供下次开启代理时使用
+            log::info!("代理已停止，Live 配置已恢复");
         }
-
-        // 2. 恢复原始 Live 配置
-        self.restore_live_configs().await?;
-
-        // 3. 清除 proxy_config 表中的接管状态（兼容旧版）
-        self.db
-            .set_live_takeover_active(false)
-            .await
-            .map_err(|e| format!("清除接管状态失败: {e}"))?;
-
-        // 4. 清除所有应用的 enabled 状态（用户手动关闭，不需要下次自动恢复）
-        for app_type in ["claude", "codex", "gemini", "grokbuild"] {
-            if let Ok(mut config) = self.db.get_proxy_config_for_app(app_type).await {
-                if config.enabled {
-                    config.enabled = false;
-                    if let Err(e) = self.db.update_proxy_config_for_app(config).await {
-                        log::warn!("清除 {app_type} enabled 状态失败: {e}");
-                    }
-                }
-            }
-        }
-
-        // 5. 删除备份
-        self.db
-            .delete_all_live_backups()
-            .await
-            .map_err(|e| format!("删除备份失败: {e}"))?;
-
-        // 6. 重置健康状态（让健康徽章恢复为正常）
-        self.db
-            .clear_all_provider_health()
-            .await
-            .map_err(|e| format!("重置健康状态失败: {e}"))?;
-
-        // 注意：不清除故障转移队列和开关状态，保留供下次开启代理时使用
-        log::info!("代理已停止，Live 配置已恢复");
-        Ok(())
+        result
     }
 
     /// 停止代理服务器（恢复 Live 配置，但保留 settings 表中的代理状态）
     ///
     /// 用于程序正常退出时，保留代理状态以便下次启动时自动恢复
     pub async fn stop_with_restore_keep_state(&self) -> Result<(), String> {
-        // 1. 停止代理服务器（即使未运行也继续执行恢复逻辑）
-        if let Err(e) = self.stop().await {
-            log::warn!("停止代理服务器失败（将继续恢复 Live 配置）: {e}");
+        let _transaction = self.lock_transaction().await;
+        self.stop_with_restore_keep_state_inner().await
+    }
+
+    /// Caller holds the proxy transaction guard.
+    async fn stop_with_restore_keep_state_inner(&self) -> Result<(), String> {
+        let _switch_guards = self.lock_all_takeover_apps().await;
+        let _lifecycle_guard = self.lifecycle.lock().await;
+        let stop_result = self.stop_runtime_locked(true).await;
+
+        #[cfg(test)]
+        self.wait_at_restore_cleanup_pause_for_test().await;
+
+        let cleanup_result = self.restore_and_cleanup_takeover_state(true).await;
+        let result = Self::combine_stop_and_cleanup_results(stop_result, cleanup_result);
+        if result.is_ok() {
+            log::info!("代理已停止，Live 配置已恢复（保留代理状态，下次启动将自动恢复）");
         }
-
-        // 2. 恢复原始 Live 配置
-        self.restore_live_configs().await?;
-
-        // 3. 更新 proxy_config 表中的 live_takeover_active 标志（兼容旧版）
-        //    注意：保留 proxy_config.enabled 状态，下次启动时自动恢复
-        if let Ok(mut config) = self.db.get_proxy_config().await {
-            config.live_takeover_active = false;
-            let _ = self.db.update_proxy_config(config).await;
-        }
-
-        // 4. 删除备份（Live 配置已恢复，备份不再需要）
-        self.db
-            .delete_all_live_backups()
-            .await
-            .map_err(|e| format!("删除备份失败: {e}"))?;
-
-        // 5. 重置健康状态
-        self.db
-            .clear_all_provider_health()
-            .await
-            .map_err(|e| format!("重置健康状态失败: {e}"))?;
-
-        log::info!("代理已停止，Live 配置已恢复（保留代理状态，下次启动将自动恢复）");
-        Ok(())
+        result
     }
 
     /// 备份各应用的 Live 配置
@@ -1481,12 +2260,29 @@ impl ProxyService {
             .await
             .map_err(|e| format!("获取代理配置失败: {e}"))?;
 
+        let mut listen_address = config.listen_address;
+        let mut listen_port = config.listen_port;
+        if let Some(server) = self.server.read().await.as_ref() {
+            let status = server.get_status().await;
+            if status.running {
+                listen_address = status.address;
+                listen_port = status.port;
+            }
+        }
+
+        Self::build_proxy_urls_for_bind(&listen_address, listen_port)
+    }
+
+    fn build_proxy_urls_for_bind(
+        listen_address: &str,
+        listen_port: u16,
+    ) -> Result<(String, String), String> {
         // listen_address 可能是 0.0.0.0（用于监听所有网卡），但客户端无法用 0.0.0.0 连接；
         // 因此写回到各应用配置时，优先使用本机回环地址。
-        let connect_host = match config.listen_address.as_str() {
+        let connect_host = match listen_address {
             "0.0.0.0" => "127.0.0.1".to_string(),
             "::" => "::1".to_string(),
-            _ => config.listen_address.clone(),
+            _ => listen_address.to_string(),
         };
         let connect_host_for_url = if connect_host.contains(':') && !connect_host.starts_with('[') {
             format!("[{connect_host}]")
@@ -1494,13 +2290,6 @@ impl ProxyService {
             connect_host
         };
 
-        let mut listen_port = config.listen_port;
-        if let Some(server) = self.server.read().await.as_ref() {
-            let status = server.get_status().await;
-            if status.running {
-                listen_port = status.port;
-            }
-        }
         if listen_port == 0 {
             return Err("代理监听端口为 0，但代理服务器尚未运行，无法生成接管地址".to_string());
         }
@@ -1510,6 +2299,32 @@ impl ProxyService {
         let proxy_codex_base_url = format!("{}/v1", proxy_origin.trim_end_matches('/'));
 
         Ok((proxy_url, proxy_codex_base_url))
+    }
+
+    /// Returns the loopback Responses endpoint used by managed Codex Agent Roles.
+    pub(crate) async fn codex_proxy_base_url(&self) -> Result<String, String> {
+        let config = self
+            .db
+            .get_proxy_config()
+            .await
+            .map_err(|error| format!("获取代理配置失败: {error}"))?;
+        let mut listen_address = config.listen_address;
+        let mut listen_port = config.listen_port;
+        if let Some(server) = self.server.read().await.as_ref() {
+            let status = server.get_status().await;
+            if status.running {
+                listen_address = status.address;
+                listen_port = status.port;
+            }
+        }
+        let connect_host = codex_agent_role_connect_host(&listen_address)?;
+        if listen_port == 0 {
+            return Err(
+                "代理监听端口为 0，但代理服务器尚未运行，无法生成 Codex Agent Role 地址"
+                    .to_string(),
+            );
+        }
+        Ok(format!("http://{connect_host}:{listen_port}/v1"))
     }
 
     /// Grok Build live 是否具备可接管的自定义模型表。
@@ -1614,6 +2429,18 @@ impl ProxyService {
     /// 接管指定应用的 Live 配置（严格模式：目标配置不存在则返回错误）
     async fn takeover_live_config_strict(&self, app_type: &AppType) -> Result<(), String> {
         let (proxy_url, proxy_codex_base_url) = self.build_proxy_urls().await?;
+        self.takeover_live_config_strict_with_urls(app_type, &proxy_url, &proxy_codex_base_url)
+    }
+
+    fn takeover_live_config_strict_with_urls(
+        &self,
+        app_type: &AppType,
+        proxy_url: &str,
+        proxy_codex_base_url: &str,
+    ) -> Result<(), String> {
+        #[cfg(test)]
+        self.maybe_fail_takeover_write_for_test(app_type)?;
+
         let proxy_grok_base_url = format!("{}/grokbuild/v1", proxy_url.trim_end_matches('/'));
 
         match app_type {
@@ -1624,7 +2451,7 @@ impl ProxyService {
                     self.claude_provider_with_effective_settings(&claude_provider)?;
                 Self::apply_claude_takeover_fields_for_provider(
                     &mut live_config,
-                    &proxy_url,
+                    proxy_url,
                     &claude_provider,
                 );
                 self.write_claude_live(&live_config)?;
@@ -1635,7 +2462,7 @@ impl ProxyService {
                 let codex_provider = self.require_current_provider_for_app(&AppType::Codex)?;
                 Self::apply_codex_takeover_fields_for_provider(
                     &mut live_config,
-                    &proxy_codex_base_url,
+                    proxy_codex_base_url,
                     &codex_provider,
                 )?;
 
@@ -1646,11 +2473,11 @@ impl ProxyService {
                 let mut live_config = self.read_gemini_live()?;
 
                 if let Some(env) = live_config.get_mut("env").and_then(|v| v.as_object_mut()) {
-                    env.insert("GOOGLE_GEMINI_BASE_URL".to_string(), json!(&proxy_url));
+                    env.insert("GOOGLE_GEMINI_BASE_URL".to_string(), json!(proxy_url));
                     env.insert("GEMINI_API_KEY".to_string(), json!(PROXY_TOKEN_PLACEHOLDER));
                 } else {
                     live_config["env"] = json!({
-                        "GOOGLE_GEMINI_BASE_URL": &proxy_url,
+                        "GOOGLE_GEMINI_BASE_URL": proxy_url,
                         "GEMINI_API_KEY": PROXY_TOKEN_PLACEHOLDER
                     });
                 }
@@ -1673,83 +2500,6 @@ impl ProxyService {
                 log::info!("Grok Build Live 配置已接管，代理地址: {proxy_grok_base_url}");
             }
             _ => return Err("该应用不支持代理功能".to_string()),
-        }
-
-        Ok(())
-    }
-
-    /// 接管指定应用的 Live 配置（尽力而为：配置不存在/读取失败则跳过）
-    async fn takeover_live_config_best_effort(&self, app_type: &AppType) -> Result<(), String> {
-        let (proxy_url, proxy_codex_base_url) = self.build_proxy_urls().await?;
-        let proxy_grok_base_url = format!("{}/grokbuild/v1", proxy_url.trim_end_matches('/'));
-
-        match app_type {
-            AppType::Claude => {
-                if let Ok(mut live_config) = self.read_claude_live() {
-                    let claude_provider = self
-                        .get_current_provider_for_app(&AppType::Claude)
-                        .ok()
-                        .flatten();
-                    if let Some(provider) = claude_provider.as_ref() {
-                        let provider = self.claude_provider_with_effective_settings(provider)?;
-                        Self::apply_claude_takeover_fields_for_provider(
-                            &mut live_config,
-                            &proxy_url,
-                            &provider,
-                        );
-                    } else {
-                        Self::apply_claude_takeover_fields_with_policy(
-                            &mut live_config,
-                            &proxy_url,
-                            ClaudeTakeoverAuthPolicy::PreserveExistingOrAuthToken,
-                        );
-                    }
-                    let _ = self.write_claude_live(&live_config);
-                }
-            }
-            AppType::Codex => {
-                if let Ok(mut live_config) = self.read_codex_live() {
-                    let codex_provider = self.require_current_provider_for_app(&AppType::Codex)?;
-                    Self::apply_codex_takeover_fields_for_provider(
-                        &mut live_config,
-                        &proxy_codex_base_url,
-                        &codex_provider,
-                    )?;
-
-                    self.write_codex_takeover_live_for_provider(
-                        &live_config,
-                        Some(&codex_provider),
-                    )?;
-                }
-            }
-            AppType::Gemini => {
-                if let Ok(mut live_config) = self.read_gemini_live() {
-                    if let Some(env) = live_config.get_mut("env").and_then(|v| v.as_object_mut()) {
-                        env.insert("GOOGLE_GEMINI_BASE_URL".to_string(), json!(&proxy_url));
-                        env.insert("GEMINI_API_KEY".to_string(), json!(PROXY_TOKEN_PLACEHOLDER));
-                    } else {
-                        live_config["env"] = json!({
-                            "GOOGLE_GEMINI_BASE_URL": &proxy_url,
-                            "GEMINI_API_KEY": PROXY_TOKEN_PLACEHOLDER
-                        });
-                    }
-
-                    let _ = self.write_gemini_live(&live_config);
-                }
-            }
-            AppType::GrokBuild => {
-                if let Ok(mut live_config) = self.read_grok_live() {
-                    if Self::grok_live_config_supports_takeover(&live_config) {
-                        Self::apply_grok_takeover_fields(&mut live_config, &proxy_grok_base_url)?;
-                        let _ = self.write_grok_live(&live_config);
-                    } else {
-                        log::info!(
-                            "Grok Build Live 处于官方登录态（无自定义模型表），跳过代理接管"
-                        );
-                    }
-                }
-            }
-            _ => {}
         }
 
         Ok(())
@@ -1797,6 +2547,12 @@ impl ProxyService {
 
     /// 恢复原始 Live 配置
     async fn restore_live_configs(&self) -> Result<(), String> {
+        let _switch_guards = self.lock_all_takeover_apps().await;
+        self.restore_live_configs_inner().await
+    }
+
+    /// Caller holds every supported app switch guard.
+    async fn restore_live_configs_inner(&self) -> Result<(), String> {
         let mut errors = Vec::new();
 
         for app_type in [
@@ -1806,7 +2562,7 @@ impl ProxyService {
             AppType::GrokBuild,
         ] {
             if let Err(e) = self
-                .restore_live_config_for_app_with_fallback(&app_type)
+                .restore_live_config_for_app_with_fallback_inner(&app_type)
                 .await
             {
                 errors.push(e);
@@ -2190,6 +2946,12 @@ impl ProxyService {
     /// 检测到 Live 备份残留时调用此方法。
     /// 会恢复 Live 配置、清除接管标志、删除备份。
     pub async fn recover_from_crash(&self) -> Result<(), String> {
+        let _transaction = self.lock_transaction().await;
+        self.recover_from_crash_inner().await
+    }
+
+    /// Caller holds the proxy transaction guard.
+    async fn recover_from_crash_inner(&self) -> Result<(), String> {
         // 1. 恢复 Live 配置
         self.restore_live_configs().await?;
 
@@ -2330,13 +3092,14 @@ impl ProxyService {
         app_type: &str,
         provider: &Provider,
     ) -> Result<(), String> {
+        let _transaction = self.lock_transaction().await;
         let _guard = self.switch_locks.lock_for_app(app_type).await;
         self.update_live_backup_from_provider_inner(app_type, provider)
             .await
     }
 
-    /// 仅供已持有 per-app 切换锁的调用方使用。
-    async fn update_live_backup_from_provider_inner(
+    /// 仅供已持有代理事务锁和 per-app 切换锁的调用方使用。
+    pub(crate) async fn update_live_backup_from_provider_inner(
         &self,
         app_type: &str,
         provider: &Provider,
@@ -2441,6 +3204,7 @@ impl ProxyService {
         app_type: &str,
         provider_id: &str,
     ) -> Result<HotSwitchOutcome, String> {
+        let _transaction = self.lock_transaction().await;
         let _guard = self.switch_locks.lock_for_app(app_type).await;
         self.hot_switch_provider_inner(app_type, provider_id).await
     }
@@ -3075,6 +3839,17 @@ impl ProxyService {
 
     /// 更新代理配置
     pub async fn update_config(&self, config: &ProxyConfig) -> Result<(), String> {
+        let _transaction = self.lock_transaction().await;
+        self.update_config_inner(config).await
+    }
+
+    /// Caller holds the proxy transaction guard.
+    pub(crate) async fn update_config_inner(&self, config: &ProxyConfig) -> Result<(), String> {
+        // Keep the global lock order aligned with set_takeover_for_app:
+        // per-app switch guards first, then the lifecycle transition.
+        let _switch_guards = self.lock_all_takeover_apps().await;
+        let _lifecycle_guard = self.lifecycle.lock().await;
+
         // 记录旧配置用于判定是否需要重启
         let previous = self
             .db
@@ -3097,78 +3872,151 @@ impl ProxyService {
             return Ok(());
         }
 
-        // 判断是否需要重启（地址或端口变更）
-        let require_restart = new_config.listen_address != previous.listen_address
-            || new_config.listen_port != previous.listen_port;
+        let mut reuse_state = server_guard
+            .as_ref()
+            .expect("server presence checked")
+            .reuse_state()
+            .await;
+        if reuse_state == ProxyServerReuseState::Stopped {
+            server_guard.take();
+            return Ok(());
+        }
+
+        // Compare the desired bind against the live listener. The persisted
+        // previous row may already contain the desired value after a cancelled
+        // update, while the listener still owns the older address/port.
+        let mut require_restart = reuse_state == ProxyServerReuseState::NeedsReap
+            || !server_guard
+                .as_ref()
+                .expect("server presence checked")
+                .bind_config_matches(&new_config)
+                .await;
+
+        if !require_restart {
+            let server = server_guard.as_ref().expect("server presence checked");
+            server.apply_runtime_config(&new_config).await;
+            require_restart = !server.is_running().await;
+            if require_restart {
+                reuse_state = ProxyServerReuseState::NeedsReap;
+                log::warn!("代理任务在应用运行时配置期间结束，改为回收并重启");
+            } else {
+                log::info!("代理配置已实时应用，无需重启代理服务器");
+            }
+        }
 
         if require_restart {
-            if let Some(server) = server_guard.take() {
-                server
+            let app_handle = self.app_handle.read().await.clone();
+            if let Some(server) = server_guard.as_ref() {
+                let stop_result = server
                     .stop()
                     .await
-                    .map_err(|e| format!("重启前停止代理服务器失败: {e}"))?;
+                    .map_err(|e| format!("重启前停止代理服务器失败: {e}"));
+                if let Err(stop_error) = stop_result {
+                    if reuse_state == ProxyServerReuseState::Reusable {
+                        server_guard.take();
+                        self.persist_proxy_disabled_after_failure("重启停止失败")
+                            .await;
+                        return Err(stop_error);
+                    }
+                    log::warn!("回收取消操作遗留的代理任务时收到终止结果: {stop_error}");
+                }
             }
+            server_guard.take();
 
-            let app_handle = self.app_handle.read().await.clone();
             let new_server = ProxyServer::new(new_config.clone(), self.db.clone(), app_handle);
-            let info = new_server
-                .start()
-                .await
-                .map_err(|e| format!("重启代理服务器失败: {e}"))?;
+            let info = match new_server.start().await {
+                Ok(info) => info,
+                Err(error) => {
+                    server_guard.take();
+                    let restart_error = format!("重启代理服务器失败: {error}");
+                    self.persist_proxy_disabled_after_failure("重启启动失败")
+                        .await;
+                    return Err(restart_error);
+                }
+            };
+            *server_guard = Some(new_server);
+
+            #[cfg(test)]
+            self.wait_at_start_install_pause_for_test().await;
+
             if let Err(e) = self
                 .persist_ephemeral_listen_port_if_needed(&new_config, info.port)
                 .await
             {
-                let _ = new_server.stop().await;
+                if let Some(server) = server_guard.as_ref() {
+                    let _ = server.stop().await;
+                }
+                server_guard.take();
+                self.persist_proxy_disabled_after_failure("重启后保存动态代理端口失败")
+                    .await;
                 return Err(e);
             }
 
-            *server_guard = Some(new_server);
             log::info!("代理配置已更新，服务器已自动重启应用最新配置");
-
-            // 如果当前存在任意 app 的 Live 接管，需要同步更新 Live 中的代理地址（否则客户端仍指向旧端口）
-            drop(server_guard);
-            if let Ok(takeover) = self.get_takeover_status().await {
-                let mut updated_any = false;
-
-                if takeover.claude {
-                    self.takeover_live_config_best_effort(&AppType::Claude)
-                        .await?;
-                    updated_any = true;
-                }
-                if takeover.codex {
-                    self.takeover_live_config_best_effort(&AppType::Codex)
-                        .await?;
-                    updated_any = true;
-                }
-                if takeover.gemini {
-                    self.takeover_live_config_best_effort(&AppType::Gemini)
-                        .await?;
-                    updated_any = true;
-                }
-                if takeover.grokbuild {
-                    self.takeover_live_config_best_effort(&AppType::GrokBuild)
-                        .await?;
-                    updated_any = true;
-                }
-
-                if updated_any {
-                    log::info!("已同步更新 Live 配置中的代理地址");
-                }
-            }
-
-            return Ok(());
-        } else if let Some(server) = server_guard.as_ref() {
-            server.apply_runtime_config(&new_config).await;
-            log::info!("代理配置已实时应用，无需重启代理服务器");
         }
 
+        let status = server_guard
+            .as_ref()
+            .expect("a successful update keeps a running server installed")
+            .get_status()
+            .await;
+        if !status.running {
+            server_guard.take();
+            return Ok(());
+        }
+        let (proxy_url, proxy_codex_base_url) =
+            Self::build_proxy_urls_for_bind(&status.address, status.port)?;
+        drop(server_guard);
+
+        self.reconcile_enabled_takeovers(&proxy_url, &proxy_codex_base_url)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Caller holds every supported app switch guard.
+    async fn reconcile_enabled_takeovers(
+        &self,
+        proxy_url: &str,
+        proxy_codex_base_url: &str,
+    ) -> Result<(), String> {
+        let mut updated_any = false;
+        for app_type in [
+            AppType::Claude,
+            AppType::Codex,
+            AppType::Gemini,
+            AppType::GrokBuild,
+        ] {
+            let app_type_str = app_type.as_str();
+            let enabled = self
+                .db
+                .get_proxy_config_for_app(app_type_str)
+                .await
+                .map_err(|e| format!("获取 {app_type_str} 配置失败: {e}"))?
+                .enabled;
+            if enabled {
+                self.takeover_live_config_strict_with_urls(
+                    &app_type,
+                    proxy_url,
+                    proxy_codex_base_url,
+                )?;
+                updated_any = true;
+            }
+        }
+
+        if updated_any {
+            log::info!("已严格同步更新所有已启用 Live 接管的代理地址");
+        }
         Ok(())
     }
 
     /// 检查服务器是否正在运行
     pub async fn is_running(&self) -> bool {
-        self.server.read().await.is_some()
+        if let Some(server) = self.server.read().await.as_ref() {
+            server.is_running().await
+        } else {
+            false
+        }
     }
 
     /// 热更新熔断器配置
@@ -3227,8 +4075,76 @@ mod tests {
     use super::*;
     use crate::provider::ProviderMeta;
     use serial_test::serial;
-    use std::env;
+    use std::{env, time::Duration};
     use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn proxy_file_rollback_preserves_external_file_created_after_transaction_output() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("auth.json");
+        let mut snapshot = ProxyFileSnapshot::capture(path.clone()).expect("capture missing file");
+        std::fs::write(&path, b"transaction-output").expect("transaction output");
+        snapshot
+            .capture_rollback_guard()
+            .expect("capture transaction output");
+        std::fs::write(&path, b"external-login").expect("external file update");
+
+        let error = snapshot
+            .restore_if_changed()
+            .expect_err("external file must block rollback deletion");
+
+        assert!(error.contains("外部修改"));
+        assert_eq!(std::fs::read(path).unwrap(), b"external-login");
+    }
+
+    #[test]
+    fn proxy_file_rollback_preserves_external_change_to_existing_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, b"original").expect("original file");
+        let mut snapshot = ProxyFileSnapshot::capture(path.clone()).expect("capture file");
+        std::fs::write(&path, b"transaction-output").expect("transaction output");
+        snapshot
+            .capture_rollback_guard()
+            .expect("capture transaction output");
+        std::fs::write(&path, b"external-edit").expect("external file update");
+
+        let error = snapshot
+            .restore_if_changed()
+            .expect_err("external edit must block rollback overwrite");
+
+        assert!(error.contains("外部修改"));
+        assert_eq!(std::fs::read(path).unwrap(), b"external-edit");
+    }
+
+    #[test]
+    fn codex_agent_role_maps_wildcard_and_loopback_listeners_to_loopback_urls() {
+        for (listen_address, expected_host) in [
+            ("0.0.0.0", "127.0.0.1"),
+            ("::", "[::1]"),
+            ("127.0.0.1", "127.0.0.1"),
+            ("::1", "[::1]"),
+        ] {
+            assert_eq!(
+                codex_agent_role_connect_host(listen_address)
+                    .expect("wildcard or loopback listener must be accepted"),
+                expected_host
+            );
+        }
+    }
+
+    #[test]
+    fn codex_agent_role_rejects_explicit_lan_listeners() {
+        for listen_address in ["192.0.2.10", "2001:db8::10"] {
+            let error = codex_agent_role_connect_host(listen_address)
+                .expect_err("a LAN-only listener is unavailable through loopback");
+            assert!(
+                error.starts_with(&format!("{CODEX_AGENT_ROLE_LOOPBACK_REQUIRED}:")),
+                "LAN rejection must expose the stable marker: {error}"
+            );
+        }
+    }
 
     struct TempHome {
         #[allow(dead_code)]
@@ -3292,6 +4208,1701 @@ mod tests {
     async fn running_codex_base_url(service: &ProxyService) -> String {
         let status = service.get_status().await.expect("get proxy status");
         format!("http://127.0.0.1:{}/v1", status.port)
+    }
+
+    async fn proxy_health_responds(port: u16) -> bool {
+        let Ok(Ok(mut stream)) = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::net::TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await
+        else {
+            return false;
+        };
+        if stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .is_err()
+        {
+            return false;
+        }
+
+        let mut response = [0u8; 1024];
+        let Ok(Ok(read)) =
+            tokio::time::timeout(Duration::from_secs(1), stream.read(&mut response)).await
+        else {
+            return false;
+        };
+        String::from_utf8_lossy(&response[..read]).contains("200 OK")
+    }
+
+    fn fail_resolved_port_persistence(db: &Database) {
+        db.conn
+            .lock()
+            .expect("lock proxy test database")
+            .execute_batch(
+                "CREATE TRIGGER fail_resolved_proxy_port
+                 BEFORE UPDATE OF listen_port ON proxy_config
+                 WHEN OLD.listen_port = 0 AND NEW.listen_port <> 0
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected resolved proxy port persistence failure');
+                 END;",
+            )
+            .expect("install resolved port persistence failure trigger");
+    }
+
+    fn seed_claude_takeover_provider(db: &Arc<Database>, service: &ProxyService) {
+        let provider = Provider::with_id(
+            "lifecycle-p1".to_string(),
+            "Lifecycle P1".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_API_KEY": "provider-key",
+                    "ANTHROPIC_BASE_URL": "https://api.anthropic.com"
+                }
+            }),
+            None,
+        );
+        db.save_provider("claude", &provider)
+            .expect("save lifecycle Claude provider");
+        db.set_current_provider("claude", "lifecycle-p1")
+            .expect("set lifecycle DB current provider");
+        crate::settings::set_current_provider(&AppType::Claude, Some("lifecycle-p1"))
+            .expect("set lifecycle local current provider");
+        service
+            .write_claude_live(&json!({
+                "env": {
+                    "ANTHROPIC_API_KEY": "live-key",
+                    "ANTHROPIC_BASE_URL": "https://api.anthropic.com"
+                }
+            }))
+            .expect("seed lifecycle Claude Live config");
+    }
+
+    fn seed_gemini_takeover_live(service: &ProxyService) {
+        service
+            .write_gemini_live(&json!({
+                "env": {
+                    "GEMINI_API_KEY": "gemini-live-key",
+                    "GOOGLE_GEMINI_BASE_URL": "https://generativelanguage.googleapis.com"
+                }
+            }))
+            .expect("seed lifecycle Gemini Live config");
+    }
+
+    fn fail_claude_takeover_enable_commit(db: &Database) {
+        db.conn
+            .lock()
+            .expect("lock proxy test database")
+            .execute_batch(
+                "CREATE TRIGGER fail_claude_takeover_enable_commit
+                 BEFORE UPDATE OF enabled ON proxy_config
+                 WHEN OLD.app_type = 'claude' AND OLD.enabled = 0 AND NEW.enabled = 1
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected Claude enabled commit failure');
+                 END;",
+            )
+            .expect("install Claude enabled commit failure trigger");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn role_transaction_resolves_ephemeral_loopback_codex_url() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db);
+        let _transaction = service.lock_transaction().await;
+
+        let started = service.start_inner().await.expect("start proxy");
+        let base_url = service
+            .codex_proxy_base_url()
+            .await
+            .expect("resolve Codex role proxy URL");
+        assert_eq!(base_url, format!("http://127.0.0.1:{}/v1", started.port));
+        assert!(!base_url.contains(":0/"));
+
+        service.stop_inner().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn role_transaction_uses_runtime_address_and_port_as_one_endpoint() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db.clone());
+        let started = service.start().await.expect("start loopback proxy");
+
+        let mut persisted = db.get_proxy_config().await.expect("persisted config");
+        persisted.listen_address = "192.0.2.10".to_string();
+        persisted.listen_port = started.port.saturating_add(1);
+        db.update_proxy_config(persisted)
+            .await
+            .expect("simulate cancelled bind update");
+
+        let base_url = service
+            .codex_proxy_base_url()
+            .await
+            .expect("resolve from live listener");
+        assert_eq!(base_url, format!("http://127.0.0.1:{}/v1", started.port));
+
+        service.stop().await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn transaction_restore_reaps_a_stopped_server_slot_before_restarting_runtime() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db);
+        let transaction = service.lock_transaction().await;
+        let started = service.start_inner().await.expect("start proxy");
+        let mut snapshot = service
+            .snapshot_transaction_state()
+            .await
+            .expect("snapshot running proxy");
+
+        let server = service
+            .server
+            .write()
+            .await
+            .take()
+            .expect("running server slot");
+        server.stop().await.expect("stop server generation");
+        *service.server.write().await = Some(server);
+        assert!(!service.get_status().await.expect("stopped status").running);
+        assert!(snapshot.capture_rollback_file_guards().is_empty());
+
+        let errors = service.restore_transaction_state(&snapshot).await;
+        assert!(errors.is_empty(), "runtime rollback errors: {errors:?}");
+        let restored = service.get_status().await.expect("restored status");
+        assert!(restored.running);
+        assert_eq!(restored.address, started.address);
+        assert_eq!(restored.port, started.port);
+
+        service.stop_inner().await.expect("stop restored proxy");
+        drop(transaction);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rollback_takeover_disable_preserves_codex_provider_health() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db.clone());
+        let provider = Provider::with_id(
+            "role-owner".to_string(),
+            "Role Owner".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "test-key" },
+                "config": "model_provider = \"test\"\n[model_providers.test]\nbase_url = \"https://example.invalid/v1\"\nwire_api = \"responses\"\n"
+            }),
+            None,
+        );
+        db.save_provider(AppType::Codex.as_str(), &provider)
+            .expect("save provider");
+        db.set_current_provider(AppType::Codex.as_str(), &provider.id)
+            .expect("set database current provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some(&provider.id))
+            .expect("set local current provider");
+        crate::codex_config::write_codex_live_atomic(
+            &json!({ "OPENAI_API_KEY": "live-key" }),
+            Some("model = \"gpt-5.4\"\n"),
+        )
+        .expect("seed Codex live files");
+
+        service
+            .set_takeover_for_app(AppType::Codex.as_str(), true)
+            .await
+            .expect("enable Codex takeover");
+        db.update_provider_health_with_threshold(
+            &provider.id,
+            AppType::Codex.as_str(),
+            false,
+            Some("seed failure".to_string()),
+            1,
+        )
+        .await
+        .expect("seed provider health");
+
+        let _transaction = service.lock_transaction().await;
+        service
+            .set_takeover_for_app_inner_preserving_health(AppType::Codex.as_str(), false)
+            .await
+            .expect("rollback takeover without clearing health");
+
+        let health = db
+            .get_provider_health(&provider.id, AppType::Codex.as_str())
+            .await
+            .expect("read provider health");
+        assert_eq!(health.consecutive_failures, 1);
+        assert!(!health.is_healthy);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_concurrent_start_reuses_one_proxy_server() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db);
+        service
+            .set_start_barrier_for_test(Arc::new(tokio::sync::Barrier::new(2)))
+            .await;
+
+        let first_service = service.clone();
+        let first = tokio::spawn(async move { first_service.start().await });
+        let second_service = service.clone();
+        let second = tokio::spawn(async move { second_service.start().await });
+
+        let first_info = first
+            .await
+            .expect("first start task")
+            .expect("first start succeeds");
+        let second_info = second
+            .await
+            .expect("second start task")
+            .expect("second start succeeds");
+        let running_port = service
+            .get_status()
+            .await
+            .expect("read running status")
+            .port;
+        service
+            .stop()
+            .await
+            .expect("stop proxy after assertion setup");
+
+        assert_eq!(first_info.port, second_info.port);
+        assert_eq!(running_port, first_info.port);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_plain_stop_rechecks_takeover_under_switch_guards() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload lifecycle settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db.clone());
+        seed_claude_takeover_provider(&db, &service);
+        let started = service.start().await.expect("start plain proxy");
+        assert!(
+            !db.get_proxy_config_for_app("claude")
+                .await
+                .expect("read initial Claude proxy config")
+                .enabled
+        );
+
+        let stop_checked = Arc::new(tokio::sync::Notify::new());
+        let stop_release = Arc::new(tokio::sync::Notify::new());
+        service
+            .set_plain_stop_takeover_check_pause_for_test(
+                stop_checked.clone(),
+                stop_release.clone(),
+            )
+            .await;
+
+        let stopping_service = service.clone();
+        let stop_task = tokio::spawn(async move { stopping_service.stop().await });
+        tokio::time::timeout(Duration::from_secs(2), stop_checked.notified())
+            .await
+            .expect("plain stop reaches the takeover-check window");
+
+        let enabling_service = service.clone();
+        let mut enable_task =
+            tokio::spawn(
+                async move { enabling_service.set_takeover_for_app("claude", true).await },
+            );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut enable_task)
+                .await
+                .is_err(),
+            "takeover enable must wait for the plain-stop transaction"
+        );
+
+        stop_release.notify_one();
+        let stop_result = stop_task.await.expect("plain stop task join");
+        stop_result.expect("plain stop completes before takeover enable");
+        enable_task
+            .await
+            .expect("takeover task join")
+            .expect("enable Claude takeover after plain stop");
+        let final_status = service.get_status().await.expect("read final proxy status");
+        let final_config = db
+            .get_proxy_config_for_app("claude")
+            .await
+            .expect("read final Claude proxy config");
+        let final_backup_present = db
+            .get_live_backup("claude")
+            .await
+            .expect("read final Claude backup")
+            .is_some();
+        let final_live = service.read_claude_live().expect("read final Claude Live");
+        let final_live_url = final_live
+            .get("env")
+            .and_then(|env| env.get("ANTHROPIC_BASE_URL"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let final_health = proxy_health_responds(started.port).await;
+
+        service
+            .set_takeover_for_app("claude", false)
+            .await
+            .expect("clean up Claude takeover");
+
+        assert!(final_status.running);
+        assert!(
+            final_health,
+            "the accepted takeover must keep a live listener"
+        );
+        assert!(final_config.enabled);
+        assert!(final_backup_present);
+        assert_eq!(
+            final_live_url.as_deref(),
+            Some(format!("http://127.0.0.1:{}", started.port).as_str())
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_plain_stop_refuses_partial_takeover_ownership_after_commit_failure() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload lifecycle settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db.clone());
+        seed_claude_takeover_provider(&db, &service);
+        let started = service.start().await.expect("start plain proxy");
+        fail_claude_takeover_enable_commit(&db);
+
+        let enable_error = service
+            .set_takeover_for_app("claude", true)
+            .await
+            .expect_err("injected enabled commit must fail takeover activation");
+        let partial_config = db
+            .get_proxy_config_for_app("claude")
+            .await
+            .expect("read partially activated Claude config");
+        let partial_live = service
+            .read_claude_live()
+            .expect("read partially taken-over Claude Live");
+        let partial_backup_present = db
+            .get_live_backup("claude")
+            .await
+            .expect("read partial Claude backup")
+            .is_some();
+
+        let stop_result = service.stop().await;
+        let status_after_stop = service
+            .get_status()
+            .await
+            .expect("read proxy status after rejected plain stop");
+        let health_after_stop = proxy_health_responds(started.port).await;
+        let backup_after_stop_present = db
+            .get_live_backup("claude")
+            .await
+            .expect("read retained Claude backup")
+            .is_some();
+        let live_after_stop = service
+            .read_claude_live()
+            .expect("read retained partial Claude Live");
+
+        service
+            .stop_with_restore()
+            .await
+            .expect("restore and stop partial Claude takeover");
+
+        assert!(enable_error.contains("injected Claude enabled commit failure"));
+        assert!(!partial_config.enabled);
+        assert!(partial_backup_present);
+        assert!(ProxyService::is_claude_live_taken_over(&partial_live));
+        assert!(
+            stop_result.as_ref().is_err_and(|error| {
+                error.contains("仍有应用处于代理接管状态")
+                    && error.contains("stop_with_restore")
+            }),
+            "plain stop must preserve partial takeover ownership and direct recovery: {stop_result:?}"
+        );
+        assert!(status_after_stop.running);
+        assert_eq!(status_after_stop.port, started.port);
+        assert!(health_after_stop);
+        assert!(backup_after_stop_present);
+        assert_eq!(live_after_stop, partial_live);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_takeover_waiting_on_plain_stop_starts_healthy_listener_after_stop() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload lifecycle settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db.clone());
+        seed_claude_takeover_provider(&db, &service);
+        service.start().await.expect("start initial plain proxy");
+
+        let stop_entered = Arc::new(tokio::sync::Notify::new());
+        let stop_release = Arc::new(tokio::sync::Notify::new());
+        service
+            .set_stop_pause_for_test(stop_entered.clone(), stop_release.clone())
+            .await;
+        let stopping_service = service.clone();
+        let stop_task = tokio::spawn(async move { stopping_service.stop().await });
+        tokio::time::timeout(Duration::from_secs(2), stop_entered.notified())
+            .await
+            .expect("plain stop owns all switch locks before stopping the listener");
+
+        use_ephemeral_proxy_port(&db).await;
+        let enabling_service = service.clone();
+        let mut enable_task =
+            tokio::spawn(
+                async move { enabling_service.set_takeover_for_app("claude", true).await },
+            );
+        let enable_while_stop_holds_switches =
+            tokio::time::timeout(Duration::from_millis(250), &mut enable_task).await;
+        assert!(
+            enable_while_stop_holds_switches.is_err(),
+            "takeover must wait while plain stop owns all app switch guards"
+        );
+
+        stop_release.notify_one();
+        stop_task
+            .await
+            .expect("plain stop task join")
+            .expect("plain stop completes before takeover");
+        enable_task
+            .await
+            .expect("takeover task join")
+            .expect("waiting takeover starts a replacement listener");
+
+        let final_status = service.get_status().await.expect("read final proxy status");
+        let final_config = db
+            .get_proxy_config_for_app("claude")
+            .await
+            .expect("read final Claude config");
+        assert!(final_status.running);
+        assert!(proxy_health_responds(final_status.port).await);
+        assert!(final_config.enabled);
+        assert!(db
+            .get_live_backup("claude")
+            .await
+            .expect("read final Claude backup")
+            .is_some());
+        assert!(service
+            .live_takeover_matches_current_proxy(&AppType::Claude)
+            .await
+            .expect("validate final Claude takeover"));
+
+        service
+            .set_takeover_for_app("claude", false)
+            .await
+            .expect("clean up final Claude takeover");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_last_disable_rechecks_other_app_takeover_before_plain_stop() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload lifecycle settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db.clone());
+        seed_claude_takeover_provider(&db, &service);
+        seed_gemini_takeover_live(&service);
+        service
+            .set_takeover_for_app("claude", true)
+            .await
+            .expect("enable initial Claude takeover");
+
+        let stop_checked = Arc::new(tokio::sync::Notify::new());
+        let stop_release = Arc::new(tokio::sync::Notify::new());
+        service
+            .set_plain_stop_takeover_check_pause_for_test(
+                stop_checked.clone(),
+                stop_release.clone(),
+            )
+            .await;
+        let disabling_service = service.clone();
+        let disable_task = tokio::spawn(async move {
+            disabling_service
+                .set_takeover_for_app("claude", false)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), stop_checked.notified())
+            .await
+            .expect("last-app disable releases its single guard before plain stop recheck");
+
+        let enabling_service = service.clone();
+        let mut enable_task =
+            tokio::spawn(
+                async move { enabling_service.set_takeover_for_app("gemini", true).await },
+            );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut enable_task)
+                .await
+                .is_err(),
+            "the proxy transaction keeps takeover enable behind the final disable"
+        );
+        stop_release.notify_one();
+        disable_task
+            .await
+            .expect("Claude disable task join")
+            .expect("Claude disable completes");
+        enable_task
+            .await
+            .expect("Gemini enable task join")
+            .expect("Gemini takeover starts after the disable transaction completes");
+
+        let final_status = service.get_status().await.expect("read final proxy status");
+        let claude_config = db
+            .get_proxy_config_for_app("claude")
+            .await
+            .expect("read final Claude config");
+        let gemini_config = db
+            .get_proxy_config_for_app("gemini")
+            .await
+            .expect("read final Gemini config");
+        assert!(final_status.running);
+        assert!(proxy_health_responds(final_status.port).await);
+        assert!(!claude_config.enabled);
+        assert!(db
+            .get_live_backup("claude")
+            .await
+            .expect("read cleaned Claude backup")
+            .is_none());
+        assert!(gemini_config.enabled);
+        assert!(db
+            .get_live_backup("gemini")
+            .await
+            .expect("read final Gemini backup")
+            .is_some());
+        assert!(service
+            .live_takeover_matches_current_proxy(&AppType::Gemini)
+            .await
+            .expect("validate final Gemini takeover"));
+
+        service
+            .set_takeover_for_app("gemini", false)
+            .await
+            .expect("clean up final Gemini takeover");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_start_waits_until_stop_transition_finishes() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db.clone());
+        let first_info = service.start().await.expect("start initial proxy");
+
+        // The first ephemeral port is persisted. Reset to zero so the RED
+        // implementation can expose a second live instance instead of failing bind.
+        use_ephemeral_proxy_port(&db).await;
+        let stop_entered = Arc::new(tokio::sync::Notify::new());
+        let stop_release = Arc::new(tokio::sync::Notify::new());
+        service
+            .set_stop_pause_for_test(stop_entered.clone(), stop_release.clone())
+            .await;
+
+        let stop_service = service.clone();
+        let stop_task = tokio::spawn(async move { stop_service.stop().await });
+        tokio::time::timeout(Duration::from_secs(2), stop_entered.notified())
+            .await
+            .expect("stop reaches the controlled transition window");
+
+        let start_service = service.clone();
+        let mut start_task = tokio::spawn(async move { start_service.start().await });
+        let completed_during_stop =
+            tokio::time::timeout(Duration::from_millis(250), &mut start_task).await;
+        let start_finished_early = completed_during_stop.is_ok();
+
+        stop_release.notify_one();
+        stop_task
+            .await
+            .expect("stop task join")
+            .expect("stop succeeds");
+        let second_info = match completed_during_stop {
+            Ok(result) => result.expect("start task join").expect("start succeeds"),
+            Err(_) => start_task
+                .await
+                .expect("start task join")
+                .expect("start succeeds"),
+        };
+        let status = service.get_status().await.expect("read final proxy status");
+        let proxy_enabled = db
+            .get_global_proxy_config()
+            .await
+            .expect("read global proxy config")
+            .proxy_enabled;
+        service.stop().await.expect("stop final proxy");
+
+        assert!(
+            !start_finished_early,
+            "start must remain blocked while stop owns the lifecycle transition"
+        );
+        assert_ne!(first_info.port, second_info.port);
+        assert!(status.running);
+        assert_eq!(status.port, second_info.port);
+        assert!(proxy_enabled);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_start_waits_until_update_config_restart_finishes() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let restart_stop_entered = Arc::new(tokio::sync::Notify::new());
+        let restart_stop_release = Arc::new(tokio::sync::Notify::new());
+
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                ..Default::default()
+            },
+            db.clone(),
+            None,
+        );
+        let entered = restart_stop_entered.clone();
+        let release = restart_stop_release.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let old_handle = tokio::spawn(async move {
+            let _ = shutdown_rx.await;
+            entered.notify_one();
+            release.notified().await;
+        });
+        server
+            .install_server_task_for_test(shutdown_tx, old_handle)
+            .await;
+        *service.server.write().await = Some(server);
+
+        let replacement_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve replacement proxy port");
+        let replacement_port = replacement_listener
+            .local_addr()
+            .expect("read replacement proxy port")
+            .port();
+        drop(replacement_listener);
+        let mut new_config = db.get_proxy_config().await.expect("read proxy config");
+        new_config.listen_port = replacement_port;
+        let updating_service = service.clone();
+        let update_task =
+            tokio::spawn(async move { updating_service.update_config(&new_config).await });
+        tokio::time::timeout(Duration::from_secs(1), restart_stop_entered.notified())
+            .await
+            .expect("restart reaches old-server stop");
+
+        let starting_service = service.clone();
+        let mut start_task = tokio::spawn(async move { starting_service.start().await });
+        let start_during_restart =
+            tokio::time::timeout(Duration::from_millis(250), &mut start_task).await;
+        let start_finished_early = start_during_restart.is_ok();
+
+        restart_stop_release.notify_one();
+        update_task
+            .await
+            .expect("update task join")
+            .expect("restart succeeds");
+        let start_info = match start_during_restart {
+            Ok(result) => result.expect("start task join").expect("start succeeds"),
+            Err(_) => start_task
+                .await
+                .expect("start task join")
+                .expect("start succeeds"),
+        };
+        let status = service.get_status().await.expect("read restarted status");
+        service.stop().await.expect("stop restarted proxy");
+
+        assert!(
+            !start_finished_early,
+            "start must wait while update_config owns the restart transition"
+        );
+        assert!(status.running);
+        assert_eq!(start_info.port, status.port);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_retrying_cancelled_config_update_restarts_from_live_bind_state() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve first proxy port");
+        let first_port = first_listener
+            .local_addr()
+            .expect("read first proxy port")
+            .port();
+        drop(first_listener);
+        let mut first_config = db.get_proxy_config().await.expect("read proxy config");
+        first_config.listen_port = first_port;
+        db.update_proxy_config(first_config)
+            .await
+            .expect("persist first proxy port");
+
+        let service = ProxyService::new(db.clone());
+        service.start().await.expect("start first proxy listener");
+        assert!(proxy_health_responds(first_port).await);
+
+        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve second proxy port");
+        let second_port = second_listener
+            .local_addr()
+            .expect("read second proxy port")
+            .port();
+        assert_ne!(first_port, second_port);
+        let mut second_config = db.get_proxy_config().await.expect("read proxy config");
+        second_config.listen_port = second_port;
+
+        // Let update_config persist P2, then block it before it can inspect or
+        // replace the P1 server slot.
+        let blocked_server_slot = service.server.read().await;
+        let updating_service = service.clone();
+        let cancelled_config = second_config.clone();
+        let update_task =
+            tokio::spawn(async move { updating_service.update_config(&cancelled_config).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if db
+                    .get_proxy_config()
+                    .await
+                    .expect("poll persisted proxy config")
+                    .listen_port
+                    == second_port
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first update persists P2 before blocking on the server slot");
+        update_task.abort();
+        let update_join = update_task.await;
+        drop(blocked_server_slot);
+        drop(second_listener);
+
+        assert!(update_join.is_err_and(|error| error.is_cancelled()));
+        assert_eq!(
+            service
+                .get_status()
+                .await
+                .expect("read stale live status")
+                .port,
+            first_port,
+            "the cancelled first attempt leaves the P1 listener alive"
+        );
+
+        service
+            .update_config(&second_config)
+            .await
+            .expect("same P2 retry compares against the live listener and restarts");
+        let final_status = service.get_status().await.expect("read P2 proxy status");
+
+        assert_eq!(final_status.port, second_port);
+        assert!(proxy_health_responds(second_port).await);
+        assert!(
+            !proxy_health_responds(first_port).await,
+            "the P1 listener must close after the P2 retry"
+        );
+        service.stop().await.expect("stop P2 proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_stop_timeout_still_persists_disabled_state() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let mut global_config = db
+            .get_global_proxy_config()
+            .await
+            .expect("read global proxy config");
+        global_config.proxy_enabled = true;
+        db.update_global_proxy_config(global_config)
+            .await
+            .expect("enable global proxy config");
+
+        let mut server = ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                ..Default::default()
+            },
+            db.clone(),
+            None,
+        );
+        server.set_stop_timeout_for_test(Duration::from_millis(50));
+        let pending_handle = tokio::spawn(async {
+            futures::future::pending::<()>().await;
+        });
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
+        server
+            .install_server_task_for_test(shutdown_tx, pending_handle)
+            .await;
+        *service.server.write().await = Some(server);
+
+        let stop_result = service.stop().await;
+        let proxy_enabled = db
+            .get_global_proxy_config()
+            .await
+            .expect("read stopped global proxy config")
+            .proxy_enabled;
+
+        assert!(
+            stop_result
+                .as_ref()
+                .is_err_and(|error| error.contains("停止超时")),
+            "the graceful-stop timeout remains visible to callers"
+        );
+        assert!(!service.is_running().await);
+        assert!(
+            !proxy_enabled,
+            "a reaped timeout generation must still persist the stopped state"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_restart_stop_timeout_still_persists_disabled_state() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let mut global_config = db
+            .get_global_proxy_config()
+            .await
+            .expect("read global proxy config");
+        global_config.proxy_enabled = true;
+        db.update_global_proxy_config(global_config)
+            .await
+            .expect("enable global proxy config");
+
+        let mut server = ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                ..Default::default()
+            },
+            db.clone(),
+            None,
+        );
+        server.set_stop_timeout_for_test(Duration::from_millis(50));
+        let pending_handle = tokio::spawn(async {
+            futures::future::pending::<()>().await;
+        });
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
+        server
+            .install_server_task_for_test(shutdown_tx, pending_handle)
+            .await;
+        *service.server.write().await = Some(server);
+
+        let mut new_config = db.get_proxy_config().await.expect("read proxy config");
+        new_config.listen_port = 1;
+        let update_result = service.update_config(&new_config).await;
+        let proxy_enabled = db
+            .get_global_proxy_config()
+            .await
+            .expect("read stopped global proxy config")
+            .proxy_enabled;
+
+        assert!(
+            update_result
+                .as_ref()
+                .is_err_and(|error| error.contains("重启前停止代理服务器失败: 停止超时")),
+            "the restart caller still receives the graceful-stop timeout"
+        );
+        assert!(!service.is_running().await);
+        assert!(
+            !proxy_enabled,
+            "a failed restart with a reaped old task must persist disabled state"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_restart_bind_failure_persists_disabled_state() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db.clone());
+        service.start().await.expect("start initial proxy");
+
+        let occupied_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind occupied restart port");
+        let occupied_port = occupied_listener
+            .local_addr()
+            .expect("read occupied port")
+            .port();
+        let mut new_config = db.get_proxy_config().await.expect("read proxy config");
+        new_config.listen_address = "127.0.0.1".to_string();
+        new_config.listen_port = occupied_port;
+
+        let update_result = service.update_config(&new_config).await;
+        let proxy_enabled = db
+            .get_global_proxy_config()
+            .await
+            .expect("read failed-restart global proxy config")
+            .proxy_enabled;
+
+        assert!(update_result
+            .as_ref()
+            .is_err_and(|error| error.contains("重启代理服务器失败")));
+        assert!(!service.is_running().await);
+        assert!(
+            !proxy_enabled,
+            "a failed restart bind must persist disabled state"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_direct_start_invalid_address_persists_disabled_state() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        let mut config = db.get_proxy_config().await.expect("read proxy config");
+        config.listen_address = "not-a-socket-address".to_string();
+        db.update_proxy_config(config)
+            .await
+            .expect("persist invalid proxy address");
+        let service = ProxyService::new(db.clone());
+
+        let start_result = service.start().await;
+        let global = db
+            .get_global_proxy_config()
+            .await
+            .expect("read failed-start global config");
+
+        assert!(
+            start_result
+                .as_ref()
+                .is_err_and(|error| error.contains("无效的地址")),
+            "the original address parse failure remains visible"
+        );
+        assert!(!service.is_running().await);
+        assert!(!global.proxy_enabled);
+        assert!(service.server.read().await.is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_direct_start_bind_failure_persists_disabled_state() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        let occupied_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind occupied direct-start port");
+        let occupied_port = occupied_listener
+            .local_addr()
+            .expect("read occupied direct-start port")
+            .port();
+        let mut config = db.get_proxy_config().await.expect("read proxy config");
+        config.listen_port = occupied_port;
+        db.update_proxy_config(config)
+            .await
+            .expect("persist occupied direct-start port");
+        let service = ProxyService::new(db.clone());
+
+        let start_result = service.start().await;
+        let global = db
+            .get_global_proxy_config()
+            .await
+            .expect("read failed-start global config");
+
+        assert!(
+            start_result
+                .as_ref()
+                .is_err_and(|error| error.contains("地址绑定失败")),
+            "the original bind failure remains visible"
+        );
+        assert!(!service.is_running().await);
+        assert!(!global.proxy_enabled);
+        assert!(service.server.read().await.is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_direct_start_dynamic_port_persist_failure_disables_and_clears_slot() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        fail_resolved_port_persistence(&db);
+        let service = ProxyService::new(db.clone());
+
+        let start_result = service.start().await;
+        let global = db
+            .get_global_proxy_config()
+            .await
+            .expect("read dynamic-port failure global config");
+
+        assert!(
+            start_result
+                .as_ref()
+                .is_err_and(|error| error.contains("保存动态代理端口失败")),
+            "the original dynamic-port persistence error remains visible"
+        );
+        assert!(!service.is_running().await);
+        assert!(!global.proxy_enabled);
+        assert!(service.server.read().await.is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_restart_dynamic_port_persist_failure_disables_and_clears_slot() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        let initial_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve initial fixed proxy port");
+        let initial_port = initial_listener
+            .local_addr()
+            .expect("read initial fixed proxy port")
+            .port();
+        drop(initial_listener);
+        let mut initial_config = db.get_proxy_config().await.expect("read proxy config");
+        initial_config.listen_port = initial_port;
+        db.update_proxy_config(initial_config)
+            .await
+            .expect("persist initial fixed proxy port");
+        let service = ProxyService::new(db.clone());
+        service.start().await.expect("start initial fixed proxy");
+        fail_resolved_port_persistence(&db);
+
+        let mut dynamic_config = db
+            .get_proxy_config()
+            .await
+            .expect("read fixed proxy config");
+        dynamic_config.listen_port = 0;
+        let update_result = service.update_config(&dynamic_config).await;
+        let global = db
+            .get_global_proxy_config()
+            .await
+            .expect("read restart dynamic-port failure global config");
+
+        assert!(
+            update_result
+                .as_ref()
+                .is_err_and(|error| error.contains("保存动态代理端口失败")),
+            "the restart returns the original dynamic-port persistence error"
+        );
+        assert!(!service.is_running().await);
+        assert!(!global.proxy_enabled);
+        assert!(service.server.read().await.is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_same_config_retry_reconciles_enabled_takeover_after_write_failure() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload lifecycle settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db.clone());
+        seed_claude_takeover_provider(&db, &service);
+        service
+            .set_takeover_for_app("claude", true)
+            .await
+            .expect("enable Claude takeover");
+        let first_status = service.get_status().await.expect("read first proxy status");
+        let first_live = service.read_claude_live().expect("read first Claude Live");
+        let first_live_url = first_live
+            .get("env")
+            .and_then(|env| env.get("ANTHROPIC_BASE_URL"))
+            .and_then(Value::as_str)
+            .expect("read first Claude takeover URL")
+            .to_string();
+
+        let next_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve next takeover port");
+        let next_port = next_listener
+            .local_addr()
+            .expect("read next takeover port")
+            .port();
+        drop(next_listener);
+        assert_ne!(first_status.port, next_port);
+        let mut next_config = db.get_proxy_config().await.expect("read proxy config");
+        next_config.listen_port = next_port;
+        service.fail_next_takeover_write_for_test("claude");
+
+        let first_update = service.update_config(&next_config).await;
+        let status_after_failed_reconcile = service
+            .get_status()
+            .await
+            .expect("read restarted proxy status");
+        let live_after_failed_reconcile = service
+            .read_claude_live()
+            .expect("read unreconciled Claude Live");
+        let stale_live_url = live_after_failed_reconcile
+            .get("env")
+            .and_then(|env| env.get("ANTHROPIC_BASE_URL"))
+            .and_then(Value::as_str)
+            .expect("read stale Claude takeover URL");
+
+        assert!(first_update
+            .as_ref()
+            .is_err_and(|error| error.contains("injected claude takeover Live write failure")));
+        assert_eq!(status_after_failed_reconcile.port, next_port);
+        assert_eq!(stale_live_url, first_live_url);
+
+        service
+            .update_config(&next_config)
+            .await
+            .expect("same config retry strictly reconciles enabled takeover");
+        let final_status = service.get_status().await.expect("read final proxy status");
+        let final_live = service.read_claude_live().expect("read final Claude Live");
+        let final_live_url = final_live
+            .get("env")
+            .and_then(|env| env.get("ANTHROPIC_BASE_URL"))
+            .and_then(Value::as_str)
+            .expect("read final Claude takeover URL");
+
+        assert_eq!(final_status.port, next_port);
+        assert_eq!(final_live_url, format!("http://127.0.0.1:{next_port}"));
+        assert!(proxy_health_responds(next_port).await);
+        service
+            .set_takeover_for_app("claude", false)
+            .await
+            .expect("disable Claude takeover");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_cancelled_start_after_server_started_keeps_instance_owned() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db);
+        let install_entered = Arc::new(tokio::sync::Notify::new());
+        let install_release = Arc::new(tokio::sync::Notify::new());
+        service
+            .set_start_install_pause_for_test(install_entered.clone(), install_release)
+            .await;
+
+        let starting_service = service.clone();
+        let start_task = tokio::spawn(async move { starting_service.start().await });
+        tokio::time::timeout(Duration::from_secs(2), install_entered.notified())
+            .await
+            .expect("start reaches the post-bind installation window");
+        start_task.abort();
+        let start_join = start_task.await;
+
+        let owned_after_cancel = service.is_running().await;
+        let status_after_cancel = service.get_status().await.expect("read proxy status");
+        if owned_after_cancel {
+            service.stop().await.expect("stop retained proxy instance");
+        }
+
+        assert!(start_join.is_err_and(|error| error.is_cancelled()));
+        assert!(
+            owned_after_cancel,
+            "a successfully started server must be installed before the next cancellation point"
+        );
+        assert!(status_after_cancel.running);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_cancelled_stop_keeps_service_server_slot_owned() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db);
+        service.start().await.expect("start proxy");
+
+        let stop_entered = Arc::new(tokio::sync::Notify::new());
+        let stop_release = Arc::new(tokio::sync::Notify::new());
+        service
+            .set_stop_pause_for_test(stop_entered.clone(), stop_release)
+            .await;
+        let stopping_service = service.clone();
+        let stop_task = tokio::spawn(async move { stopping_service.stop().await });
+        tokio::time::timeout(Duration::from_secs(1), stop_entered.notified())
+            .await
+            .expect("stop reaches the owned-slot window");
+        stop_task.abort();
+        let stop_join = stop_task.await;
+
+        let owned_after_cancel = service.is_running().await;
+        if owned_after_cancel {
+            service.stop().await.expect("retry stop retained instance");
+        }
+
+        assert!(stop_join.is_err_and(|error| error.is_cancelled()));
+        assert!(
+            owned_after_cancel,
+            "cancelling service stop must retain the server slot until task reaping completes"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_start_replaces_server_left_stopping_after_cancelled_stop() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db.clone());
+        let first_info = service.start().await.expect("start initial proxy");
+
+        let next_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve next proxy port");
+        let next_port = next_listener
+            .local_addr()
+            .expect("read next proxy port")
+            .port();
+        assert_ne!(first_info.port, next_port);
+        let mut next_config = db.get_proxy_config().await.expect("read proxy config");
+        next_config.listen_port = next_port;
+        db.update_proxy_config(next_config)
+            .await
+            .expect("persist next proxy port");
+
+        let publish_entered = Arc::new(tokio::sync::Notify::new());
+        let publish_release = Arc::new(tokio::sync::Notify::new());
+        service
+            .server
+            .read()
+            .await
+            .as_ref()
+            .expect("installed proxy server")
+            .set_stop_publish_pause_for_test(publish_entered.clone(), publish_release)
+            .await;
+
+        let stopping_service = service.clone();
+        let stop_task = tokio::spawn(async move { stopping_service.stop().await });
+        tokio::time::timeout(Duration::from_secs(2), publish_entered.notified())
+            .await
+            .expect("stop reaches the completed-result publication window");
+        stop_task.abort();
+        let stop_join = stop_task.await;
+
+        assert!(stop_join.is_err_and(|error| error.is_cancelled()));
+        assert!(
+            !service.is_running().await,
+            "a completed listener in Stopping must not be reported as running"
+        );
+
+        drop(next_listener);
+        let second_info = service
+            .start()
+            .await
+            .expect("start reaps the cancelled stop and creates a new server");
+        let new_connection = tokio::net::TcpStream::connect(("127.0.0.1", second_info.port)).await;
+
+        assert_eq!(second_info.port, next_port);
+        assert!(
+            new_connection.is_ok(),
+            "the replacement server must accept TCP connections"
+        );
+        service.stop().await.expect("stop replacement proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_cancelled_restart_stop_is_reaped_by_next_start() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let stop_entered = Arc::new(tokio::sync::Notify::new());
+        let stop_release = Arc::new(tokio::sync::Notify::new());
+
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                ..Default::default()
+            },
+            db.clone(),
+            None,
+        );
+        let entered = stop_entered.clone();
+        let release = stop_release.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let pending_handle = tokio::spawn(async move {
+            let _ = shutdown_rx.await;
+            entered.notify_one();
+            release.notified().await;
+        });
+        server
+            .install_server_task_for_test(shutdown_tx, pending_handle)
+            .await;
+        *service.server.write().await = Some(server);
+
+        let replacement_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve cancelled-restart replacement port");
+        let replacement_port = replacement_listener
+            .local_addr()
+            .expect("read cancelled-restart replacement port")
+            .port();
+        drop(replacement_listener);
+        let mut new_config = db.get_proxy_config().await.expect("read proxy config");
+        new_config.listen_port = replacement_port;
+        let updating_service = service.clone();
+        let update_task =
+            tokio::spawn(async move { updating_service.update_config(&new_config).await });
+        tokio::time::timeout(Duration::from_secs(1), stop_entered.notified())
+            .await
+            .expect("restart sends shutdown to the old server");
+        update_task.abort();
+        let update_join = update_task.await;
+
+        let running_after_cancel = service.is_running().await;
+        stop_release.notify_one();
+        let replacement = service
+            .start()
+            .await
+            .expect("next start reaps the cancelled restart task");
+
+        assert!(update_join.is_err_and(|error| error.is_cancelled()));
+        assert!(
+            !running_after_cancel,
+            "shutdown-sent old tasks are owned for reaping without being reported as live"
+        );
+        assert_eq!(replacement.port, replacement_port);
+        assert!(proxy_health_responds(replacement_port).await);
+        service.stop().await.expect("stop replacement proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_cancelled_restart_after_new_server_started_keeps_instance_owned() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db.clone());
+        service.start().await.expect("start initial proxy");
+
+        let install_entered = Arc::new(tokio::sync::Notify::new());
+        let install_release = Arc::new(tokio::sync::Notify::new());
+        service
+            .set_start_install_pause_for_test(install_entered.clone(), install_release)
+            .await;
+        let replacement_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve restarted proxy port");
+        let replacement_port = replacement_listener
+            .local_addr()
+            .expect("read restarted proxy port")
+            .port();
+        drop(replacement_listener);
+        let mut new_config = db.get_proxy_config().await.expect("read proxy config");
+        new_config.listen_port = replacement_port;
+        let updating_service = service.clone();
+        let update_task =
+            tokio::spawn(async move { updating_service.update_config(&new_config).await });
+        tokio::time::timeout(Duration::from_secs(2), install_entered.notified())
+            .await
+            .expect("restart reaches the post-start installation window");
+        update_task.abort();
+        let update_join = update_task.await;
+
+        let owned_after_cancel = service.is_running().await;
+        let status_after_cancel = service.get_status().await.expect("read proxy status");
+        if owned_after_cancel {
+            service
+                .stop()
+                .await
+                .expect("stop retained restart instance");
+        }
+
+        assert!(update_join.is_err_and(|error| error.is_cancelled()));
+        assert!(
+            owned_after_cancel,
+            "a restarted server must be installed before the next cancellation point"
+        );
+        assert!(status_after_cancel.running);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_stop_with_restore_completes_cleanup_then_returns_stop_timeout() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let original_live = json!({
+            "env": {
+                "ANTHROPIC_API_KEY": "original-key",
+                "ANTHROPIC_BASE_URL": "https://api.anthropic.com"
+            }
+        });
+        service
+            .write_claude_live(&json!({
+                "env": {
+                    "ANTHROPIC_AUTH_TOKEN": PROXY_TOKEN_PLACEHOLDER,
+                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:15721"
+                }
+            }))
+            .expect("seed taken-over Claude Live");
+        db.save_live_backup(
+            "claude",
+            &serde_json::to_string(&original_live).expect("serialize original Claude Live"),
+        )
+        .await
+        .expect("save original Claude backup");
+        let mut claude_config = db
+            .get_proxy_config_for_app("claude")
+            .await
+            .expect("read Claude proxy config");
+        claude_config.enabled = true;
+        db.update_proxy_config_for_app(claude_config)
+            .await
+            .expect("enable Claude takeover state");
+        let mut global = db
+            .get_global_proxy_config()
+            .await
+            .expect("read global proxy config");
+        global.proxy_enabled = true;
+        db.update_global_proxy_config(global)
+            .await
+            .expect("enable global proxy state");
+
+        let mut server = ProxyServer::new(ProxyConfig::default(), db.clone(), None);
+        server.set_stop_timeout_for_test(Duration::from_millis(50));
+        let pending_handle = tokio::spawn(async {
+            futures::future::pending::<()>().await;
+        });
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
+        server
+            .install_server_task_for_test(shutdown_tx, pending_handle)
+            .await;
+        *service.server.write().await = Some(server);
+
+        let stop_result = service.stop_with_restore().await;
+        let restored_live = service
+            .read_claude_live()
+            .expect("read restored Claude Live");
+        let final_claude_config = db
+            .get_proxy_config_for_app("claude")
+            .await
+            .expect("read final Claude proxy config");
+
+        assert!(
+            stop_result
+                .as_ref()
+                .is_err_and(|error| error.contains("停止代理服务器失败: 停止超时")),
+            "the real graceful-stop timeout remains visible after cleanup"
+        );
+        assert_eq!(restored_live, original_live);
+        assert!(!final_claude_config.enabled);
+        assert!(db
+            .get_live_backup("claude")
+            .await
+            .expect("read cleaned Claude backup")
+            .is_none());
+        assert!(!service.is_running().await);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_stop_error_has_priority_when_restore_also_fails() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        db.save_live_backup("claude", "{ invalid backup")
+            .await
+            .expect("save invalid Claude backup");
+
+        let mut server = ProxyServer::new(ProxyConfig::default(), db.clone(), None);
+        server.set_stop_timeout_for_test(Duration::from_millis(50));
+        let pending_handle = tokio::spawn(async {
+            futures::future::pending::<()>().await;
+        });
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
+        server
+            .install_server_task_for_test(shutdown_tx, pending_handle)
+            .await;
+        *service.server.write().await = Some(server);
+
+        let stop_error = service
+            .stop_with_restore()
+            .await
+            .expect_err("stop and restore must both fail");
+
+        assert!(
+            stop_error.starts_with("停止代理服务器失败: 停止超时"),
+            "the stop timeout remains the primary error: {stop_error}"
+        );
+        assert!(
+            stop_error.contains("Live 恢复/清理失败")
+                && stop_error.contains("解析 claude 备份失败"),
+            "the returned error must append the restore failure context: {stop_error}"
+        );
+        assert!(
+            db.get_live_backup("claude")
+                .await
+                .expect("read retained invalid backup")
+                .is_some(),
+            "failed restore keeps its backup for a later recovery attempt"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_keep_state_cleanup_preserves_stop_failed_and_enabled_state() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let original_live = json!({
+            "env": {
+                "ANTHROPIC_API_KEY": "keep-state-key",
+                "ANTHROPIC_BASE_URL": "https://api.anthropic.com"
+            }
+        });
+        service
+            .write_claude_live(&json!({
+                "env": {
+                    "ANTHROPIC_AUTH_TOKEN": PROXY_TOKEN_PLACEHOLDER,
+                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:15721"
+                }
+            }))
+            .expect("seed taken-over Claude Live");
+        db.save_live_backup(
+            "claude",
+            &serde_json::to_string(&original_live).expect("serialize keep-state backup"),
+        )
+        .await
+        .expect("save keep-state Claude backup");
+        let mut claude_config = db
+            .get_proxy_config_for_app("claude")
+            .await
+            .expect("read Claude proxy config");
+        claude_config.enabled = true;
+        db.update_proxy_config_for_app(claude_config)
+            .await
+            .expect("enable Claude takeover state");
+
+        let failed_handle = tokio::spawn(async {
+            panic!("injected proxy task failure");
+        });
+        while !failed_handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = ProxyServer::new(ProxyConfig::default(), db.clone(), None);
+        server
+            .install_server_task_for_test(shutdown_tx, failed_handle)
+            .await;
+        *service.server.write().await = Some(server);
+
+        let stop_result = service.stop_with_restore_keep_state().await;
+        let restored_live = service
+            .read_claude_live()
+            .expect("read restored Claude Live");
+        let final_claude_config = db
+            .get_proxy_config_for_app("claude")
+            .await
+            .expect("read final Claude proxy config");
+
+        assert!(
+            stop_result
+                .as_ref()
+                .is_err_and(|error| error.contains("停止代理服务器失败: 停止失败")),
+            "the real JoinError-backed StopFailed remains visible after cleanup"
+        );
+        assert_eq!(restored_live, original_live);
+        assert!(final_claude_config.enabled);
+        assert!(db
+            .get_live_backup("claude")
+            .await
+            .expect("read cleaned keep-state backup")
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_restore_wrappers_are_idempotent_without_server_slot() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db);
+
+        service
+            .stop_with_restore()
+            .await
+            .expect("manual restore wrapper treats no slot as stopped");
+        service
+            .stop_with_restore_keep_state()
+            .await
+            .expect("keep-state restore wrapper treats no slot as stopped");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_stop_with_restore_serializes_concurrent_takeover_reenable() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload lifecycle settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db.clone());
+        seed_claude_takeover_provider(&db, &service);
+        service
+            .set_takeover_for_app("claude", true)
+            .await
+            .expect("enable initial Claude takeover");
+
+        let cleanup_entered = Arc::new(tokio::sync::Notify::new());
+        let cleanup_release = Arc::new(tokio::sync::Notify::new());
+        service
+            .set_restore_cleanup_pause_for_test(cleanup_entered.clone(), cleanup_release.clone())
+            .await;
+        let restoring_service = service.clone();
+        let restore_task = tokio::spawn(async move { restoring_service.stop_with_restore().await });
+        tokio::time::timeout(Duration::from_secs(2), cleanup_entered.notified())
+            .await
+            .expect("restore wrapper stops before its restore/cleanup phase");
+
+        let mut ephemeral_config = db.get_proxy_config().await.expect("read proxy config");
+        ephemeral_config.listen_port = 0;
+        db.update_proxy_config(ephemeral_config)
+            .await
+            .expect("request a fresh port for the re-enabled takeover");
+        let enabling_service = service.clone();
+        let mut enable_task =
+            tokio::spawn(
+                async move { enabling_service.set_takeover_for_app("claude", true).await },
+            );
+        let enable_while_restore_paused =
+            tokio::time::timeout(Duration::from_millis(250), &mut enable_task).await;
+
+        assert!(
+            enable_while_restore_paused.is_err(),
+            "takeover re-enable must wait for the wrapper's switch-guarded cleanup"
+        );
+        cleanup_release.notify_one();
+        restore_task
+            .await
+            .expect("restore task join")
+            .expect("restore wrapper succeeds");
+        enable_task
+            .await
+            .expect("enable task join")
+            .expect("takeover re-enable succeeds after restore cleanup");
+
+        let final_config = db
+            .get_proxy_config_for_app("claude")
+            .await
+            .expect("read final Claude proxy config");
+        assert!(service.is_running().await);
+        assert!(final_config.enabled);
+        assert!(db
+            .get_live_backup("claude")
+            .await
+            .expect("read final Claude backup")
+            .is_some());
+        assert!(service
+            .live_takeover_matches_current_proxy(&AppType::Claude)
+            .await
+            .expect("validate final Claude takeover URL"));
+        service
+            .set_takeover_for_app("claude", false)
+            .await
+            .expect("disable final Claude takeover");
     }
 
     fn seed_codex_model_template() {
@@ -5727,6 +8338,124 @@ model = "gpt-5.1-codex"
 
     #[tokio::test]
     #[serial]
+    async fn hot_switch_provider_waits_for_proxy_transaction() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let provider = Provider::with_id(
+            "target".to_string(),
+            "Target".to_string(),
+            json!({ "env": { "ANTHROPIC_API_KEY": "target-key" } }),
+            None,
+        );
+        db.save_provider("claude", &provider)
+            .expect("save target provider");
+        let transaction = service.lock_transaction().await;
+        let switching_service = service.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let result = switching_service
+                .hot_switch_provider("claude", "target")
+                .await;
+            let _ = done_tx.send(());
+            result
+        });
+
+        assert!(tokio::time::timeout(Duration::from_millis(50), done_rx)
+            .await
+            .is_err());
+        drop(transaction);
+        task.await
+            .expect("join hot switch")
+            .expect("hot switch after transaction release");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn update_live_backup_waits_for_proxy_transaction() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db);
+        let provider = Provider::with_id(
+            "target".to_string(),
+            "Target".to_string(),
+            json!({ "env": { "ANTHROPIC_API_KEY": "target-key" } }),
+            None,
+        );
+        let transaction = service.lock_transaction().await;
+        let updating_service = service.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let result = updating_service
+                .update_live_backup_from_provider("claude", &provider)
+                .await;
+            let _ = done_tx.send(());
+            result
+        });
+
+        assert!(tokio::time::timeout(Duration::from_millis(50), done_rx)
+            .await
+            .is_err());
+        drop(transaction);
+        task.await
+            .expect("join backup update")
+            .expect("backup update after transaction release");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn crash_recovery_waits_for_proxy_transaction() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db);
+        let transaction = service.lock_transaction().await;
+        let recovering_service = service.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let result = recovering_service.recover_from_crash().await;
+            let _ = done_tx.send(());
+            result
+        });
+
+        assert!(tokio::time::timeout(Duration::from_millis(50), done_rx)
+            .await
+            .is_err());
+        drop(transaction);
+        task.await
+            .expect("join crash recovery")
+            .expect("crash recovery after transaction release");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn synchronous_takeover_disable_waits_for_proxy_transaction() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db);
+        let transaction = service.lock_transaction().await;
+        let disabling_service = service.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            let result = disabling_service.disable_takeover_for_app_sync(&AppType::Claude);
+            let _ = done_tx.send(());
+            result
+        });
+
+        assert!(tokio::time::timeout(Duration::from_millis(50), done_rx)
+            .await
+            .is_err());
+        drop(transaction);
+        task.await
+            .expect("join synchronous disable")
+            .expect("disable after transaction release");
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn restore_waits_for_hot_switch_and_restores_latest_backup() {
         use tokio::time::{sleep, Duration};
 
@@ -6497,7 +9226,6 @@ requires_openai_auth = true
 
         crate::services::provider::ProviderService::switch(&state, AppType::Codex, "b")
             .expect("provider switch to provider b");
-        state.proxy_service.stop().await.expect("stop proxy server");
 
         let catalog_path = crate::codex_config::get_codex_model_catalog_path();
         assert!(
@@ -6539,6 +9267,12 @@ requires_openai_auth = true
             config_text.contains(r#"command = "shared-command""#),
             "config.toml must include common config content after switch"
         );
+
+        state
+            .proxy_service
+            .stop_with_restore()
+            .await
+            .expect("stop proxy server and restore Codex live config");
     }
 
     #[tokio::test]
@@ -6639,13 +9373,19 @@ requires_openai_auth = true
 
         let err = crate::services::provider::ProviderService::switch(&state, AppType::Codex, "b")
             .expect_err("provider switch should fail when catalog cannot be written");
-        state.proxy_service.stop().await.expect("stop proxy server");
 
         let message = err.to_string();
         assert!(
             message.contains("写入 Codex 配置失败") || message.contains("原子替换失败"),
             "switch should surface catalog write failure, got: {message}"
         );
+
+        std::fs::remove_dir(&catalog_path).expect("remove injected catalog directory");
+        state
+            .proxy_service
+            .stop_with_restore()
+            .await
+            .expect("stop proxy server and restore Codex live config");
     }
 
     #[tokio::test]
@@ -6724,7 +9464,6 @@ requires_openai_auth = true
 
         let error = crate::services::provider::ProviderService::switch(&state, AppType::Codex, "b")
             .expect_err("database commit should fail");
-        state.proxy_service.stop().await.expect("stop proxy server");
 
         assert!(error
             .to_string()
@@ -6747,6 +9486,12 @@ requires_openai_auth = true
             crate::settings::get_current_provider(&AppType::Codex).as_deref(),
             Some("a")
         );
+
+        state
+            .proxy_service
+            .stop_with_restore()
+            .await
+            .expect("stop proxy server and restore Codex live config");
     }
 
     /// Regression: turning proxy takeover off restores Live from the backup. The

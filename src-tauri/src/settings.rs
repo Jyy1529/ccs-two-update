@@ -357,12 +357,18 @@ pub struct AppSettings {
     /// 是否开机自启
     #[serde(default)]
     pub launch_on_startup: bool,
+    /// 是否启用 Codex Desktop 健康检测
+    #[serde(default)]
+    pub codex_repair_detection_enabled: bool,
     /// 静默启动（程序启动时不显示主窗口，仅托盘运行）
     #[serde(default)]
     pub silent_startup: bool,
     /// 是否在主页面启用本地代理功能（默认关闭）
     #[serde(default)]
     pub enable_local_proxy: bool,
+    /// 全局 Provider 自动重试开关；None 兼容旧 settings.json，按开启处理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_retry_enabled: Option<bool>,
     /// User has confirmed the local proxy first-run notice
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_confirmed: Option<bool>,
@@ -511,8 +517,10 @@ impl Default for AppSettings {
             enable_claude_plugin_integration: false,
             skip_claude_onboarding: false,
             launch_on_startup: false,
+            codex_repair_detection_enabled: false,
             silent_startup: false,
             enable_local_proxy: false,
+            provider_retry_enabled: None,
             proxy_confirmed: None,
             usage_confirmed: None,
             usage_dashboard_refresh_interval_ms: None,
@@ -555,6 +563,10 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    pub fn is_provider_retry_enabled(&self) -> bool {
+        self.provider_retry_enabled.unwrap_or(true)
+    }
+
     fn settings_path() -> Option<PathBuf> {
         // settings.json 保留用于旧版本迁移和无数据库场景
         Some(
@@ -1148,6 +1160,31 @@ mod tests {
     use super::*;
     use crate::app_config::AppType;
 
+    #[test]
+    fn provider_retry_switch_defaults_to_enabled_for_legacy_settings() {
+        let legacy: AppSettings = serde_json::from_value(serde_json::json!({
+            "enableLocalProxy": true
+        }))
+        .expect("legacy settings");
+
+        assert_eq!(legacy.provider_retry_enabled, None);
+        assert!(legacy.is_provider_retry_enabled());
+    }
+
+    #[test]
+    fn provider_retry_switch_respects_explicit_values() {
+        let enabled = AppSettings {
+            provider_retry_enabled: Some(true),
+            ..AppSettings::default()
+        };
+        let disabled = AppSettings {
+            provider_retry_enabled: Some(false),
+            ..AppSettings::default()
+        };
+
+        assert!(enabled.is_provider_retry_enabled());
+        assert!(!disabled.is_provider_retry_enabled());
+    }
     #[test]
     fn visible_apps_old_settings_default_claude_desktop_visible() {
         let visible: VisibleApps = serde_json::from_value(serde_json::json!({

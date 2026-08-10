@@ -11,7 +11,10 @@ import {
   useProxyStatusQuery,
   useProxyTakeoverStatus,
 } from "@/lib/query/proxy";
-import { extractErrorMessage } from "@/utils/errorUtils";
+import {
+  extractErrorMessage,
+  translateCodexAgentRoleProxyError,
+} from "@/utils/errorUtils";
 
 /**
  * 代理服务状态管理
@@ -19,6 +22,14 @@ import { extractErrorMessage } from "@/utils/errorUtils";
 export function useProxyStatus() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
+  const proxyErrorDetail = (error: Error) => {
+    const detail = extractErrorMessage(error);
+    return (
+      translateCodexAgentRoleProxyError(detail, t) ||
+      detail ||
+      t("common.unknown", { defaultValue: "未知错误" })
+    );
+  };
 
   // 查询状态（自动轮询）
   const { data: status } = useProxyStatusQuery();
@@ -41,9 +52,7 @@ export function useProxyStatus() {
       queryClient.invalidateQueries({ queryKey: proxyKeys.status });
     },
     onError: (error: Error) => {
-      const detail =
-        extractErrorMessage(error) ||
-        t("common.unknown", { defaultValue: "未知错误" });
+      const detail = proxyErrorDetail(error);
       toast.error(
         t("proxy.server.startFailed", {
           detail,
@@ -66,9 +75,7 @@ export function useProxyStatus() {
       queryClient.invalidateQueries({ queryKey: proxyKeys.status });
     },
     onError: (error: Error) => {
-      const detail =
-        extractErrorMessage(error) ||
-        t("common.unknown", { defaultValue: "未知错误" });
+      const detail = proxyErrorDetail(error);
       toast.error(
         t("proxy.server.stopFailed", {
           detail,
@@ -97,9 +104,7 @@ export function useProxyStatus() {
       // 注意：故障转移队列和开关状态会保留，不需要刷新
     },
     onError: (error: Error) => {
-      const detail =
-        extractErrorMessage(error) ||
-        t("common.unknown", { defaultValue: "未知错误" });
+      const detail = proxyErrorDetail(error);
       toast.error(
         t("proxy.stopWithRestoreFailed", {
           detail,
@@ -142,9 +147,7 @@ export function useProxyStatus() {
       queryClient.invalidateQueries({ queryKey: proxyKeys.takeoverStatus });
     },
     onError: (error: Error) => {
-      const detail =
-        extractErrorMessage(error) ||
-        t("common.unknown", { defaultValue: "未知错误" });
+      const detail = proxyErrorDetail(error);
       toast.error(
         t("proxy.takeover.failed", {
           detail,

@@ -1,3 +1,12 @@
+import type { TFunction } from "i18next";
+
+const CODEX_AGENT_ROLE_OWNER_DELETE_BLOCKED =
+  "codex_agent_role_owner_delete_blocked";
+const CODEX_AGENT_ROLE_TARGET_DELETE_BLOCKED =
+  "codex_agent_role_target_delete_blocked:";
+const CODEX_AGENT_ROLE_PROXY_REQUIRED = "codex_agent_role_proxy_required";
+const CODEX_AGENT_ROLE_LOOPBACK_REQUIRED = "codex_agent_role_loopback_required";
+
 /**
  * 从各种错误对象中提取错误信息
  * @param error 错误对象
@@ -36,6 +45,51 @@ export const extractErrorMessage = (error: unknown): string => {
 
   return "";
 };
+
+export function translateCodexAgentRoleDeleteError(
+  detail: string,
+  t: TFunction,
+): string | null {
+  if (detail.includes(CODEX_AGENT_ROLE_OWNER_DELETE_BLOCKED)) {
+    return t("providerAdvanced.agentRoleOwnerDeleteBlocked");
+  }
+
+  const markerIndex = detail.indexOf(CODEX_AGENT_ROLE_TARGET_DELETE_BLOCKED);
+  if (markerIndex < 0) return null;
+
+  const payload = detail
+    .slice(markerIndex + CODEX_AGENT_ROLE_TARGET_DELETE_BLOCKED.length)
+    .trim();
+  let providers: string[] = [];
+  try {
+    const parsed = JSON.parse(payload);
+    if (Array.isArray(parsed)) {
+      providers = parsed
+        .filter((value): value is string => typeof value === "string")
+        .map((value) => value.trim())
+        .filter(Boolean);
+    }
+  } catch {
+    providers = [];
+  }
+
+  return t("providerAdvanced.agentRoleTargetDeleteBlocked", {
+    providers: providers.join(", ") || t("common.unknown"),
+  });
+}
+
+export function translateCodexAgentRoleProxyError(
+  detail: string,
+  t: TFunction,
+): string | null {
+  if (detail.includes(CODEX_AGENT_ROLE_PROXY_REQUIRED)) {
+    return t("providerAdvanced.agentRoleProxyDisableBlocked");
+  }
+  if (detail.includes(CODEX_AGENT_ROLE_LOOPBACK_REQUIRED)) {
+    return t("providerAdvanced.agentRoleLoopbackRequired");
+  }
+  return null;
+}
 
 /**
  * 将已知的 MCP 相关后端错误（通常为中文硬编码）映射为 i18n 文案

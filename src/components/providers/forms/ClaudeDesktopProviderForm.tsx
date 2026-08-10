@@ -105,6 +105,7 @@ export interface ClaudeDesktopProviderFormProps {
     iconColor?: string;
   };
   showButtons?: boolean;
+  formId?: string;
 }
 
 type RouteRow = {
@@ -257,6 +258,7 @@ export function ClaudeDesktopProviderForm({
   onSubmittingChange,
   initialData,
   showButtons = true,
+  formId = "provider-form",
 }: ClaudeDesktopProviderFormProps) {
   const { t } = useTranslation();
   const initialMode = isOAuthProviderType(initialData?.meta?.providerType)
@@ -830,7 +832,7 @@ export function ClaudeDesktopProviderForm({
   return (
     <Form {...form}>
       <form
-        id="provider-form"
+        id={formId}
         onSubmit={form.handleSubmit(handleSubmit)}
         className="space-y-6"
       >

@@ -2421,6 +2421,44 @@ mod tests {
     }
 
     #[test]
+    fn responses_request_to_chat_normalizes_missing_and_union_tool_parameters() {
+        let input = json!({
+            "model": "gpt-5.4",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "missing_schema",
+                    "parameters": null
+                },
+                {
+                    "type": "function",
+                    "name": "union_schema",
+                    "parameters": {
+                        "oneOf": [
+                            {"type": "object", "properties": {"id": {"type": "string"}}},
+                            {"type": "object", "properties": {"slug": {"type": "string"}}}
+                        ]
+                    }
+                }
+            ],
+            "input": "hi"
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        assert_eq!(
+            result["tools"][0]["function"]["parameters"],
+            json!({"type": "object", "properties": {}})
+        );
+        assert_eq!(
+            result["tools"][1]["function"]["parameters"]["type"],
+            "object"
+        );
+        assert!(result["tools"][1]["function"]["parameters"]
+            .get("oneOf")
+            .is_some());
+    }
+
+    #[test]
     fn responses_request_to_chat_maps_custom_tool_and_choice() {
         let input = json!({
             "model": "gpt-5.4",

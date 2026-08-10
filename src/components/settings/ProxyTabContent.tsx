@@ -1,5 +1,12 @@
 import { useState } from "react";
-import { Server, Activity, Zap, Globe, ShieldAlert } from "lucide-react";
+import {
+  Server,
+  Activity,
+  Zap,
+  Globe,
+  ShieldAlert,
+  RefreshCw,
+} from "lucide-react";
 import { motion } from "framer-motion";
 import { useTranslation } from "react-i18next";
 import {
@@ -127,14 +134,35 @@ export function ProxyTabContent({
             </div>
           </AccordionTrigger>
           <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
-            <ProxyPanel
-              enableLocalProxy={settings?.enableLocalProxy ?? false}
-              onEnableLocalProxyChange={(checked) =>
-                onAutoSave({ enableLocalProxy: checked })
-              }
-              onToggleProxy={handleToggleProxy}
-              isProxyPending={isProxyPending}
-            />
+            <div className="space-y-6">
+              <ProxyPanel
+                enableLocalProxy={settings?.enableLocalProxy ?? false}
+                onEnableLocalProxyChange={(checked) =>
+                  onAutoSave({ enableLocalProxy: checked })
+                }
+                onToggleProxy={handleToggleProxy}
+                isProxyPending={isProxyPending}
+              />
+              <div className="border-t border-border/50 pt-6">
+                <ToggleRow
+                  icon={<RefreshCw className="h-4 w-4 text-blue-500" />}
+                  title={t("settings.advanced.proxy.providerRetryEnabled", {
+                    defaultValue: "Enable Provider automatic retry",
+                  })}
+                  description={t(
+                    "settings.advanced.proxy.providerRetryEnabledDescription",
+                    {
+                      defaultValue:
+                        "Globally allow configured Claude, Codex, Gemini and Grok Build Providers to retry ordinary model errors before failover. Provider parameters are preserved while disabled.",
+                    },
+                  )}
+                  checked={settings?.providerRetryEnabled ?? true}
+                  onCheckedChange={(checked) =>
+                    void onAutoSave({ providerRetryEnabled: checked })
+                  }
+                />
+              </div>
+            </div>
           </AccordionContent>
         </AccordionItem>
 

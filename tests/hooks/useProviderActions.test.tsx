@@ -155,6 +155,27 @@ describe("useProviderActions", () => {
     expect(addProviderMutateAsync).toHaveBeenCalledWith(providerInput);
   });
 
+  it("returns the provider created by the add mutation", async () => {
+    const createdProvider = createProvider({ id: "provider-created" });
+    addProviderMutateAsync.mockResolvedValueOnce(createdProvider);
+    const { wrapper } = createWrapper();
+    const providerInput = {
+      name: "Created Provider",
+      settingsConfig: {},
+    } as Omit<Provider, "id">;
+
+    const { result } = renderHook(() => useProviderActions("codex"), {
+      wrapper,
+    });
+
+    let returnedProvider: Provider | undefined;
+    await act(async () => {
+      returnedProvider = await result.current.addProvider(providerInput);
+    });
+
+    expect(returnedProvider).toBe(createdProvider);
+  });
+
   it("should update tray menu when calling updateProvider", async () => {
     updateProviderMutateAsync.mockResolvedValueOnce(undefined);
     providersApiUpdateTrayMenuMock.mockResolvedValueOnce(true);

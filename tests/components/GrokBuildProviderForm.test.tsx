@@ -23,6 +23,24 @@ vi.mock("@/components/JsonEditor", () => ({
   ),
 }));
 
+async function openAdvancedOptions(user: ReturnType<typeof userEvent.setup>) {
+  const advancedButton = screen.getByRole("button", {
+    name: /Advanced Options|高级选项/,
+  });
+  if (advancedButton.getAttribute("aria-expanded") !== "true") {
+    await user.click(advancedButton);
+  }
+}
+
+async function openRetryPolicy(user: ReturnType<typeof userEvent.setup>) {
+  await openAdvancedOptions(user);
+  const retryButton = screen.getByRole("button", {
+    name: "Local proxy automatic retry",
+  });
+  if (retryButton.getAttribute("aria-expanded") !== "true") {
+    await user.click(retryButton);
+  }
+}
 describe("GrokBuildProviderForm", () => {
   it("offers curated Grok Build presets and applies one", async () => {
     const user = userEvent.setup();
@@ -46,6 +64,60 @@ describe("GrokBuildProviderForm", () => {
       container.querySelector<HTMLInputElement>('input[name="name"]');
     expect(baseUrlInput?.value).toBe("https://api.pateway.ai/v1");
     expect(nameInput?.value).toBe("PatewayAI");
+  });
+
+  it("keeps the official Grok form minimal and exposes provider retry", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    const { container } = render(
+      <GrokBuildProviderForm
+        submitLabel="Save"
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: /Grok Official/ }));
+
+    expect(container.querySelector("#grokbuild-profile")).toBeNull();
+    expect(screen.queryByLabelText("API Key")).toBeNull();
+    expect(
+      screen.queryByRole("button", {
+        name: "Local proxy automatic retry",
+      }),
+    ).not.toBeInTheDocument();
+
+    await openAdvancedOptions(user);
+    expect(
+      screen.getByRole("button", {
+        name: "Local proxy automatic retry",
+      }),
+    ).toHaveAttribute("aria-expanded", "false");
+
+    await user.click(
+      screen.getByRole("switch", {
+        name: "Enable retries for this Provider",
+      }),
+    );
+    fireEvent.change(screen.getByLabelText("Additional retries"), {
+      target: { value: "2" },
+    });
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(onSubmit.mock.calls[0][0]).toMatchObject({
+      name: "Grok Official",
+      presetCategory: "official",
+      meta: {
+        localProxyRetryPolicy: {
+          enabled: true,
+          maxRetries: 2,
+        },
+      },
+    });
+    expect(JSON.parse(onSubmit.mock.calls[0][0].settingsConfig)).toEqual({
+      config: "",
+    });
   });
 
   it("submits a complete config.toml payload with Grok defaults", async () => {
@@ -189,5 +261,62 @@ context_window = 250000
 
     expect(onSubmit).toHaveBeenCalledTimes(1);
     expect(onSubmit.mock.calls[0][0].meta.custom_endpoints).toBeUndefined();
+  });
+
+  it("loads and saves an independent provider retry policy", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    const config = `[models]
+default = "existing-profile"
+
+[model."existing-profile"]
+model = "grok-upstream"
+base_url = "https://existing.example.com/v1"
+name = "Existing Relay"
+api_key = "existing-key"
+api_backend = "responses"
+context_window = 250000
+`;
+    render(
+      <GrokBuildProviderForm
+        providerId="existing-provider"
+        submitLabel="Save"
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+        initialData={{
+          name: "Existing Relay",
+          settingsConfig: { config },
+          meta: {
+            localProxyRetryPolicy: {
+              maxRetries: 3,
+              retryDelayMs: 250,
+              customMessages: ["temporary capacity"],
+              errorTypes: ["overloaded"],
+            },
+          },
+        }}
+      />,
+    );
+
+    await openRetryPolicy(user);
+    expect(screen.getByLabelText("Additional retries")).toHaveValue(3);
+    expect(screen.getByLabelText("Retry interval (ms)")).toHaveValue(250);
+    expect(screen.getByLabelText("Overloaded (HTTP 503)")).toBeChecked();
+    expect(
+      screen.getByRole("switch", {
+        name: "Enable retries for this Provider",
+      }),
+    ).toBeChecked();
+
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(onSubmit.mock.calls[0][0].meta.localProxyRetryPolicy).toEqual({
+      enabled: true,
+      maxRetries: 3,
+      retryDelayMs: 250,
+      customMessages: ["temporary capacity"],
+      errorTypes: ["overloaded"],
+    });
   });
 });

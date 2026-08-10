@@ -32,6 +32,13 @@ import type { ProviderFormProps, ProviderFormValues } from "./ProviderForm";
 import { BasicFormFields } from "./BasicFormFields";
 import { CodexFormFields } from "./CodexFormFields";
 import { ProviderPresetSelector } from "./ProviderPresetSelector";
+import { ProviderAdvancedOptionsSection } from "./ProviderAdvancedConfig";
+import {
+  defaultLocalProxyRetryPolicy,
+  normalizeLocalProxyRetryPolicy,
+  ProviderRetryPolicyConfig,
+  validateLocalProxyRetryPolicy,
+} from "./ProviderRetryPolicyConfig";
 import {
   grokBuildOfficialPreset,
   grokBuildProviderPresets,
@@ -81,6 +88,7 @@ export function GrokBuildProviderForm({
   onSubmittingChange,
   initialData,
   showButtons = true,
+  formId = "provider-form",
 }: GrokBuildProviderFormProps) {
   const { t } = useTranslation();
   const isDarkMode = useDarkMode();
@@ -161,6 +169,11 @@ export function GrokBuildProviderForm({
   const [presetEndpoints, setPresetEndpoints] = useState<string[]>([]);
   const [draftCustomEndpoints, setDraftCustomEndpoints] = useState<string[]>(
     [],
+  );
+  const [localProxyRetryPolicy, setLocalProxyRetryPolicy] = useState(() =>
+    initialData?.meta?.localProxyRetryPolicy
+      ? normalizeLocalProxyRetryPolicy(initialData.meta.localProxyRetryPolicy)
+      : defaultLocalProxyRetryPolicy(),
   );
 
   const form = useForm<ProviderFormData>({
@@ -312,6 +325,22 @@ export function GrokBuildProviderForm({
 
   const handleSubmit = async (values: ProviderFormData) => {
     const name = values.name.trim();
+    const retryPolicyError = validateLocalProxyRetryPolicy(
+      localProxyRetryPolicy,
+    );
+    if (retryPolicyError) {
+      toast.error(
+        t(`providerAdvanced.retryValidation.${retryPolicyError}`, {
+          defaultValue:
+            retryPolicyError === "maxRetries"
+              ? "Additional retries must be an integer from 0 to 100."
+              : retryPolicyError === "retryDelayMs"
+                ? "Retry interval must be an integer from 1 to 60000 ms."
+                : "Choose at least one error type or enter an error message when retries are enabled.",
+        }),
+      );
+      return;
+    }
 
     // 官方条目：config 快照原样透传（新增时为空），不做自定义模型字段校验，
     // 也不重建 config —— 新增走 ensure seed，编辑只允许改名称/图标等元信息。
@@ -325,7 +354,12 @@ export function GrokBuildProviderForm({
         presetId: selectedPresetId ?? undefined,
         presetCategory: "official",
         isPartner: false,
-        meta: initialData?.meta,
+        meta: {
+          ...(initialData?.meta ?? {}),
+          localProxyRetryPolicy: normalizeLocalProxyRetryPolicy(
+            localProxyRetryPolicy,
+          ),
+        },
       });
       return;
     }
@@ -405,6 +439,9 @@ export function GrokBuildProviderForm({
       codexChatReasoning,
       customUserAgent: customUserAgent.trim() || undefined,
       localProxyRequestOverrides: requestOverrides.overrides,
+      localProxyRetryPolicy: normalizeLocalProxyRetryPolicy(
+        localProxyRetryPolicy,
+      ),
       maxOutputTokens:
         Number.isInteger(parsedMaxOutputTokens) && parsedMaxOutputTokens > 0
           ? parsedMaxOutputTokens
@@ -428,12 +465,19 @@ export function GrokBuildProviderForm({
     await onSubmit(payload);
   };
 
+  const retryAdvancedOptions = (
+    <ProviderRetryPolicyConfig
+      idPrefix="grokbuild-provider-retry"
+      value={localProxyRetryPolicy}
+      onChange={setLocalProxyRetryPolicy}
+    />
+  );
   const rawConfigError = validateGrokBuildConfig(rawConfig);
 
   return (
     <Form {...form}>
       <form
-        id="provider-form"
+        id={formId}
         onSubmit={form.handleSubmit(handleSubmit)}
         className="space-y-6"
       >
@@ -562,6 +606,7 @@ export function GrokBuildProviderForm({
               onLocalProxyHeadersOverrideChange={setHeadersOverride}
               localProxyBodyOverride={bodyOverride}
               onLocalProxyBodyOverrideChange={setBodyOverride}
+              advancedOptionsContent={retryAdvancedOptions}
             />
 
             <div className="space-y-2">
@@ -587,6 +632,12 @@ export function GrokBuildProviderForm({
               )}
             </div>
           </>
+        )}
+
+        {category === "official" && (
+          <ProviderAdvancedOptionsSection>
+            {retryAdvancedOptions}
+          </ProviderAdvancedOptionsSection>
         )}
 
         <FormField

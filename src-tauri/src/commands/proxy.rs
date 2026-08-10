@@ -2,23 +2,95 @@
 //!
 //! 提供前端调用的 API 接口
 
+use crate::app_config::AppType;
 use crate::error::AppError;
 use crate::proxy::types::*;
 use crate::proxy::{CircuitBreakerConfig, CircuitBreakerStats};
 use crate::store::AppState;
 use std::str::FromStr;
 
+const CODEX_AGENT_ROLE_PROXY_REQUIRED: &str = "codex_agent_role_proxy_required";
+
+fn codex_agent_role_proxy_required_error() -> String {
+    format!(
+        "{CODEX_AGENT_ROLE_PROXY_REQUIRED}: 当前 Codex Provider 启用了前端子代理独立路由，请先在 Provider 高级选项中关闭角色路由。"
+    )
+}
+
+fn with_proxy_rollback_errors(primary_error: String, rollback_errors: Vec<String>) -> String {
+    if rollback_errors.is_empty() {
+        primary_error
+    } else {
+        format!(
+            "{primary_error}; 代理状态回滚遇到错误: {}",
+            rollback_errors.join("; ")
+        )
+    }
+}
+
+async fn rollback_proxy_transaction(
+    state: &AppState,
+    snapshot: &mut crate::services::proxy::ProxyTransactionSnapshot,
+    reconcile_roles: bool,
+) -> Vec<String> {
+    let mut rollback_errors = snapshot.capture_rollback_file_guards();
+    rollback_errors.extend(
+        state
+            .proxy_service
+            .restore_transaction_state(snapshot)
+            .await,
+    );
+    if reconcile_roles {
+        if let Err(error) = crate::services::codex_agent_roles::reconcile_current_codex_agent_roles_under_proxy_transaction(state).await {
+            rollback_errors.push(format!(
+                "恢复代理状态后重投影 Codex Agent Role 失败: {error}"
+            ));
+        }
+    }
+    rollback_errors
+}
+
 /// 启动代理服务器（仅启动服务，不接管 Live 配置）
 #[tauri::command]
 pub async fn start_proxy_server(
     state: tauri::State<'_, AppState>,
 ) -> Result<ProxyServerInfo, String> {
-    state.proxy_service.start().await
+    start_proxy_server_inner(state.inner()).await
+}
+
+async fn start_proxy_server_inner(state: &AppState) -> Result<ProxyServerInfo, String> {
+    let _transaction = state.proxy_service.lock_transaction().await;
+    let mut snapshot = state.proxy_service.snapshot_transaction_state().await?;
+    let info = match state.proxy_service.start_inner().await {
+        Ok(info) => info,
+        Err(error) => {
+            let rollback_errors = rollback_proxy_transaction(state, &mut snapshot, false).await;
+            return Err(with_proxy_rollback_errors(error, rollback_errors));
+        }
+    };
+    if let Err(error) = crate::services::codex_agent_roles::reconcile_current_codex_agent_roles_under_proxy_transaction(state).await {
+        let rollback_errors = rollback_proxy_transaction(state, &mut snapshot, true).await;
+        return Err(with_proxy_rollback_errors(
+            format!("启动代理后同步 Codex Agent Role 失败: {error}"),
+            rollback_errors,
+        ));
+    }
+    Ok(info)
 }
 
 /// 停止代理服务器（仅停止服务，不恢复/清理 Live 接管状态）
 #[tauri::command]
 pub async fn stop_proxy_server(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    stop_proxy_server_inner(state.inner()).await
+}
+
+async fn stop_proxy_server_inner(state: &AppState) -> Result<(), String> {
+    let _transaction = state.proxy_service.lock_transaction().await;
+    if crate::services::codex_agent_roles::current_codex_role_route_requires_proxy(state)
+        .map_err(|error| error.to_string())?
+    {
+        return Err(codex_agent_role_proxy_required_error());
+    }
     let takeover = state.proxy_service.get_takeover_status().await?;
     if takeover.claude
         || takeover.codex
@@ -32,13 +104,45 @@ pub async fn stop_proxy_server(state: tauri::State<'_, AppState>) -> Result<(), 
         );
     }
 
-    state.proxy_service.stop().await
+    let mut snapshot = state.proxy_service.snapshot_transaction_state().await?;
+    match state.proxy_service.stop_inner().await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let rollback_errors = rollback_proxy_transaction(state, &mut snapshot, false).await;
+            Err(with_proxy_rollback_errors(error, rollback_errors))
+        }
+    }
 }
 
 /// 停止代理服务器（恢复 Live 配置）
 #[tauri::command]
 pub async fn stop_proxy_with_restore(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.proxy_service.stop_with_restore().await
+    stop_proxy_with_restore_inner(state.inner()).await
+}
+
+async fn stop_proxy_with_restore_inner(state: &AppState) -> Result<(), String> {
+    let _transaction = state.proxy_service.lock_transaction().await;
+    if crate::services::codex_agent_roles::current_codex_role_route_requires_proxy(state)
+        .map_err(|error| error.to_string())?
+    {
+        return Err(codex_agent_role_proxy_required_error());
+    }
+    let mut snapshot = state.proxy_service.snapshot_transaction_state().await?;
+    if let Err(error) = state.proxy_service.stop_with_restore_inner().await {
+        let rollback_errors = rollback_proxy_transaction(state, &mut snapshot, false).await;
+        return Err(with_proxy_rollback_errors(error, rollback_errors));
+    }
+    if let Err(error) =
+        crate::services::codex_agent_roles::disable_codex_agent_roles_under_proxy_transaction()
+            .await
+    {
+        let rollback_errors = rollback_proxy_transaction(state, &mut snapshot, true).await;
+        return Err(with_proxy_rollback_errors(
+            format!("停止代理后禁用 Codex Agent Role 失败: {error}"),
+            rollback_errors,
+        ));
+    }
+    Ok(())
 }
 
 /// 获取各应用接管状态
@@ -56,10 +160,43 @@ pub async fn set_proxy_takeover_for_app(
     app_type: String,
     enabled: bool,
 ) -> Result<(), String> {
-    state
+    set_proxy_takeover_for_app_inner(state.inner(), &app_type, enabled).await
+}
+
+async fn set_proxy_takeover_for_app_inner(
+    state: &AppState,
+    app_type: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    let _transaction = state.proxy_service.lock_transaction().await;
+    if app_type == AppType::Codex.as_str()
+        && !enabled
+        && crate::services::codex_agent_roles::current_codex_role_route_requires_proxy(state)
+            .map_err(|error| error.to_string())?
+    {
+        return Err(codex_agent_role_proxy_required_error());
+    }
+
+    let mut snapshot = state.proxy_service.snapshot_transaction_state().await?;
+    if let Err(error) = state
         .proxy_service
-        .set_takeover_for_app(&app_type, enabled)
+        .set_takeover_for_app_inner(app_type, enabled)
         .await
+    {
+        let rollback_errors = rollback_proxy_transaction(state, &mut snapshot, false).await;
+        return Err(with_proxy_rollback_errors(error, rollback_errors));
+    }
+
+    if app_type == AppType::Codex.as_str() {
+        if let Err(error) = crate::services::codex_agent_roles::reconcile_current_codex_agent_roles_under_proxy_transaction(state).await {
+            let rollback_errors = rollback_proxy_transaction(state, &mut snapshot, true).await;
+            return Err(with_proxy_rollback_errors(
+                format!("修改 Codex 接管后同步 Codex Agent Role 失败: {error}"),
+                rollback_errors,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 获取代理服务器状态
@@ -80,7 +217,24 @@ pub async fn update_proxy_config(
     state: tauri::State<'_, AppState>,
     config: ProxyConfig,
 ) -> Result<(), String> {
-    state.proxy_service.update_config(&config).await
+    update_proxy_config_inner(state.inner(), config).await
+}
+
+async fn update_proxy_config_inner(state: &AppState, config: ProxyConfig) -> Result<(), String> {
+    let _transaction = state.proxy_service.lock_transaction().await;
+    let mut snapshot = state.proxy_service.snapshot_transaction_state().await?;
+    if let Err(error) = state.proxy_service.update_config_inner(&config).await {
+        let rollback_errors = rollback_proxy_transaction(state, &mut snapshot, false).await;
+        return Err(with_proxy_rollback_errors(error, rollback_errors));
+    }
+    if let Err(error) = crate::services::codex_agent_roles::reconcile_current_codex_agent_roles_under_proxy_transaction(state).await {
+        let rollback_errors = rollback_proxy_transaction(state, &mut snapshot, true).await;
+        return Err(with_proxy_rollback_errors(
+            format!("更新代理配置后同步 Codex Agent Role 失败: {error}"),
+            rollback_errors,
+        ));
+    }
+    Ok(())
 }
 
 // ==================== Global & Per-App Config ====================
@@ -106,10 +260,44 @@ pub async fn update_global_proxy_config(
     state: tauri::State<'_, AppState>,
     config: GlobalProxyConfig,
 ) -> Result<(), String> {
-    let db = &state.db;
-    db.update_global_proxy_config(config)
-        .await
-        .map_err(|e| e.to_string())
+    update_global_proxy_config_inner(state.inner(), config).await
+}
+
+async fn update_global_proxy_config_inner(
+    state: &AppState,
+    config: GlobalProxyConfig,
+) -> Result<(), String> {
+    let _transaction = state.proxy_service.lock_transaction().await;
+    if !config.proxy_enabled
+        && crate::services::codex_agent_roles::current_codex_role_route_requires_proxy(state)
+            .map_err(|error| error.to_string())?
+    {
+        return Err(codex_agent_role_proxy_required_error());
+    }
+    let mut snapshot = state.proxy_service.snapshot_transaction_state().await?;
+    let mut proxy_config = state.proxy_service.get_config().await?;
+    proxy_config.listen_address = config.listen_address.clone();
+    proxy_config.listen_port = config.listen_port;
+    proxy_config.enable_logging = config.enable_logging;
+    if let Err(error) = state.db.update_global_proxy_config(config).await {
+        let rollback_errors = rollback_proxy_transaction(state, &mut snapshot, false).await;
+        return Err(with_proxy_rollback_errors(
+            error.to_string(),
+            rollback_errors,
+        ));
+    }
+    if let Err(error) = state.proxy_service.update_config_inner(&proxy_config).await {
+        let rollback_errors = rollback_proxy_transaction(state, &mut snapshot, false).await;
+        return Err(with_proxy_rollback_errors(error, rollback_errors));
+    }
+    if let Err(error) = crate::services::codex_agent_roles::reconcile_current_codex_agent_roles_under_proxy_transaction(state).await {
+        let rollback_errors = rollback_proxy_transaction(state, &mut snapshot, true).await;
+        return Err(with_proxy_rollback_errors(
+            format!("更新全局代理配置后同步 Codex Agent Role 失败: {error}"),
+            rollback_errors,
+        ));
+    }
+    Ok(())
 }
 
 /// 获取指定应用的代理配置
@@ -134,18 +322,51 @@ pub async fn update_proxy_config_for_app(
     state: tauri::State<'_, AppState>,
     config: AppProxyConfig,
 ) -> Result<(), String> {
-    let db = &state.db;
+    update_proxy_config_for_app_inner(state.inner(), config).await
+}
+
+async fn update_proxy_config_for_app_inner(
+    state: &AppState,
+    config: AppProxyConfig,
+) -> Result<(), String> {
     let app_type = config.app_type.clone();
+    let _transaction = state.proxy_service.lock_transaction().await;
+    if app_type == AppType::Codex.as_str()
+        && !config.enabled
+        && crate::services::codex_agent_roles::current_codex_role_route_requires_proxy(state)
+            .map_err(|error| error.to_string())?
+    {
+        return Err(codex_agent_role_proxy_required_error());
+    }
+    let mut snapshot = state.proxy_service.snapshot_transaction_state().await?;
     let circuit_config = CircuitBreakerConfig::from(&config);
 
-    db.update_proxy_config_for_app(config)
-        .await
-        .map_err(|e| e.to_string())?;
+    if let Err(error) = state.db.update_proxy_config_for_app(config).await {
+        let rollback_errors = rollback_proxy_transaction(state, &mut snapshot, false).await;
+        return Err(with_proxy_rollback_errors(
+            error.to_string(),
+            rollback_errors,
+        ));
+    }
 
-    state
+    if let Err(error) = state
         .proxy_service
         .update_circuit_breaker_config_for_app(&app_type, circuit_config)
         .await
+    {
+        let rollback_errors = rollback_proxy_transaction(state, &mut snapshot, false).await;
+        return Err(with_proxy_rollback_errors(error, rollback_errors));
+    }
+    if app_type == AppType::Codex.as_str() {
+        if let Err(error) = crate::services::codex_agent_roles::reconcile_current_codex_agent_roles_under_proxy_transaction(state).await {
+            let rollback_errors = rollback_proxy_transaction(state, &mut snapshot, true).await;
+            return Err(with_proxy_rollback_errors(
+                format!("更新 Codex 代理配置后同步 Agent Role 失败: {error}"),
+                rollback_errors,
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn get_default_cost_multiplier_internal(
@@ -297,6 +518,24 @@ pub async fn switch_proxy_provider(
             "代理接管模式下不能切换到官方供应商 (Cannot switch to official provider during proxy takeover)"
                 .to_string(),
         );
+    }
+
+    if matches!(app, AppType::Codex) {
+        let state = state.inner().owned_clone();
+        return crate::services::codex_provider_lifecycle::run_codex_provider_mutation(
+            state,
+            "switch Codex proxy Provider",
+            move |state| {
+                crate::services::ProviderService::switch_under_proxy_transaction(
+                    state.as_ref(),
+                    AppType::Codex,
+                    &provider_id,
+                )
+                .map(|_| ())
+            },
+        )
+        .await
+        .map_err(|error| error.to_string());
     }
 
     state
@@ -452,4 +691,171 @@ pub async fn get_circuit_breaker_stats(
     // 目前先返回 None，后续可以通过 ProxyService 暴露接口来实现
     let _ = (state, provider_id, app_type);
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        set_proxy_takeover_for_app_inner, start_proxy_server_inner, stop_proxy_server_inner,
+        stop_proxy_with_restore_inner, update_global_proxy_config_inner,
+        update_proxy_config_for_app_inner,
+    };
+    use crate::app_config::AppType;
+    use crate::database::Database;
+    use crate::provider::{CodexAgentRoleRouting, Provider, ProviderMeta};
+    use crate::store::AppState;
+    use serde_json::json;
+    use serial_test::serial;
+    use std::ffi::OsString;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    struct TestHome {
+        _dir: TempDir,
+        old_home: Option<OsString>,
+        old_test_home: Option<OsString>,
+    }
+
+    impl TestHome {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let old_home = std::env::var_os("HOME");
+            let old_test_home = std::env::var_os("CC_SWITCH_TEST_HOME");
+            std::env::set_var("HOME", dir.path());
+            std::env::set_var("CC_SWITCH_TEST_HOME", dir.path());
+            crate::settings::reload_settings().expect("reload isolated settings");
+            Self {
+                _dir: dir,
+                old_home,
+                old_test_home,
+            }
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            match self.old_home.take() {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match self.old_test_home.take() {
+                Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
+                None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
+            }
+            let _ = crate::settings::reload_settings();
+        }
+    }
+
+    fn codex_provider_with_role_routing() -> Provider {
+        let mut provider = Provider::with_id(
+            "provider-a".to_string(),
+            "Provider A".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "test-key" },
+                "config": "model_provider = \"test\"\nmodel = \"test-model\"\n[model_providers.test]\nbase_url = \"https://example.invalid/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\n"
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            codex_agent_role_routing: Some(CodexAgentRoleRouting {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        provider
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn every_proxy_close_entry_rejects_an_active_codex_role_route() {
+        let _home = TestHome::new();
+        let db = Arc::new(Database::memory().expect("in-memory database"));
+        let state = AppState::new(db.clone());
+        let provider = codex_provider_with_role_routing();
+        db.save_provider(AppType::Codex.as_str(), &provider)
+            .expect("seed provider");
+        db.set_current_provider(AppType::Codex.as_str(), &provider.id)
+            .expect("set database current provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some(&provider.id))
+            .expect("set device current provider");
+
+        let mut codex_config = db
+            .get_proxy_config_for_app(AppType::Codex.as_str())
+            .await
+            .expect("Codex proxy config");
+        codex_config.enabled = false;
+        let mut global_config = db
+            .get_global_proxy_config()
+            .await
+            .expect("global proxy config");
+        global_config.proxy_enabled = false;
+
+        for error in [
+            stop_proxy_server_inner(&state)
+                .await
+                .expect_err("plain stop must be blocked"),
+            stop_proxy_with_restore_inner(&state)
+                .await
+                .expect_err("restore stop must be blocked"),
+            set_proxy_takeover_for_app_inner(&state, AppType::Codex.as_str(), false)
+                .await
+                .expect_err("Codex takeover disable must be blocked"),
+            update_proxy_config_for_app_inner(&state, codex_config.clone())
+                .await
+                .expect_err("Codex app config disable must be blocked"),
+            update_global_proxy_config_inner(&state, global_config.clone())
+                .await
+                .expect_err("global proxy disable must be blocked"),
+        ] {
+            assert!(error.starts_with("codex_agent_role_proxy_required:"));
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn start_with_ephemeral_port_rewrites_role_base_url_to_actual_port() {
+        let _home = TestHome::new();
+        let db = Arc::new(Database::memory().expect("in-memory database"));
+        let state = AppState::new(db.clone());
+        let provider = codex_provider_with_role_routing();
+        db.save_provider(AppType::Codex.as_str(), &provider)
+            .expect("seed provider");
+        db.set_current_provider(AppType::Codex.as_str(), &provider.id)
+            .expect("set database current provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some(&provider.id))
+            .expect("set device current provider");
+        let codex_dir = crate::codex_config::get_codex_config_dir();
+        std::fs::create_dir_all(&codex_dir).expect("create Codex config directory");
+        std::fs::write(
+            codex_dir.join("config.toml"),
+            "model_provider = \"test\"\nmodel = \"test-model\"\n[model_providers.test]\nbase_url = \"https://example.invalid/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\n",
+        )
+        .expect("write Codex config");
+        std::fs::write(
+            codex_dir.join("auth.json"),
+            r#"{"OPENAI_API_KEY":"test-key"}"#,
+        )
+        .expect("write Codex auth");
+        let mut proxy_config = db.get_proxy_config().await.expect("proxy config");
+        proxy_config.listen_port = 0;
+        proxy_config.enable_logging = false;
+        db.update_proxy_config(proxy_config)
+            .await
+            .expect("set ephemeral port");
+
+        let info = start_proxy_server_inner(&state)
+            .await
+            .expect("start and reconcile roles");
+        let frontend_path = codex_dir.join("agents").join("cc-switch-frontend.toml");
+        let frontend = std::fs::read_to_string(frontend_path).expect("frontend role file");
+
+        assert_ne!(info.port, 0);
+        assert!(frontend.contains(&format!("base_url = \"http://127.0.0.1:{}/v1\"", info.port)));
+        state
+            .proxy_service
+            .stop_with_restore()
+            .await
+            .expect("stop and restore test proxy");
+    }
 }

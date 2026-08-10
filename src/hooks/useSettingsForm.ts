@@ -115,6 +115,8 @@ export function useSettingsForm(): UseSettingsFormResult {
       enableClaudePluginIntegration:
         data.enableClaudePluginIntegration ?? false,
       silentStartup: data.silentStartup ?? false,
+      providerRetryEnabled: data.providerRetryEnabled ?? true,
+      codexRepairDetectionEnabled: data.codexRepairDetectionEnabled ?? false,
       skipClaudeOnboarding: data.skipClaudeOnboarding ?? false,
       preserveCodexOfficialAuthOnSwitch:
         data.preserveCodexOfficialAuthOnSwitch ?? false,
@@ -143,8 +145,10 @@ export function useSettingsForm(): UseSettingsFormResult {
             minimizeToTrayOnClose: true,
             useAppWindowControls: false,
             enableClaudePluginIntegration: false,
+            providerRetryEnabled: true,
             skipClaudeOnboarding: false,
             preserveCodexOfficialAuthOnSwitch: false,
+            codexRepairDetectionEnabled: false,
             unifyCodexSessionHistory: false,
             language: readPersistedLanguage(),
           } as SettingsFormState);
@@ -182,6 +186,9 @@ export function useSettingsForm(): UseSettingsFormResult {
         enableClaudePluginIntegration:
           serverData.enableClaudePluginIntegration ?? false,
         silentStartup: serverData.silentStartup ?? false,
+        providerRetryEnabled: serverData.providerRetryEnabled ?? true,
+        codexRepairDetectionEnabled:
+          serverData.codexRepairDetectionEnabled ?? false,
         skipClaudeOnboarding: serverData.skipClaudeOnboarding ?? false,
         preserveCodexOfficialAuthOnSwitch:
           serverData.preserveCodexOfficialAuthOnSwitch ?? false,

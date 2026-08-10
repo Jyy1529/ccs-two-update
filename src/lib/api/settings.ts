@@ -7,6 +7,31 @@ import type {
 } from "@/types";
 import type { AppId } from "./types";
 
+export type CodexRepairState =
+  | "unsupported"
+  | "notInstalled"
+  | "healthy"
+  | "needsRepair"
+  | "unknown";
+
+export interface CodexRepairStatus {
+  state: CodexRepairState;
+  platformSupported: boolean;
+  codexInstalled: boolean;
+  runtimeInstalled: boolean;
+  repairRunning: boolean;
+  lastRepairError?: string | null;
+  packageVersion?: string | null;
+  warnings: string[];
+  checkedAt: string;
+  runtimeCommit: string;
+}
+
+export interface CodexRepairLaunchResult {
+  started: boolean;
+  runtimeInstalled: boolean;
+}
+
 export interface ConfigTransferResult {
   success: boolean;
   message: string;
@@ -28,6 +53,12 @@ export interface CodexUnifyHistoryRestoreResult {
 
 export interface WebDavSyncResult {
   status: string;
+  warning?: string;
+}
+
+export interface RestoreDbBackupResult {
+  safetyBackupId: string;
+  warning?: string;
 }
 
 export const settingsApi = {
@@ -212,6 +243,10 @@ export const settingsApi = {
     }
   },
 
+  async retryPostImportSync(): Promise<void> {
+    await invoke("retry_post_import_sync");
+  },
+
   async openExternal(url: string): Promise<void> {
     try {
       const u = new URL(url);
@@ -231,6 +266,14 @@ export const settingsApi = {
 
   async getAutoLaunchStatus(): Promise<boolean> {
     return await invoke("get_auto_launch_status");
+  },
+
+  async getCodexRepairStatus(): Promise<CodexRepairStatus> {
+    return await invoke("get_codex_repair_status");
+  },
+
+  async launchCodexRepair(): Promise<CodexRepairLaunchResult> {
+    return await invoke("launch_codex_repair");
   },
 
   async getToolVersions(
@@ -355,7 +398,7 @@ export const backupsApi = {
     return await invoke("list_db_backups");
   },
 
-  async restoreDbBackup(filename: string): Promise<string> {
+  async restoreDbBackup(filename: string): Promise<RestoreDbBackupResult> {
     return await invoke("restore_db_backup", { filename });
   },
 

@@ -21,6 +21,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useBackupManager } from "@/hooks/useBackupManager";
+import { settingsApi } from "@/lib/api";
 import { extractErrorMessage } from "@/utils/errorUtils";
 
 interface BackupListSectionProps {
@@ -84,23 +85,54 @@ export function BackupListSection({
   const [editingFilename, setEditingFilename] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
 
+  const handlePostImportSyncRetry = async () => {
+    try {
+      await settingsApi.retryPostImportSync();
+      toast.success(t("settings.postImportSync.retrySuccess"));
+    } catch (error) {
+      toast.error(
+        t("settings.postImportSync.retryFailed", {
+          error:
+            extractErrorMessage(error) ||
+            (error as Error)?.message ||
+            String(error),
+        }),
+      );
+    }
+  };
+
   const handleRestore = async () => {
     if (!confirmFilename) return;
     try {
-      const safetyId = await restore(confirmFilename);
+      const result = await restore(confirmFilename);
       setConfirmFilename(null);
-      toast.success(
-        t("settings.backupManager.restoreSuccess", {
-          defaultValue: "Restore successful! Safety backup created",
-        }),
-        {
-          description: safetyId
-            ? `${t("settings.backupManager.safetyBackupId", { defaultValue: "Safety Backup ID" })}: ${safetyId}`
-            : undefined,
-          duration: 6000,
+      const safetyBackupDescription = result.safetyBackupId
+        ? `${t("settings.backupManager.safetyBackupId", { defaultValue: "Safety Backup ID" })}: ${result.safetyBackupId}`
+        : undefined;
+      if (result.warning) {
+        toast.warning(t("settings.postImportSync.partialSuccess"), {
+          description: [safetyBackupDescription, result.warning]
+            .filter(Boolean)
+            .join("\n"),
+          duration: 10000,
           closeButton: true,
-        },
-      );
+          action: {
+            label: t("settings.postImportSync.retry"),
+            onClick: () => void handlePostImportSyncRetry(),
+          },
+        });
+      } else {
+        toast.success(
+          t("settings.backupManager.restoreSuccess", {
+            defaultValue: "Restore successful! Safety backup created",
+          }),
+          {
+            description: safetyBackupDescription,
+            duration: 6000,
+            closeButton: true,
+          },
+        );
+      }
     } catch (error) {
       const detail =
         extractErrorMessage(error) ||

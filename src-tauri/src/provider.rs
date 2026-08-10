@@ -418,6 +418,131 @@ impl LocalProxyRequestOverrides {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAutoReviewMode {
+    #[default]
+    Native,
+    Auto,
+    Fallback,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAgentReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+    Ultra,
+}
+
+impl CodexAgentReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexAgentRoleOverride {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<CodexAgentReasoningEffort>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexFrontendAgentRoleOverride {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<CodexAgentReasoningEffort>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexAgentRoleRouting {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frontend: Option<CodexFrontendAgentRoleOverride>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<CodexAgentRoleOverride>,
+}
+
+impl CodexAgentRoleRouting {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+}
+
+pub const DEFAULT_LOCAL_PROXY_RETRY_MESSAGE: &str =
+    "We're currently experiencing high demand, which may cause temporary errors.";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalProxyRetryErrorType {
+    RateLimit,
+    Overloaded,
+    ServerError,
+    Network,
+}
+
+fn default_local_proxy_retry_delay_ms() -> u64 {
+    1_000
+}
+
+fn default_local_proxy_retry_messages() -> Vec<String> {
+    vec![DEFAULT_LOCAL_PROXY_RETRY_MESSAGE.to_string()]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalProxyRetryPolicy {
+    /// Explicit Provider-level switch. `None` infers enabled from `max_retries > 0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    /// Extra retry count. With `enabled = Some(true)`, zero means unlimited retries.
+    pub max_retries: u32,
+    #[serde(default = "default_local_proxy_retry_delay_ms")]
+    pub retry_delay_ms: u64,
+    #[serde(default = "default_local_proxy_retry_messages")]
+    pub custom_messages: Vec<String>,
+    #[serde(default)]
+    pub error_types: Vec<LocalProxyRetryErrorType>,
+}
+
+impl Default for LocalProxyRetryPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            max_retries: 0,
+            retry_delay_ms: default_local_proxy_retry_delay_ms(),
+            custom_messages: default_local_proxy_retry_messages(),
+            error_types: Vec::new(),
+        }
+    }
+}
+
 /// 供应商元数据
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderMeta {
@@ -529,6 +654,28 @@ pub struct ProviderMeta {
         skip_serializing_if = "Option::is_none"
     )]
     pub local_proxy_request_overrides: Option<LocalProxyRequestOverrides>,
+    /// Same-provider retry policy used only by the local proxy.
+    #[serde(
+        rename = "localProxyRetryPolicy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub local_proxy_retry_policy: Option<LocalProxyRetryPolicy>,
+    #[serde(
+        rename = "codexAutoReviewMode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub codex_auto_review_mode: Option<CodexAutoReviewMode>,
+    #[serde(
+        rename = "codexAutoReviewFallbackModel",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub codex_auto_review_fallback_model: Option<String>,
+    /// Codex Agent Role overrides and optional frontend Provider routing.
+    #[serde(
+        rename = "codexAgentRoleRouting",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub codex_agent_role_routing: Option<CodexAgentRoleRouting>,
     /// 累加模式应用中，该 provider 是否已写入 live config。
     /// `None` 表示旧数据/未知状态，`Some(false)` 表示明确仅存在于数据库中。
     #[serde(rename = "liveConfigManaged", skip_serializing_if = "Option::is_none")]
@@ -995,8 +1142,10 @@ pub struct OpenCodeModelLimit {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaudeModelConfig, CodexModelConfig, GeminiModelConfig, LocalProxyRequestOverrides,
-        OpenCodeProviderConfig, Provider, ProviderManager, ProviderMeta, UniversalProvider,
+        ClaudeModelConfig, CodexAgentReasoningEffort, CodexAgentRoleOverride,
+        CodexAgentRoleRouting, CodexFrontendAgentRoleOverride, CodexModelConfig, GeminiModelConfig,
+        LocalProxyRequestOverrides, OpenCodeProviderConfig, Provider, ProviderManager,
+        ProviderMeta, UniversalProvider,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -1076,6 +1225,175 @@ mod tests {
         let overrides = decoded.local_proxy_request_overrides.unwrap();
         assert_eq!(overrides.headers.get("X-Test"), Some(&"yes".to_string()));
         assert_eq!(overrides.body.unwrap()["temperature"], 0.2);
+    }
+
+    #[test]
+    fn provider_meta_roundtrips_codex_agent_role_routing() {
+        let meta = ProviderMeta {
+            codex_agent_role_routing: Some(CodexAgentRoleRouting {
+                enabled: Some(true),
+                frontend: Some(CodexFrontendAgentRoleOverride {
+                    provider_id: Some("provider-b".to_string()),
+                    upstream_model: Some("frontend-upstream".to_string()),
+                    model: Some("gpt-5.6-sol".to_string()),
+                    reasoning_effort: Some(CodexAgentReasoningEffort::Xhigh),
+                }),
+                backend: Some(CodexAgentRoleOverride {
+                    model: Some("gpt-5.6-terra".to_string()),
+                    reasoning_effort: Some(CodexAgentReasoningEffort::High),
+                }),
+            }),
+            ..ProviderMeta::default()
+        };
+
+        let value = serde_json::to_value(&meta).expect("serialize ProviderMeta");
+        assert_eq!(value["codexAgentRoleRouting"]["enabled"], true);
+        assert_eq!(
+            value["codexAgentRoleRouting"]["frontend"]["providerId"],
+            "provider-b"
+        );
+        assert_eq!(
+            value["codexAgentRoleRouting"]["frontend"]["upstreamModel"],
+            "frontend-upstream"
+        );
+        assert_eq!(
+            value["codexAgentRoleRouting"]["frontend"]["reasoningEffort"],
+            "xhigh"
+        );
+        assert_eq!(
+            value["codexAgentRoleRouting"]["backend"]["reasoningEffort"],
+            "high"
+        );
+
+        let decoded: ProviderMeta =
+            serde_json::from_value(value).expect("deserialize ProviderMeta");
+        assert_eq!(
+            decoded.codex_agent_role_routing,
+            meta.codex_agent_role_routing
+        );
+    }
+
+    #[test]
+    fn provider_meta_without_codex_agent_role_routing_remains_compatible() {
+        let decoded: ProviderMeta = serde_json::from_value(json!({
+            "customUserAgent": "legacy-client"
+        }))
+        .expect("deserialize legacy ProviderMeta");
+
+        assert!(decoded.codex_agent_role_routing.is_none());
+        assert_eq!(decoded.custom_user_agent.as_deref(), Some("legacy-client"));
+    }
+
+    #[test]
+    fn provider_meta_roundtrips_codex_auto_review_policy() {
+        let meta = ProviderMeta {
+            codex_auto_review_mode: Some(super::CodexAutoReviewMode::Auto),
+            codex_auto_review_fallback_model: Some("gpt-5.6-sol".to_string()),
+            ..ProviderMeta::default()
+        };
+
+        let value = serde_json::to_value(&meta).expect("serialize ProviderMeta");
+        assert_eq!(value["codexAutoReviewMode"], "auto");
+        assert_eq!(value["codexAutoReviewFallbackModel"], "gpt-5.6-sol");
+
+        let decoded: ProviderMeta =
+            serde_json::from_value(value).expect("deserialize ProviderMeta");
+        assert_eq!(
+            decoded.codex_auto_review_mode,
+            Some(super::CodexAutoReviewMode::Auto)
+        );
+        assert_eq!(
+            decoded.codex_auto_review_fallback_model.as_deref(),
+            Some("gpt-5.6-sol")
+        );
+
+        let empty = serde_json::to_value(ProviderMeta::default()).expect("serialize default");
+        assert!(empty.get("codexAutoReviewMode").is_none());
+        assert!(empty.get("codexAutoReviewFallbackModel").is_none());
+    }
+
+    #[test]
+    fn provider_meta_roundtrips_local_proxy_retry_policy() {
+        let meta = ProviderMeta {
+            local_proxy_retry_policy: Some(super::LocalProxyRetryPolicy {
+                enabled: Some(true),
+                max_retries: 5,
+                retry_delay_ms: 1_000,
+                custom_messages: vec!["We're currently experiencing high demand".to_string()],
+                error_types: vec![
+                    super::LocalProxyRetryErrorType::RateLimit,
+                    super::LocalProxyRetryErrorType::Network,
+                ],
+            }),
+            ..ProviderMeta::default()
+        };
+
+        let value = serde_json::to_value(&meta).expect("serialize ProviderMeta");
+        assert_eq!(value["localProxyRetryPolicy"]["enabled"], true);
+        assert_eq!(value["localProxyRetryPolicy"]["maxRetries"], 5);
+        assert_eq!(value["localProxyRetryPolicy"]["retryDelayMs"], 1_000);
+        assert_eq!(
+            value["localProxyRetryPolicy"]["customMessages"][0],
+            "We're currently experiencing high demand"
+        );
+        assert_eq!(
+            value["localProxyRetryPolicy"]["errorTypes"],
+            json!(["rate_limit", "network"])
+        );
+
+        let decoded: ProviderMeta =
+            serde_json::from_value(value).expect("deserialize ProviderMeta");
+        let policy = decoded
+            .local_proxy_retry_policy
+            .expect("retry policy should roundtrip");
+        assert_eq!(policy.enabled, Some(true));
+        assert_eq!(policy.max_retries, 5);
+        assert_eq!(policy.retry_delay_ms, 1_000);
+        assert_eq!(
+            policy.error_types,
+            vec![
+                super::LocalProxyRetryErrorType::RateLimit,
+                super::LocalProxyRetryErrorType::Network,
+            ]
+        );
+
+        let empty = serde_json::to_value(ProviderMeta::default()).expect("serialize default");
+        assert!(empty.get("localProxyRetryPolicy").is_none());
+    }
+
+    #[test]
+    fn provider_meta_retry_policy_without_enabled_remains_compatible() {
+        let decoded: ProviderMeta = serde_json::from_value(json!({
+            "localProxyRetryPolicy": {
+                "maxRetries": 2,
+                "retryDelayMs": 250,
+                "customMessages": [],
+                "errorTypes": ["network"]
+            }
+        }))
+        .expect("deserialize legacy retry policy");
+
+        let policy = decoded
+            .local_proxy_retry_policy
+            .expect("legacy retry policy should deserialize");
+        assert_eq!(policy.enabled, None);
+        assert_eq!(policy.max_retries, 2);
+        assert_eq!(policy.retry_delay_ms, 250);
+        assert_eq!(
+            policy.error_types,
+            vec![super::LocalProxyRetryErrorType::Network]
+        );
+    }
+    #[test]
+    fn provider_meta_without_local_proxy_retry_policy_remains_compatible() {
+        let decoded: ProviderMeta = serde_json::from_value(json!({
+            "codexAutoReviewMode": "native",
+            "customUserAgent": "legacy-client"
+        }))
+        .expect("deserialize legacy ProviderMeta");
+
+        assert!(decoded.local_proxy_retry_policy.is_none());
+        assert_eq!(decoded.custom_user_agent.as_deref(), Some("legacy-client"));
     }
 
     #[test]

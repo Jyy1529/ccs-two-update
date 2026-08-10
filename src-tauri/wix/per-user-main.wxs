@@ -44,7 +44,16 @@
             <MajorUpgrade Schedule="afterInstallInitialize" DowngradeErrorMessage="!(loc.DowngradeErrorMessage)" AllowSameVersionUpgrades="yes" />
         {{/if}}
 
+        <CustomAction
+            Id="RemoveAutoLaunchRegistryValue"
+            Directory="TARGETDIR"
+            ExeCommand='"[SystemFolder]reg.exe" delete "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" /v "CC Switch" /f'
+            Execute="immediate"
+            Impersonate="yes"
+            Return="ignore" />
+
         <InstallExecuteSequence>
+            <Custom Action="RemoveAutoLaunchRegistryValue" Before="RemoveFiles">REMOVE~="ALL"</Custom>
             <RemoveShortcuts>Installed AND NOT UPGRADINGPRODUCTCODE</RemoveShortcuts>
         </InstallExecuteSequence>
 
@@ -118,7 +127,6 @@
                         WorkingDirectory="INSTALLDIR">
                         <ShortcutProperty Key="System.AppUserModel.ID" Value="{{bundle_id}}"/>
                     </Shortcut>
-                    <RemoveFolder Id="DesktopFolder" On="uninstall" />
                     <RegistryValue Root="HKCU" Key="Software\\{{manufacturer}}\\{{product_name}}" Name="Desktop Shortcut" Type="integer" Value="1" KeyPath="yes" />
                 </Component>
             </Directory>
@@ -189,11 +197,13 @@
 						  Target="[System64Folder]msiexec.exe"
 						  Arguments="/x [ProductCode]" />
 
-                <RemoveFile Id="RemoveUserProgramsFiles" Directory="TauriLocalAppDataPrograms" Name="*" On="uninstall" />
-                <RemoveFolder Id="RemoveUserProgramsFolder" Directory="TauriLocalAppDataPrograms" On="uninstall" />
-
-				<RemoveFolder Id="INSTALLDIR"
+				<!-- Remove the shared Programs directory only when no other app uses it. -->
+				<RemoveFolder Id="RemoveEmptyUserProgramsFolder"
+							  Directory="TauriLocalAppDataPrograms"
 							  On="uninstall" />
+
+					<RemoveFolder Id="INSTALLDIR"
+								  On="uninstall" />
 
 				<RegistryValue Root="HKCU"
 							   Key="Software\\{{manufacturer}}\\{{product_name}}"

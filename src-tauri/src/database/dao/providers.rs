@@ -2,7 +2,7 @@ use crate::database::{lock_conn, Database};
 use crate::error::AppError;
 use crate::provider::{Provider, ProviderMeta};
 use indexmap::IndexMap;
-use rusqlite::params;
+use rusqlite::{params, params_from_iter, types::Value as SqlValue};
 use std::collections::{HashMap, HashSet};
 
 type OmoProviderRow = (
@@ -16,7 +16,104 @@ type OmoProviderRow = (
     String,
 );
 
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderTablesSnapshot {
+    app_type: String,
+    provider_rows: Vec<Vec<SqlValue>>,
+    endpoint_rows: Vec<Vec<SqlValue>>,
+}
+
 impl Database {
+    pub(crate) fn snapshot_provider_tables(
+        &self,
+        app_type: &str,
+    ) -> Result<ProviderTablesSnapshot, AppError> {
+        let conn = lock_conn!(self.conn);
+        let mut provider_stmt = conn
+            .prepare(
+                "SELECT id, app_type, name, settings_config, website_url, category,
+                        created_at, sort_index, notes, icon, icon_color, meta,
+                        is_current, in_failover_queue
+                 FROM providers WHERE app_type = ?1 ORDER BY id ASC",
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let provider_iter = provider_stmt
+            .query_map(params![app_type], |row| {
+                (0..14)
+                    .map(|index| row.get::<_, SqlValue>(index))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let provider_rows = provider_iter
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let mut endpoint_stmt = conn
+            .prepare(
+                "SELECT id, provider_id, app_type, url, added_at
+                 FROM provider_endpoints WHERE app_type = ?1 ORDER BY id ASC",
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let endpoint_iter = endpoint_stmt
+            .query_map(params![app_type], |row| {
+                (0..5)
+                    .map(|index| row.get::<_, SqlValue>(index))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let endpoint_rows = endpoint_iter
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(ProviderTablesSnapshot {
+            app_type: app_type.to_string(),
+            provider_rows,
+            endpoint_rows,
+        })
+    }
+
+    pub(crate) fn restore_provider_tables(
+        &self,
+        snapshot: &ProviderTablesSnapshot,
+    ) -> Result<(), AppError> {
+        let mut conn = lock_conn!(self.conn);
+        let tx = conn
+            .transaction()
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        tx.execute(
+            "DELETE FROM provider_endpoints WHERE app_type = ?1",
+            params![snapshot.app_type],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        tx.execute(
+            "DELETE FROM providers WHERE app_type = ?1",
+            params![snapshot.app_type],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        for row in &snapshot.provider_rows {
+            tx.execute(
+                "INSERT INTO providers (
+                    id, app_type, name, settings_config, website_url, category,
+                    created_at, sort_index, notes, icon, icon_color, meta,
+                    is_current, in_failover_queue
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params_from_iter(row.iter()),
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+        for row in &snapshot.endpoint_rows {
+            tx.execute(
+                "INSERT INTO provider_endpoints (id, provider_id, app_type, url, added_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params_from_iter(row.iter()),
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+
+        tx.commit().map_err(|e| AppError::Database(e.to_string()))
+    }
+
     pub fn get_all_providers(
         &self,
         app_type: &str,
@@ -714,6 +811,10 @@ mod ensure_official_seed_tests {
         Database, CLAUDE_DESKTOP_OFFICIAL_PROVIDER_ID, CODEX_OFFICIAL_PROVIDER_ID,
         GROKBUILD_OFFICIAL_PROVIDER_ID,
     };
+    use crate::provider::Provider;
+    use crate::settings::CustomEndpoint;
+    use serde_json::json;
+    use std::collections::HashMap;
 
     #[test]
     fn ensure_inserts_when_missing() {
@@ -824,5 +925,91 @@ mod ensure_official_seed_tests {
         let result =
             db.ensure_official_seed_by_id(CLAUDE_DESKTOP_OFFICIAL_PROVIDER_ID, AppType::Claude);
         assert!(result.is_err(), "(id, app_type) mismatch should be Err");
+    }
+
+    #[test]
+    fn raw_provider_snapshot_restores_rows_current_failover_and_endpoints() {
+        let db = Database::memory().expect("memory db");
+        let mut original = Provider::with_id(
+            "owner".into(),
+            "Original".into(),
+            json!({ "auth": {}, "config": "model = \"old\"" }),
+            None,
+        );
+        original
+            .meta
+            .get_or_insert_with(Default::default)
+            .custom_endpoints = HashMap::from([(
+            "https://old.example/v1".into(),
+            CustomEndpoint {
+                url: "https://old.example/v1".into(),
+                added_at: 123,
+                last_used: None,
+            },
+        )]);
+        db.save_provider(AppType::Codex.as_str(), &original)
+            .expect("save original provider");
+        db.set_current_provider(AppType::Codex.as_str(), &original.id)
+            .expect("set original current");
+        db.add_to_failover_queue(AppType::Codex.as_str(), &original.id)
+            .expect("set original failover state");
+        let snapshot = db
+            .snapshot_provider_tables(AppType::Codex.as_str())
+            .expect("snapshot raw provider tables");
+
+        let mut changed = original.clone();
+        changed.name = "Changed".into();
+        db.save_provider(AppType::Codex.as_str(), &changed)
+            .expect("change provider");
+        db.remove_from_failover_queue(AppType::Codex.as_str(), &original.id)
+            .expect("clear failover state");
+        db.remove_custom_endpoint(
+            AppType::Codex.as_str(),
+            &original.id,
+            "https://old.example/v1",
+        )
+        .expect("remove original endpoint");
+        let added = Provider::with_id(
+            "added".into(),
+            "Added".into(),
+            json!({ "auth": {}, "config": "model = \"new\"" }),
+            None,
+        );
+        db.save_provider(AppType::Codex.as_str(), &added)
+            .expect("save transaction provider");
+        db.add_custom_endpoint(AppType::Codex.as_str(), &added.id, "https://new.example/v1")
+            .expect("save transaction endpoint");
+        db.set_current_provider(AppType::Codex.as_str(), &added.id)
+            .expect("set transaction current");
+
+        db.restore_provider_tables(&snapshot)
+            .expect("restore raw provider tables");
+
+        let providers = db
+            .get_all_providers(AppType::Codex.as_str())
+            .expect("read restored providers");
+        assert_eq!(providers.len(), 1);
+        let restored = providers.get("owner").expect("owner restored");
+        assert_eq!(restored.name, "Original");
+        assert!(restored.in_failover_queue);
+        let endpoints = &restored
+            .meta
+            .as_ref()
+            .expect("restored meta")
+            .custom_endpoints;
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(
+            endpoints
+                .get("https://old.example/v1")
+                .expect("old endpoint restored")
+                .added_at,
+            123
+        );
+        assert_eq!(
+            db.get_current_provider(AppType::Codex.as_str())
+                .expect("read restored current")
+                .as_deref(),
+            Some("owner")
+        );
     }
 }

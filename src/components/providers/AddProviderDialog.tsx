@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Plus } from "lucide-react";
 import { toast } from "sonner";
@@ -36,7 +36,10 @@ interface AddProviderDialogProps {
       ensureCodexOfficialSeed?: boolean;
       ensureGrokBuildOfficialSeed?: boolean;
     },
-  ) => Promise<void> | void;
+  ) => Promise<Provider | void> | Provider | void;
+  onRequestAddProvider?: (onCreated: (providerId: string) => void) => void;
+  escapeEnabled?: boolean;
+  appSpecificOnly?: boolean;
 }
 
 export function AddProviderDialog({
@@ -44,10 +47,15 @@ export function AddProviderDialog({
   onOpenChange,
   appId,
   onSubmit,
+  onRequestAddProvider,
+  escapeEnabled = true,
+  appSpecificOnly = false,
 }: AddProviderDialogProps) {
   const { t } = useTranslation();
+  const formId = useId();
   // OpenCode and OpenClaw don't support universal providers
   const showUniversalTab =
+    !appSpecificOnly &&
     appId !== "opencode" &&
     appId !== "openclaw" &&
     appId !== "hermes" &&
@@ -334,7 +342,7 @@ export function AddProviderDialog({
         </Button>
         <Button
           type="submit"
-          form="provider-form"
+          form={formId}
           disabled={isFormSubmitting}
           className="bg-primary text-primary-foreground hover:bg-primary/90"
         >
@@ -366,6 +374,7 @@ export function AddProviderDialog({
       isOpen={open}
       title={t("provider.addNewProvider")}
       onClose={() => onOpenChange(false)}
+      escapeEnabled={escapeEnabled}
       footer={footer}
       contentClassName="pt-3"
     >
@@ -391,6 +400,8 @@ export function AddProviderDialog({
               onCancel={() => onOpenChange(false)}
               onSubmittingChange={setIsFormSubmitting}
               showButtons={false}
+              formId={formId}
+              onRequestAddProvider={onRequestAddProvider}
             />
           </TabsContent>
 
@@ -407,6 +418,8 @@ export function AddProviderDialog({
           onCancel={() => onOpenChange(false)}
           onSubmittingChange={setIsFormSubmitting}
           showButtons={false}
+          formId={formId}
+          onRequestAddProvider={onRequestAddProvider}
         />
       )}
 

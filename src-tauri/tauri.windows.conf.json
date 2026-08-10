@@ -11,5 +11,17 @@
         "minHeight": 600
       }
     ]
+  },
+  "bundle": {
+    "resources": null,
+    "windows": {
+      "wix": {
+        "fragmentPaths": ["wix/third-party-notices.wxs"],
+        "componentRefs": ["ThirdPartyNoticesComponent"]
+      },
+      "nsis": {
+        "installerHooks": "nsis/installer-hooks.nsh"
+      }
+    }
   }
 }

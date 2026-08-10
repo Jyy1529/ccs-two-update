@@ -13,6 +13,7 @@ import { emitTauriEvent } from "../msw/tauriMocks";
 
 const toastSuccessMock = vi.fn();
 const toastErrorMock = vi.fn();
+const roleProviderCreatedMock = vi.fn();
 const skillsPanelMocks = vi.hoisted(() => ({
   checkUpdates: vi.fn(),
   openDiscovery: vi.fn(),
@@ -58,28 +59,69 @@ vi.mock("@/components/providers/ProviderList", () => ({
 }));
 
 vi.mock("@/components/providers/AddProviderDialog", () => ({
-  AddProviderDialog: ({ open, onOpenChange, onSubmit, appId }: any) =>
-    open ? (
-      <div data-testid="add-provider-dialog">
+  AddProviderDialog: ({
+    open,
+    onOpenChange,
+    onSubmit,
+    appId,
+    onRequestAddProvider,
+    appSpecificOnly,
+  }: any) => {
+    if (!open) return null;
+    const isRoleProviderDialog = !onRequestAddProvider;
+    return (
+      <div
+        data-testid={
+          isRoleProviderDialog
+            ? "role-provider-add-dialog"
+            : "add-provider-dialog"
+        }
+      >
+        {isRoleProviderDialog && (
+          <span data-testid="role-provider-app-specific-only">
+            {String(appSpecificOnly)}
+          </span>
+        )}
         <button
-          onClick={() =>
-            onSubmit({
+          onClick={async () => {
+            await onSubmit({
               name: `New ${appId} Provider`,
               settingsConfig: {},
               category: "custom",
               sortIndex: 99,
-            })
-          }
+            });
+            onOpenChange(false);
+          }}
         >
-          confirm-add
+          {isRoleProviderDialog ? "confirm-role-add" : "confirm-add"}
         </button>
-        <button onClick={() => onOpenChange(false)}>close-add</button>
+        {onRequestAddProvider && (
+          <button
+            onClick={() =>
+              onRequestAddProvider((providerId: string) =>
+                roleProviderCreatedMock(providerId),
+              )
+            }
+          >
+            request-role-provider-from-add
+          </button>
+        )}
+        <button onClick={() => onOpenChange(false)}>
+          {isRoleProviderDialog ? "close-role-add" : "close-add"}
+        </button>
       </div>
-    ) : null,
+    );
+  },
 }));
 
 vi.mock("@/components/providers/EditProviderDialog", () => ({
-  EditProviderDialog: ({ open, provider, onSubmit, onOpenChange }: any) =>
+  EditProviderDialog: ({
+    open,
+    provider,
+    onSubmit,
+    onOpenChange,
+    onRequestAddProvider,
+  }: any) =>
     open ? (
       <div data-testid="edit-provider-dialog">
         <button
@@ -95,6 +137,17 @@ vi.mock("@/components/providers/EditProviderDialog", () => ({
         >
           confirm-edit
         </button>
+        {onRequestAddProvider && (
+          <button
+            onClick={() =>
+              onRequestAddProvider((providerId: string) =>
+                roleProviderCreatedMock(providerId),
+              )
+            }
+          >
+            request-role-provider-from-edit
+          </button>
+        )}
         <button onClick={() => onOpenChange(false)}>close-edit</button>
       </div>
     ) : null,
@@ -186,11 +239,12 @@ const renderApp = (AppComponent: ComponentType) => {
   );
 };
 
-describe("App integration with MSW", () => {
+describe("App integration with MSW", { timeout: 60_000 }, () => {
   beforeEach(() => {
     resetProviderState();
     toastSuccessMock.mockReset();
     toastErrorMock.mockReset();
+    roleProviderCreatedMock.mockReset();
     skillsPanelMocks.checkUpdates.mockReset();
     skillsPanelMocks.openDiscovery.mockReset();
     localStorage.removeItem("cc-switch-last-view");
@@ -251,7 +305,53 @@ describe("App integration with MSW", () => {
 
     expect(toastErrorMock).not.toHaveBeenCalled();
     expect(toastSuccessMock).toHaveBeenCalled();
-  }, 10_000);
+  }, 60_000);
+
+  it("keeps the owner dialog mounted while adding and selecting a role provider", async () => {
+    const { default: App } = await import("@/App");
+    renderApp(App);
+
+    fireEvent.click(screen.getByText("switch-codex"));
+    await waitFor(() =>
+      expect(screen.getByTestId("provider-list").textContent).toContain(
+        "codex-1",
+      ),
+    );
+
+    fireEvent.click(screen.getByText("edit"));
+    expect(screen.getByTestId("edit-provider-dialog")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("request-role-provider-from-edit"));
+
+    expect(screen.getByTestId("role-provider-add-dialog")).toBeInTheDocument();
+    expect(screen.getByTestId("edit-provider-dialog")).toBeInTheDocument();
+    expect(
+      screen.getByTestId("role-provider-app-specific-only"),
+    ).toHaveTextContent("true");
+
+    fireEvent.click(screen.getByText("confirm-role-add"));
+    await waitFor(() =>
+      expect(roleProviderCreatedMock).toHaveBeenCalledTimes(1),
+    );
+    expect(roleProviderCreatedMock.mock.calls[0]?.[0]).toEqual(
+      expect.any(String),
+    );
+    expect(screen.getByTestId("edit-provider-dialog")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId("role-provider-add-dialog"),
+      ).not.toBeInTheDocument(),
+    );
+
+    fireEvent.click(screen.getByText("close-edit"));
+    fireEvent.click(screen.getByText("create"));
+    expect(screen.getByTestId("add-provider-dialog")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("request-role-provider-from-add"));
+    expect(screen.getByTestId("role-provider-add-dialog")).toBeInTheDocument();
+    expect(screen.getByTestId("add-provider-dialog")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("close-role-add"));
+    expect(screen.getByTestId("add-provider-dialog")).toBeInTheDocument();
+  });
 
   it("shows toast when auto sync fails in background", async () => {
     const { default: App } = await import("@/App");

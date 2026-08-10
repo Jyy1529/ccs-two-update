@@ -6,11 +6,77 @@ use crate::app_config::AppType;
 use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::Provider;
-use crate::proxy::circuit_breaker::{AllowResult, CircuitBreaker, CircuitBreakerConfig};
+use crate::proxy::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+#[derive(Debug, Clone)]
+pub struct ProviderRouteAttempt {
+    pub provider: Provider,
+    pub outbound_model_override: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderRoutePlan {
+    pub attempts: Vec<ProviderRouteAttempt>,
+    pub use_failover_timeouts: bool,
+    pub sync_logical_target: bool,
+    pub bypass_single_provider_circuit_breaker: bool,
+}
+
+impl ProviderRoutePlan {
+    pub fn standard(providers: Vec<Provider>, use_failover_timeouts: bool) -> Self {
+        Self {
+            attempts: providers
+                .into_iter()
+                .map(|provider| ProviderRouteAttempt {
+                    provider,
+                    outbound_model_override: None,
+                })
+                .collect(),
+            use_failover_timeouts,
+            sync_logical_target: true,
+            bypass_single_provider_circuit_breaker: true,
+        }
+    }
+
+    pub fn providers(&self) -> Vec<Provider> {
+        self.attempts
+            .iter()
+            .map(|attempt| attempt.provider.clone())
+            .collect()
+    }
+}
+
+/// Releases an acquired HalfOpen probe slot if an in-flight request future is dropped.
+pub struct ProviderRequestPermit {
+    allowed: bool,
+    breaker: Option<Arc<CircuitBreaker>>,
+}
+
+impl ProviderRequestPermit {
+    pub fn allowed(&self) -> bool {
+        self.allowed
+    }
+
+    pub fn used_half_open_permit(&self) -> bool {
+        self.breaker.is_some()
+    }
+
+    pub fn into_used_half_open_permit(mut self) -> bool {
+        self.breaker.take().is_some()
+    }
+}
+
+impl Drop for ProviderRequestPermit {
+    fn drop(&mut self) {
+        if let Some(breaker) = self.breaker.take() {
+            breaker.release_half_open_permit();
+        }
+    }
+}
 
 /// 供应商路由器
 pub struct ProviderRouter {
@@ -108,18 +174,160 @@ impl ProviderRouter {
         Ok(result)
     }
 
+    pub async fn select_codex_frontend_route_plan(
+        &self,
+        owner_provider_id: &str,
+        request_model: &str,
+        route_token: &str,
+    ) -> Result<Option<ProviderRoutePlan>, AppError> {
+        const APP_TYPE: &str = "codex";
+
+        let Some(owner) = self.db.get_provider_by_id(owner_provider_id, APP_TYPE)? else {
+            let current_id =
+                crate::settings::get_effective_current_provider(&self.db, &AppType::Codex)?
+                    .ok_or(AppError::NoProvidersConfigured)?;
+            let current = self
+                .db
+                .get_provider_by_id(&current_id, APP_TYPE)?
+                .ok_or(AppError::NoProvidersConfigured)?;
+            log::warn!(
+                "[CodexRoleRoute] owner {} is unavailable; using current Codex provider {}",
+                owner_provider_id,
+                current.id
+            );
+            return Ok(Some(ProviderRoutePlan {
+                attempts: vec![ProviderRouteAttempt {
+                    outbound_model_override: provider_default_or_request(&current, request_model),
+                    provider: current,
+                }],
+                use_failover_timeouts: true,
+                sync_logical_target: false,
+                bypass_single_provider_circuit_breaker: false,
+            }));
+        };
+
+        let routing = owner
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.codex_agent_role_routing.as_ref())
+            .filter(|routing| routing.is_enabled())
+            .ok_or_else(|| {
+                AppError::InvalidInput(format!(
+                    "Codex role routing is unavailable or disabled for owner: {owner_provider_id}"
+                ))
+            })?;
+        if !crate::services::codex_agent_roles::verify_codex_role_route_token(
+            owner_provider_id,
+            crate::services::codex_agent_roles::FRONTEND_ROLE_ROUTE_VALUE,
+            routing,
+            route_token,
+        ) {
+            return Err(AppError::InvalidInput(
+                "Invalid or stale Codex role route token".to_string(),
+            ));
+        }
+
+        let frontend = routing.frontend.as_ref();
+        let requested_target_id = frontend
+            .and_then(|frontend| frontend.provider_id.as_deref())
+            .map(str::trim)
+            .filter(|provider_id| !provider_id.is_empty());
+        let explicit_upstream_model = frontend
+            .and_then(|frontend| frontend.upstream_model.as_deref())
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(ToString::to_string);
+        let owner_id = owner.id.clone();
+        let target = match requested_target_id {
+            Some(provider_id) if provider_id != owner.id => {
+                match self.db.get_provider_by_id(provider_id, APP_TYPE)? {
+                    Some(provider) => Some(provider),
+                    None => {
+                        log::warn!(
+                            "[CodexRoleRoute] frontend provider {} referenced by owner {} is unavailable; using owner provider",
+                            provider_id,
+                            owner.id
+                        );
+                        None
+                    }
+                }
+            }
+            _ => Some(owner.clone()),
+        };
+
+        let mut attempts = Vec::with_capacity(2);
+        if let Some(target) = target {
+            if target.id == owner.id {
+                attempts.push(ProviderRouteAttempt {
+                    outbound_model_override: explicit_upstream_model
+                        .or_else(|| provider_default_or_request(&owner, request_model)),
+                    provider: owner,
+                });
+            } else {
+                attempts.push(ProviderRouteAttempt {
+                    outbound_model_override: explicit_upstream_model
+                        .or_else(|| provider_default_or_request(&target, request_model)),
+                    provider: target,
+                });
+                attempts.push(ProviderRouteAttempt {
+                    outbound_model_override: provider_default_or_request(&owner, request_model),
+                    provider: owner,
+                });
+            }
+        } else {
+            attempts.push(ProviderRouteAttempt {
+                outbound_model_override: provider_default_or_request(&owner, request_model),
+                provider: owner,
+            });
+        }
+
+        let chain = attempts
+            .iter()
+            .map(|attempt| {
+                format!(
+                    "{}:{}",
+                    attempt.provider.id,
+                    attempt
+                        .outbound_model_override
+                        .as_deref()
+                        .unwrap_or(request_model)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        log::info!(
+            "[CodexRoleRoute] role=frontend owner={} capability_model={} chain={}",
+            owner_id,
+            request_model,
+            chain
+        );
+
+        Ok(Some(ProviderRoutePlan {
+            attempts,
+            use_failover_timeouts: true,
+            sync_logical_target: false,
+            bypass_single_provider_circuit_breaker: false,
+        }))
+    }
+
     /// 请求执行前获取熔断器“放行许可”
     ///
     /// - Closed：直接放行
     /// - Open：超时到达后切到 HalfOpen 并放行一次探测
     /// - HalfOpen：按限流规则放行探测
     ///
-    /// 注意：调用方必须在请求结束后通过 `record_result()` 释放 HalfOpen 名额，
-    /// 否则会导致该 Provider 长时间无法进入探测状态。
-    pub async fn allow_provider_request(&self, provider_id: &str, app_type: &str) -> AllowResult {
+    pub async fn allow_provider_request(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+    ) -> ProviderRequestPermit {
         let circuit_key = format!("{app_type}:{provider_id}");
         let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
-        breaker.allow_request().await
+        let result = breaker.allow_request().await;
+        ProviderRequestPermit {
+            allowed: result.allowed,
+            breaker: result.used_half_open_permit.then_some(breaker),
+        }
     }
 
     /// 记录供应商请求结果
@@ -173,24 +381,6 @@ impl ProviderRouter {
     pub async fn reset_provider_breaker(&self, provider_id: &str, app_type: &str) {
         let circuit_key = format!("{app_type}:{provider_id}");
         self.reset_circuit_breaker(&circuit_key).await;
-    }
-
-    /// 仅释放 HalfOpen permit，不影响健康统计（neutral 接口）
-    ///
-    /// 用于整流器等场景：请求结果不应计入 Provider 健康度，
-    /// 但仍需释放占用的探测名额，避免 HalfOpen 状态卡死
-    pub async fn release_permit_neutral(
-        &self,
-        provider_id: &str,
-        app_type: &str,
-        used_half_open_permit: bool,
-    ) {
-        if !used_half_open_permit {
-            return;
-        }
-        let circuit_key = format!("{app_type}:{provider_id}");
-        let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
-        breaker.release_half_open_permit();
     }
 
     /// 更新所有熔断器的配置（热更新）
@@ -269,10 +459,38 @@ impl ProviderRouter {
     }
 }
 
+fn provider_default_or_request(provider: &Provider, request_model: &str) -> Option<String> {
+    crate::proxy::providers::codex_provider_upstream_model(provider)
+        .or_else(|| {
+            provider
+                .settings_config
+                .get("modelCatalog")
+                .and_then(|catalog| catalog.get("models"))
+                .and_then(|models| models.as_array())
+                .and_then(|models| models.first())
+                .and_then(|model| {
+                    model
+                        .as_str()
+                        .or_else(|| model.get("model").and_then(|value| value.as_str()))
+                })
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            let request_model = request_model.trim();
+            (!request_model.is_empty()).then(|| request_model.to_string())
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::database::Database;
+    use crate::provider::{CodexAgentRoleRouting, CodexFrontendAgentRoleOverride, ProviderMeta};
+    use crate::services::codex_agent_roles::{
+        create_codex_role_route_token, FRONTEND_ROLE_ROUTE_VALUE,
+    };
     use serde_json::json;
     use serial_test::serial;
     use std::env;
@@ -323,6 +541,320 @@ mod tests {
                 Some(value) => env::set_var("CC_SWITCH_TEST_HOME", value),
                 None => env::remove_var("CC_SWITCH_TEST_HOME"),
             }
+        }
+    }
+
+    async fn setup_half_open_router() -> (TempHome, Arc<ProviderRouter>) {
+        let home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        db.update_circuit_breaker_config(&CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 2,
+            timeout_seconds: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let provider =
+            Provider::with_id("a".to_string(), "Provider A".to_string(), json!({}), None);
+        db.save_provider("claude", &provider).unwrap();
+
+        let router = Arc::new(ProviderRouter::new(db));
+        router
+            .record_result("a", "claude", false, false, Some("fail".to_string()))
+            .await
+            .unwrap();
+
+        (home, router)
+    }
+
+    fn codex_role_owner(
+        id: &str,
+        frontend_provider_id: Option<&str>,
+        upstream_model: Option<&str>,
+    ) -> Provider {
+        let mut provider = Provider::with_id(
+            id.to_string(),
+            format!("Provider {id}"),
+            json!({ "config": format!("model = \"{id}-default\"\n") }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            codex_agent_role_routing: Some(CodexAgentRoleRouting {
+                enabled: Some(true),
+                frontend: Some(CodexFrontendAgentRoleOverride {
+                    provider_id: frontend_provider_id.map(ToString::to_string),
+                    upstream_model: upstream_model.map(ToString::to_string),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        provider
+    }
+
+    fn role_route_token(owner: &Provider) -> String {
+        let routing = owner
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.codex_agent_role_routing.as_ref())
+            .expect("Codex role routing");
+        create_codex_role_route_token(&owner.id, FRONTEND_ROLE_ROUTE_VALUE, routing)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn codex_frontend_route_plan_is_fixed_to_b_then_owner_a() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("memory db"));
+        let owner = codex_role_owner("a", Some("b"), Some("frontend-custom"));
+        let provider_b = Provider::with_id(
+            "b".into(),
+            "Provider B".into(),
+            json!({
+                "modelCatalog": {
+                    "models": [{ "model": "b-catalog-default" }]
+                }
+            }),
+            None,
+        );
+        let provider_c = Provider::with_id(
+            "c".into(),
+            "Provider C".into(),
+            json!({ "model": "c-default" }),
+            None,
+        );
+        db.save_provider("codex", &owner).expect("save owner");
+        db.save_provider("codex", &provider_b).expect("save B");
+        db.save_provider("codex", &provider_c).expect("save C");
+        db.set_current_provider("codex", "c")
+            .expect("set current C");
+        db.add_to_failover_queue("codex", "c").expect("queue C");
+
+        let router = ProviderRouter::new(db);
+        let plan = router
+            .select_codex_frontend_route_plan(
+                "a",
+                "client-capability-model",
+                &role_route_token(&owner),
+            )
+            .await
+            .expect("select role route")
+            .expect("enabled role route");
+
+        assert_eq!(
+            plan.attempts
+                .iter()
+                .map(|attempt| attempt.provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "a"]
+        );
+        assert_eq!(
+            plan.attempts[0].outbound_model_override.as_deref(),
+            Some("frontend-custom")
+        );
+        assert_eq!(
+            plan.attempts[1].outbound_model_override.as_deref(),
+            Some("a-default")
+        );
+        assert!(plan.use_failover_timeouts);
+        assert!(!plan.sync_logical_target);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn codex_frontend_route_plan_uses_target_and_owner_catalog_defaults() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("memory db"));
+        let mut owner = codex_role_owner("a", Some("b"), None);
+        owner.settings_config = json!({
+            "modelCatalog": {
+                "models": ["  a-catalog-default  "]
+            }
+        });
+        let provider_b = Provider::with_id(
+            "b".into(),
+            "Provider B".into(),
+            json!({
+                "modelCatalog": {
+                    "models": [{ "model": "  b-catalog-default  " }]
+                }
+            }),
+            None,
+        );
+        db.save_provider("codex", &owner).expect("save owner");
+        db.save_provider("codex", &provider_b).expect("save B");
+
+        let router = ProviderRouter::new(db);
+        let plan = router
+            .select_codex_frontend_route_plan(
+                "a",
+                "client-capability-model",
+                &role_route_token(&owner),
+            )
+            .await
+            .expect("select role route")
+            .expect("enabled role route");
+
+        assert_eq!(
+            plan.attempts[0].outbound_model_override.as_deref(),
+            Some("b-catalog-default")
+        );
+        assert_eq!(
+            plan.attempts[1].outbound_model_override.as_deref(),
+            Some("a-catalog-default")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn codex_frontend_route_plan_recovers_missing_target_with_owner_default() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("memory db"));
+        let mut owner = codex_role_owner("a", Some("missing"), None);
+        owner.settings_config = json!({
+            "modelCatalog": {
+                "models": [{ "model": "owner-catalog-default" }]
+            }
+        });
+        db.save_provider("codex", &owner).expect("save owner");
+        let router = ProviderRouter::new(db);
+
+        let plan = router
+            .select_codex_frontend_route_plan("a", "client-model", &role_route_token(&owner))
+            .await
+            .expect("select missing target route")
+            .expect("role route plan");
+        assert_eq!(plan.attempts.len(), 1);
+        assert_eq!(plan.attempts[0].provider.id, "a");
+        assert_eq!(
+            plan.attempts[0].outbound_model_override.as_deref(),
+            Some("owner-catalog-default")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn missing_role_owner_falls_back_to_current_codex_provider() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("memory db"));
+        let current = Provider::with_id(
+            "current".into(),
+            "Current".into(),
+            json!({
+                "modelCatalog": {
+                    "models": ["  current-catalog-default  "]
+                }
+            }),
+            None,
+        );
+        db.save_provider("codex", &current).expect("save current");
+        db.set_current_provider("codex", "current")
+            .expect("set database current");
+        let router = ProviderRouter::new(db);
+
+        let plan = router
+            .select_codex_frontend_route_plan(
+                "deleted-owner",
+                "client-model",
+                "unverifiable-deleted-owner-token",
+            )
+            .await
+            .expect("missing owner falls back")
+            .expect("fallback route plan");
+        assert_eq!(plan.attempts.len(), 1);
+        assert_eq!(plan.attempts[0].provider.id, "current");
+        assert_eq!(
+            plan.attempts[0].outbound_model_override.as_deref(),
+            Some("current-catalog-default")
+        );
+        assert!(!plan.sync_logical_target);
+    }
+
+    #[test]
+    fn provider_default_or_request_uses_role_model_priority() {
+        let direct = Provider::with_id(
+            "direct".into(),
+            "Direct".into(),
+            json!({
+                "model": "  settings-model  ",
+                "config": "model = \"toml-model\"\n",
+                "modelCatalog": { "models": [{ "model": "catalog-model" }] }
+            }),
+            None,
+        );
+        assert_eq!(
+            provider_default_or_request(&direct, "request-model").as_deref(),
+            Some("settings-model")
+        );
+
+        let toml = Provider::with_id(
+            "toml".into(),
+            "TOML".into(),
+            json!({
+                "model": "   ",
+                "config": "model = \"  toml-model  \"\n",
+                "modelCatalog": { "models": [{ "model": "catalog-model" }] }
+            }),
+            None,
+        );
+        assert_eq!(
+            provider_default_or_request(&toml, "request-model").as_deref(),
+            Some("toml-model")
+        );
+
+        let catalog = Provider::with_id(
+            "catalog".into(),
+            "Catalog".into(),
+            json!({
+                "model": "   ",
+                "config": "model = \"   \"\n",
+                "modelCatalog": { "models": [{ "model": "  catalog-model  " }] }
+            }),
+            None,
+        );
+        assert_eq!(
+            provider_default_or_request(&catalog, "request-model").as_deref(),
+            Some("catalog-model")
+        );
+
+        let empty_catalog = Provider::with_id(
+            "request".into(),
+            "Request".into(),
+            json!({
+                "modelCatalog": { "models": ["   ", { "model": "unused-second-model" }] }
+            }),
+            None,
+        );
+        assert_eq!(
+            provider_default_or_request(&empty_catalog, "  request-model  ").as_deref(),
+            Some("request-model")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn existing_role_owner_rejects_forged_and_stale_tokens() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("memory db"));
+        let owner = codex_role_owner("a", Some("b"), Some("initial-model"));
+        let stale_token = role_route_token(&owner);
+        db.save_provider("codex", &owner).expect("save owner");
+        let changed_owner = codex_role_owner("a", Some("b"), Some("changed-model"));
+        db.save_provider("codex", &changed_owner)
+            .expect("save changed owner");
+        let router = ProviderRouter::new(db);
+
+        for token in ["forged-token", stale_token.as_str()] {
+            assert!(matches!(
+                router
+                    .select_codex_frontend_route_plan("a", "client-model", token)
+                    .await,
+                Err(AppError::InvalidInput(message)) if message.contains("token")
+            ));
         }
     }
 
@@ -465,12 +997,12 @@ mod tests {
         let providers = router.select_providers("claude").await.unwrap();
         assert_eq!(providers.len(), 2);
 
-        assert!(router.allow_provider_request("b", "claude").await.allowed);
+        assert!(router.allow_provider_request("b", "claude").await.allowed());
     }
 
     #[tokio::test]
     #[serial]
-    async fn test_release_permit_neutral_frees_half_open_slot() {
+    async fn dropping_provider_request_permit_frees_half_open_slot() {
         let _home = TempHome::new();
         let db = Arc::new(Database::memory().unwrap());
 
@@ -503,21 +1035,114 @@ mod tests {
 
         // 第一次请求：获取 HalfOpen 探测名额
         let first = router.allow_provider_request("a", "claude").await;
-        assert!(first.allowed);
-        assert!(first.used_half_open_permit);
+        assert!(first.allowed());
+        assert!(first.used_half_open_permit());
 
         // 第二次请求应被拒绝（名额已被占用）
         let second = router.allow_provider_request("a", "claude").await;
-        assert!(!second.allowed);
+        assert!(!second.allowed());
 
-        // 使用 release_permit_neutral 释放名额（不影响健康统计）
-        router
-            .release_permit_neutral("a", "claude", first.used_half_open_permit)
-            .await;
+        // Dropping the guard releases the slot without changing health statistics.
+        drop(first);
 
         // 第三次请求应被允许（名额已释放）
         let third = router.allow_provider_request("a", "claude").await;
-        assert!(third.allowed);
-        assert!(third.used_half_open_permit);
+        assert!(third.allowed());
+        assert!(third.used_half_open_permit());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn consuming_provider_request_permit_transfers_release_ownership_once() {
+        let (_home, router) = setup_half_open_router().await;
+
+        let first = router.allow_provider_request("a", "claude").await;
+        assert!(first.allowed());
+        assert!(first.used_half_open_permit());
+
+        let used_half_open_permit = first.into_used_half_open_permit();
+        assert!(used_half_open_permit);
+
+        // Consuming the guard transfers release responsibility to record_result.
+        let blocked_before_record = router.allow_provider_request("a", "claude").await;
+        assert!(!blocked_before_record.allowed());
+
+        router
+            .record_result("a", "claude", used_half_open_permit, true, None)
+            .await
+            .unwrap();
+
+        let second = router.allow_provider_request("a", "claude").await;
+        assert!(second.allowed());
+        assert!(second.used_half_open_permit());
+
+        // No stale first guard remains that can release the second probe's slot.
+        let third = router.allow_provider_request("a", "claude").await;
+        assert!(!third.allowed());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn detached_half_open_finalizer_completes_after_parent_abort() {
+        let (_home, router) = setup_half_open_router().await;
+        let permit = router.allow_provider_request("a", "claude").await;
+        assert!(permit.allowed());
+        assert!(permit.used_half_open_permit());
+
+        let finalizer_started = Arc::new(tokio::sync::Notify::new());
+        let allow_finalizer = Arc::new(tokio::sync::Notify::new());
+        let finalizer_finished = Arc::new(tokio::sync::Notify::new());
+
+        let parent = tokio::spawn({
+            let router = router.clone();
+            let finalizer_started = finalizer_started.clone();
+            let allow_finalizer = allow_finalizer.clone();
+            let finalizer_finished = finalizer_finished.clone();
+
+            async move {
+                let finalizer = tokio::spawn(async move {
+                    finalizer_started.notify_one();
+                    allow_finalizer.notified().await;
+
+                    let used_half_open_permit = permit.into_used_half_open_permit();
+                    router
+                        .record_result("a", "claude", used_half_open_permit, true, None)
+                        .await
+                        .unwrap();
+                    finalizer_finished.notify_one();
+                });
+
+                finalizer.await.unwrap();
+            }
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            finalizer_started.notified(),
+        )
+        .await
+        .expect("finalizer should start");
+
+        parent.abort();
+        let _ = parent.await;
+
+        let blocked_while_finalizer_owns_permit =
+            router.allow_provider_request("a", "claude").await;
+        assert!(!blocked_while_finalizer_owns_permit.allowed());
+
+        allow_finalizer.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            finalizer_finished.notified(),
+        )
+        .await
+        .expect("detached finalizer should finish after parent abort");
+
+        let next = router.allow_provider_request("a", "claude").await;
+        assert!(next.allowed());
+        assert!(next.used_half_open_permit());
+
+        let blocked_by_next = router.allow_provider_request("a", "claude").await;
+        assert!(!blocked_by_next.allowed());
     }
 }

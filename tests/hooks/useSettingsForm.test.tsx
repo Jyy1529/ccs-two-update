@@ -51,11 +51,28 @@ describe("useSettingsForm Hook", () => {
     expect(settings.showInTray).toBe(true);
     expect(settings.minimizeToTrayOnClose).toBe(true);
     expect(settings.enableClaudePluginIntegration).toBe(false);
+    expect(settings.providerRetryEnabled).toBe(true);
     expect(settings.claudeConfigDir).toBe("/Users/demo");
     expect(settings.codexConfigDir).toBeUndefined();
     expect(settings.language).toBe("en");
     expect(result.current.initialLanguage).toBe("en");
     expect(changeLanguageSpy).toHaveBeenCalledWith("en");
+  });
+
+  it("should preserve an explicitly disabled provider retry setting", async () => {
+    useSettingsQueryMock.mockReturnValue({
+      data: {
+        providerRetryEnabled: false,
+        language: "zh",
+      },
+      isLoading: false,
+    });
+
+    const { result } = renderHook(() => useSettingsForm());
+
+    await waitFor(() => {
+      expect(result.current.settings?.providerRetryEnabled).toBe(false);
+    });
   });
 
   it("should support japanese language preference from server data", async () => {

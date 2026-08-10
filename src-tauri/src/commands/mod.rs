@@ -3,6 +3,7 @@
 mod auth;
 mod balance;
 mod codex_oauth;
+mod codex_repair;
 mod coding_plan;
 mod config;
 mod copilot;
@@ -39,6 +40,7 @@ mod workspace;
 pub use auth::*;
 pub use balance::*;
 pub use codex_oauth::*;
+pub use codex_repair::*;
 pub use coding_plan::*;
 pub use config::*;
 pub use copilot::*;
@@ -63,6 +65,7 @@ pub use settings::*;
 pub use skill::*;
 pub use stream_check::*;
 pub use subscription::*;
+pub use sync_support::*;
 pub use xai_oauth::*;
 
 pub use lightweight::*;

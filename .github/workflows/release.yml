@@ -466,7 +466,7 @@ jobs:
             Write-Warning 'No Windows MSI installer found'
           }
 
-          # 绿色版（portable）：仅可执行文件打 zip（不参与 Updater）
+          # 绿色版（portable）：可执行文件、portable 标记和第三方声明打 zip（不参与 Updater）
           $exeCandidates = if ($isArm64) {
             @('src-tauri/target/aarch64-pc-windows-msvc/release/cc-switch.exe')
           } else {
@@ -494,6 +494,7 @@ jobs:
               )
             }
             $portableContent | Set-Content -Path $portableIniPath -Encoding UTF8
+            Copy-Item 'THIRD_PARTY_NOTICES.md' (Join-Path $portableDir 'THIRD_PARTY_NOTICES.md')
             $portableZip = "release-assets/CC-Switch-$VERSION-Windows$assetSuffix-Portable.zip"
             Compress-Archive -Path "$portableDir/*" -DestinationPath $portableZip -Force
             Remove-Item -Recurse -Force $portableDir

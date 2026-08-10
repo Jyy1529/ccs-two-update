@@ -256,13 +256,7 @@ fn handle_deeplink_url(
 
             if focus_main_window {
                 if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.unminimize();
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                    #[cfg(target_os = "linux")]
-                    {
-                        linux_fix::nudge_main_window(window.clone());
-                    }
+                    show_main_window(&window);
                     log::info!("✓ Window shown and focused");
                 }
             }
@@ -320,6 +314,21 @@ fn macos_tray_icon() -> Option<Image<'static>> {
     }
 }
 
+pub(crate) fn show_main_window(window: &tauri::WebviewWindow) {
+    let _ = window.unminimize();
+    let _ = window.show();
+    #[cfg(target_os = "windows")]
+    if let Err(err) = window.set_skip_taskbar(false) {
+        log::warn!("恢复主窗口任务栏入口失败: {err}");
+    }
+    let _ = window.set_focus();
+
+    #[cfg(target_os = "linux")]
+    linux_fix::nudge_main_window(window.clone());
+    #[cfg(target_os = "macos")]
+    tray::apply_tray_policy(window.app_handle(), true);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // 设置 panic hook，在应用崩溃时记录日志到 <app_config_dir>/crash.log（默认 ~/.cc-switch/crash.log）
@@ -357,13 +366,7 @@ pub fn run() {
 
             // Show and focus window regardless
             if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
-                #[cfg(target_os = "linux")]
-                {
-                    linux_fix::nudge_main_window(window.clone());
-                }
+                show_main_window(&window);
             }
         }));
     }
@@ -388,6 +391,7 @@ pub fn run() {
 
                 if settings.minimize_to_tray_on_close {
                     api.prevent_close();
+                    tray::ensure_tray_visible(window.app_handle());
                     let _ = window.hide();
                     #[cfg(target_os = "windows")]
                     {
@@ -545,8 +549,7 @@ pub fn run() {
                     });
                     // 主窗口默认 visible:false，恢复界面必须强制显示
                     if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.set_focus();
+                        show_main_window(&window);
                     }
                     return Ok(());
                 }
@@ -1077,7 +1080,8 @@ pub fn run() {
                 }
             }
 
-            let _tray = tray_builder.build(app)?;
+            let tray_icon = tray_builder.build(app)?;
+            tray_icon.set_visible(true)?;
             crate::services::webdav_auto_sync::start_worker(
                 app_state.db.clone(),
                 app.handle().clone(),
@@ -1200,6 +1204,14 @@ pub fn run() {
 
                 // 检查 settings 表中的代理状态，自动恢复代理服务
                 restore_proxy_state_on_startup(&state).await;
+                if let Err(error) =
+                    crate::services::codex_agent_roles::reconcile_current_codex_agent_roles(
+                        &state,
+                    )
+                    .await
+                {
+                    log::warn!("启动自愈 Codex Agent Role 失败: {error}");
+                }
 
                 // Periodic backup check (on startup)
                 if let Err(e) = state.db.periodic_backup_if_needed() {
@@ -1282,8 +1294,28 @@ pub fn run() {
                 }
             }
 
-            // 静默启动：根据设置决定是否显示主窗口
+            // 启动时校准开机自启注册项。设置文件可能仍为 true，但 Windows Run 项
+            // 会被升级、清理工具或用户手动操作删除；此处用当前可执行文件路径修复。
             let settings = crate::settings::get_settings();
+            #[cfg(target_os = "windows")]
+            if settings.codex_repair_detection_enabled {
+                tauri::async_runtime::spawn_blocking(|| {
+                    let status = crate::services::codex_repair::detect();
+                    log::info!(
+                        "Codex Desktop repair detection: state={:?}, warnings={}",
+                        status.state,
+                        status.warnings.len()
+                    );
+                });
+            }
+            #[cfg(target_os = "windows")]
+            if settings.launch_on_startup {
+                if let Err(error) = crate::auto_launch::reconcile_auto_launch(true) {
+                    log::warn!("启动时修复开机自启失败: {error}");
+                }
+            }
+
+            // 静默启动：根据设置决定是否显示主窗口
             if let Some(window) = app.get_webview_window("main") {
                 // 在窗口首次显示前同步装饰状态，避免前端加载后再切换导致标题栏闪烁
                 // 仅 Linux 生效：解决 Wayland 下系统窗口按钮不可用的问题
@@ -1291,6 +1323,7 @@ pub fn run() {
                 let _ = window.set_decorations(!settings.use_app_window_controls);
                 if settings.silent_startup {
                     // 静默启动模式：保持窗口隐藏
+                    tray::ensure_tray_visible(app.handle());
                     let _ = window.hide();
                     #[cfg(target_os = "windows")]
                     let _ = window.set_skip_taskbar(true);
@@ -1299,16 +1332,8 @@ pub fn run() {
                     log::info!("静默启动模式：主窗口已隐藏");
                 } else {
                     // 正常启动模式：显示窗口
-                    let _ = window.show();
+                    show_main_window(&window);
                     log::info!("正常启动模式：主窗口已显示");
-
-                    // Linux: 解决首次启动 UI 无响应问题（Tauri #10746 + wry #637）。
-                    // 启动时 webview 未获取焦点 + surface 尺寸协商失败，导致点击无效。
-                    // 这里做 set_focus + 伪 resize，等价于无视觉版本的"最大化-还原"。
-                    #[cfg(target_os = "linux")]
-                    {
-                        linux_fix::nudge_main_window(window.clone());
-                    }
                 }
             }
 
@@ -1318,6 +1343,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_providers,
             commands::get_current_provider,
+            commands::get_provider_transfer_preview,
+            commands::transfer_provider_to_apps,
             commands::add_provider,
             commands::update_provider,
             commands::delete_provider,
@@ -1351,6 +1378,8 @@ pub fn run() {
             commands::read_live_provider_settings,
             commands::get_settings,
             commands::save_settings,
+            commands::get_codex_repair_status,
+            commands::launch_codex_repair,
             commands::has_codex_unify_history_backup,
             commands::restore_codex_unified_history,
             commands::get_rectifier_config,
@@ -1448,6 +1477,7 @@ pub fn run() {
             commands::create_db_backup,
             commands::list_db_backups,
             commands::restore_db_backup,
+            commands::retry_post_import_sync,
             commands::rename_db_backup,
             commands::delete_db_backup,
             commands::sync_current_providers_live,
@@ -1696,7 +1726,12 @@ pub fn run() {
             let app_handle = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 save_window_state_before_exit(&app_handle);
-                cleanup_before_exit(&app_handle).await;
+                if let Err(error) = cleanup_before_exit(&app_handle).await {
+                    log::error!(
+                        "退出时禁用 CC Switch Codex Agent Role 失败，退出已取消: {error}"
+                    );
+                    return;
+                }
                 // 先于 std::process::exit 显式移除托盘图标。
                 // 进程直接退出时 Tauri 运行时不走正常 Drop 流程，
                 // 不会向 Windows Shell 发送 NIM_DELETE，导致已退出的进程
@@ -1719,14 +1754,7 @@ pub fn run() {
                 // macOS 在 Dock 图标被点击并重新激活应用时会触发 Reopen 事件，这里手动恢复主窗口
                 RunEvent::Reopen { .. } => {
                     if let Some(window) = app_handle.get_webview_window("main") {
-                        #[cfg(target_os = "windows")]
-                        {
-                            let _ = window.set_skip_taskbar(false);
-                        }
-                        let _ = window.unminimize();
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                        tray::apply_tray_policy(app_handle, true);
+                        show_main_window(&window);
                     } else if crate::lightweight::is_lightweight_mode() {
                         if let Err(e) = crate::lightweight::exit_lightweight_mode(app_handle) {
                             log::error!("退出轻量模式重建窗口失败: {e}");
@@ -1788,9 +1816,7 @@ pub fn run() {
 
                             // 确保主窗口可见
                             if let Some(window) = app_handle.get_webview_window("main") {
-                                let _ = window.unminimize();
-                                let _ = window.show();
-                                let _ = window.set_focus();
+                                show_main_window(&window);
                             }
                         }
                     }
@@ -1815,40 +1841,80 @@ pub fn run() {
 /// 在应用退出前检查代理服务器状态，如果正在运行则停止代理并恢复 Live 配置。
 /// 确保 Claude Code/Codex/Gemini 的配置不会处于损坏状态。
 /// 使用 stop_with_restore_keep_state 保留 settings 表中的代理状态，下次启动时自动恢复。
-pub async fn cleanup_before_exit(app_handle: &tauri::AppHandle) {
+pub async fn cleanup_before_exit(
+    app_handle: &tauri::AppHandle,
+) -> Result<(), crate::error::AppError> {
     if let Some(state) = app_handle.try_state::<store::AppState>() {
-        let proxy_service = &state.proxy_service;
+        cleanup_app_state_before_exit(state.inner()).await
+    } else {
+        cleanup_without_app_state_before_exit().await
+    }
+}
 
-        // 退出时也需要兜底：代理可能已崩溃/未运行，但 Live 接管残留仍在（占位符/备份）。
-        let has_backups = match state.db.has_any_live_backup().await {
-            Ok(v) => v,
-            Err(e) => {
-                log::error!("退出时检查 Live 备份失败: {e}");
-                false
-            }
-        };
-        let live_taken_over = proxy_service.detect_takeover_in_live_configs();
-        let needs_restore = has_backups || live_taken_over;
+async fn cleanup_without_app_state_before_exit() -> Result<(), crate::error::AppError> {
+    crate::services::codex_agent_roles::disable_codex_agent_roles()
+        .await
+        .map(|_| ())
+}
 
-        if needs_restore {
-            log::info!("检测到接管残留，开始恢复 Live 配置（保留代理状态）...");
-            // 使用 keep_state 版本，保留 settings 表中的代理状态
-            if let Err(e) = proxy_service.stop_with_restore_keep_state().await {
-                log::error!("退出时恢复 Live 配置失败: {e}");
-            } else {
-                log::info!("已恢复 Live 配置（代理状态已保留，下次启动将自动恢复）");
-            }
-            return;
+async fn cleanup_app_state_before_exit(
+    state: &store::AppState,
+) -> Result<(), crate::error::AppError> {
+    cleanup_app_state_before_exit_with(state, cleanup_without_app_state_before_exit, || {
+        cleanup_proxy_state_before_exit(state)
+    })
+    .await
+}
+
+async fn cleanup_app_state_before_exit_with<D, DisableFut, P, ProxyFut>(
+    state: &store::AppState,
+    disable_roles: D,
+    proxy_cleanup: P,
+) -> Result<(), crate::error::AppError>
+where
+    D: FnOnce() -> DisableFut,
+    DisableFut: std::future::Future<Output = Result<(), crate::error::AppError>>,
+    P: FnOnce() -> ProxyFut,
+    ProxyFut: std::future::Future<Output = ()>,
+{
+    let _lifecycle = state.lock_codex_provider_lifecycle().await;
+    disable_roles().await?;
+    proxy_cleanup().await;
+    Ok(())
+}
+
+async fn cleanup_proxy_state_before_exit(state: &store::AppState) {
+    let proxy_service = &state.proxy_service;
+
+    // 退出时也需要兜底：代理可能已崩溃/未运行，但 Live 接管残留仍在（占位符/备份）。
+    let has_backups = match state.db.has_any_live_backup().await {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("退出时检查 Live 备份失败: {e}");
+            false
         }
+    };
+    let live_taken_over = proxy_service.detect_takeover_in_live_configs();
+    let needs_restore = has_backups || live_taken_over;
 
-        // 非接管模式：代理在运行则仅停止代理
-        if proxy_service.is_running().await {
-            log::info!("检测到代理服务器正在运行，开始停止...");
-            if let Err(e) = proxy_service.stop().await {
-                log::error!("退出时停止代理失败: {e}");
-            }
-            log::info!("代理服务器清理完成");
+    if needs_restore {
+        log::info!("检测到接管残留，开始恢复 Live 配置（保留代理状态）...");
+        // 使用 keep_state 版本，保留 settings 表中的代理状态
+        if let Err(e) = proxy_service.stop_with_restore_keep_state().await {
+            log::error!("退出时恢复 Live 配置失败: {e}");
+        } else {
+            log::info!("已恢复 Live 配置（代理状态已保留，下次启动将自动恢复）");
         }
+        return;
+    }
+
+    // 非接管模式：代理在运行则仅停止代理
+    if proxy_service.is_running().await {
+        log::info!("检测到代理服务器正在运行，开始停止...");
+        if let Err(e) = proxy_service.stop().await {
+            log::error!("退出时停止代理失败: {e}");
+        }
+        log::info!("代理服务器清理完成");
     }
 }
 
@@ -2217,11 +2283,44 @@ pub fn restart_process(app_handle: &tauri::AppHandle) -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_exit_request, enabled_proxy_apps_on_startup, redact_url_for_log,
+        classify_exit_request, cleanup_app_state_before_exit_with,
+        cleanup_without_app_state_before_exit, enabled_proxy_apps_on_startup, redact_url_for_log,
         redact_url_for_log_with_secrets, redact_url_origin_for_log, runtime_log_level_allows,
         ExitRequestAction,
     };
     use crate::database::Database;
+    use crate::services::codex_agent_roles::{
+        BACKEND_ROLE_DISABLED_FILE_NAME, BACKEND_ROLE_FILE_NAME, FRONTEND_ROLE_DISABLED_FILE_NAME,
+        FRONTEND_ROLE_FILE_NAME, MANAGED_MARKER,
+    };
+    use crate::store::AppState;
+    use serial_test::serial;
+    use std::ffi::OsString;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    struct TestHomeGuard {
+        previous: Option<OsString>,
+    }
+
+    impl TestHomeGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("CC_SWITCH_TEST_HOME");
+            std::env::set_var("CC_SWITCH_TEST_HOME", path);
+            crate::settings::reload_settings().expect("reload isolated settings");
+            Self { previous }
+        }
+    }
+
+    impl Drop for TestHomeGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
+                None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
+            }
+            let _ = crate::settings::reload_settings();
+        }
+    }
 
     #[test]
     fn log_url_redaction_strips_credentials_and_query_keeps_path() {
@@ -2310,6 +2409,32 @@ mod tests {
     }
 
     #[test]
+    fn single_instance_restore_readds_windows_taskbar_entry_after_show() {
+        let source = include_str!("lib.rs");
+        let helper = source
+            .split_once("pub(crate) fn show_main_window")
+            .expect("show helper exists")
+            .1
+            .split_once("#[cfg_attr(mobile, tauri::mobile_entry_point)]")
+            .expect("show helper has a bounded body")
+            .0;
+        let show_position = helper.find("window.show()").expect("window is shown");
+        let taskbar_position = helper
+            .find("window.set_skip_taskbar(false)")
+            .expect("Windows taskbar entry is restored");
+        assert!(show_position < taskbar_position);
+
+        let single_instance_restore = source
+            .split_once("// Show and focus window regardless")
+            .expect("single-instance restore block exists")
+            .1
+            .split_once("}));")
+            .expect("single-instance restore block is bounded")
+            .0;
+        assert!(single_instance_restore.contains("show_main_window(&window)"));
+    }
+
+    #[test]
     fn restart_exit_code_defers_to_tauri_default_restart() {
         assert_eq!(
             classify_exit_request(Some(tauri::RESTART_EXIT_CODE)),
@@ -2344,5 +2469,122 @@ mod tests {
         let apps = enabled_proxy_apps_on_startup(&db).await;
 
         assert_eq!(apps, vec!["grokbuild"]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn user_exit_disables_managed_codex_agent_roles_before_proxy_cleanup() {
+        let temp = TempDir::new().expect("create isolated home");
+        let _home = TestHomeGuard::set(temp.path());
+        let agents_dir = temp.path().join(".codex").join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("create Codex agents directory");
+        std::fs::write(
+            agents_dir.join(FRONTEND_ROLE_FILE_NAME),
+            format!("{MANAGED_MARKER}\nname = \"managed-frontend\"\n"),
+        )
+        .expect("write managed frontend role");
+        std::fs::write(
+            agents_dir.join(BACKEND_ROLE_FILE_NAME),
+            format!("{MANAGED_MARKER}\nname = \"managed-backend\"\n"),
+        )
+        .expect("write managed backend role");
+        let user_frontend_disabled = "name = \"user-disabled-frontend\"\n";
+        let user_backend_disabled = "name = \"user-disabled-backend\"\n";
+        std::fs::write(
+            agents_dir.join(FRONTEND_ROLE_DISABLED_FILE_NAME),
+            user_frontend_disabled,
+        )
+        .expect("write user frontend disabled file");
+        std::fs::write(
+            agents_dir.join(BACKEND_ROLE_DISABLED_FILE_NAME),
+            user_backend_disabled,
+        )
+        .expect("write user backend disabled file");
+
+        let state = AppState::new(Arc::new(Database::memory().expect("initialize database")));
+        let proxy_cleanup_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let proxy_cleanup_observed_in_callback = Arc::clone(&proxy_cleanup_observed);
+        cleanup_app_state_before_exit_with(
+            &state,
+            || async {
+                crate::services::codex_agent_roles::disable_codex_agent_roles()
+                    .await
+                    .map(|_| ())
+            },
+            || async {
+                assert!(!agents_dir.join(FRONTEND_ROLE_FILE_NAME).exists());
+                assert!(!agents_dir.join(BACKEND_ROLE_FILE_NAME).exists());
+                assert_eq!(
+                    std::fs::read_to_string(agents_dir.join(FRONTEND_ROLE_DISABLED_FILE_NAME))
+                        .expect("read user frontend disabled file"),
+                    user_frontend_disabled
+                );
+                assert_eq!(
+                    std::fs::read_to_string(agents_dir.join(BACKEND_ROLE_DISABLED_FILE_NAME))
+                        .expect("read user backend disabled file"),
+                    user_backend_disabled
+                );
+                proxy_cleanup_observed_in_callback.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("role disable and proxy cleanup succeed");
+
+        assert!(!agents_dir.join(FRONTEND_ROLE_FILE_NAME).exists());
+        assert!(!agents_dir.join(BACKEND_ROLE_FILE_NAME).exists());
+        assert!(agents_dir.join(FRONTEND_ROLE_DISABLED_FILE_NAME).exists());
+        assert!(agents_dir.join(BACKEND_ROLE_DISABLED_FILE_NAME).exists());
+        assert!(proxy_cleanup_observed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn role_disable_failure_blocks_proxy_cleanup() {
+        let state = AppState::new(Arc::new(Database::memory().expect("initialize database")));
+        let proxy_cleanup_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let proxy_cleanup_observed_in_callback = Arc::clone(&proxy_cleanup_observed);
+
+        let result = cleanup_app_state_before_exit_with(
+            &state,
+            || async {
+                Err(crate::error::AppError::Message(
+                    "injected role disable failure".to_string(),
+                ))
+            },
+            || async move {
+                proxy_cleanup_observed_in_callback.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!proxy_cleanup_observed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recovery_mode_without_app_state_still_disables_managed_roles() {
+        let temp = TempDir::new().expect("create isolated home");
+        let _home = TestHomeGuard::set(temp.path());
+        let agents_dir = temp.path().join(".codex").join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("create Codex agents directory");
+        std::fs::write(
+            agents_dir.join(FRONTEND_ROLE_FILE_NAME),
+            format!("{MANAGED_MARKER}\nname = \"managed-frontend\"\n"),
+        )
+        .expect("write managed frontend role");
+        std::fs::write(
+            agents_dir.join(BACKEND_ROLE_FILE_NAME),
+            format!("{MANAGED_MARKER}\nname = \"managed-backend\"\n"),
+        )
+        .expect("write managed backend role");
+
+        cleanup_without_app_state_before_exit()
+            .await
+            .expect("disable managed roles without AppState");
+
+        assert!(!agents_dir.join(FRONTEND_ROLE_FILE_NAME).exists());
+        assert!(!agents_dir.join(BACKEND_ROLE_FILE_NAME).exists());
+        assert!(agents_dir.join(FRONTEND_ROLE_DISABLED_FILE_NAME).exists());
+        assert!(agents_dir.join(BACKEND_ROLE_DISABLED_FILE_NAME).exists());
     }
 }
