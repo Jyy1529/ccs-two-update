@@ -776,8 +776,10 @@ mod tests {
             None,
         );
         let ephemeral_info = ephemeral.start().await.expect("start ephemeral proxy");
-        let mut persisted_actual = ProxyConfig::default();
-        persisted_actual.listen_port = ephemeral_info.port;
+        let persisted_actual = ProxyConfig {
+            listen_port: ephemeral_info.port,
+            ..Default::default()
+        };
         let mut another_explicit = persisted_actual.clone();
         another_explicit.listen_port = persisted_actual.listen_port.wrapping_add(1).max(1);
 

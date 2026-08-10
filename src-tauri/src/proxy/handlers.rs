@@ -18,7 +18,7 @@ use super::{
         claude_stream_usage_event_filter, codex_stream_usage_event_filter, CLAUDE_PARSER_CONFIG,
         CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
     },
-    handler_context::RequestContext,
+    handler_context::{RequestContext, RequestContextParams},
     providers::{
         codex_chat_common::extract_reasoning_field_text,
         codex_chat_history::record_responses_sse_stream,
@@ -760,16 +760,16 @@ pub async fn handle_chat_completions(
 
     let endpoint = endpoint_with_query(&uri, "/chat/completions");
     let peer_addr = extensions.get::<std::net::SocketAddr>().copied();
-    let mut ctx = RequestContext::new_with_peer_addr(
-        &state,
-        &body,
-        &headers,
-        AppType::Codex,
-        "Codex",
-        "codex",
-        &endpoint,
+    let mut ctx = RequestContext::new_with_peer_addr(RequestContextParams {
+        state: &state,
+        body: &body,
+        headers: &headers,
+        app_type: AppType::Codex,
+        tag: "Codex",
+        app_type_str: "codex",
+        endpoint: &endpoint,
         peer_addr,
-    )
+    })
     .await?;
 
     let is_stream = body
@@ -857,16 +857,16 @@ async fn handle_responses_for_app(
 
     let endpoint = endpoint_with_query(&uri, "/responses");
     let peer_addr = extensions.get::<std::net::SocketAddr>().copied();
-    let mut ctx = RequestContext::new_with_peer_addr(
-        &state,
-        &body,
-        &headers,
-        app_type.clone(),
+    let mut ctx = RequestContext::new_with_peer_addr(RequestContextParams {
+        state: &state,
+        body: &body,
+        headers: &headers,
+        app_type: app_type.clone(),
         tag,
         app_type_str,
-        &endpoint,
+        endpoint: &endpoint,
         peer_addr,
-    )
+    })
     .await?;
 
     let is_stream = body
@@ -1001,16 +1001,16 @@ async fn handle_responses_compact_for_app(
 
     let endpoint = endpoint_with_query(&uri, "/responses/compact");
     let peer_addr = extensions.get::<std::net::SocketAddr>().copied();
-    let mut ctx = RequestContext::new_with_peer_addr(
-        &state,
-        &body,
-        &headers,
-        app_type.clone(),
+    let mut ctx = RequestContext::new_with_peer_addr(RequestContextParams {
+        state: &state,
+        body: &body,
+        headers: &headers,
+        app_type: app_type.clone(),
         tag,
         app_type_str,
-        &endpoint,
+        endpoint: &endpoint,
         peer_addr,
-    )
+    })
     .await?;
 
     let is_stream = body

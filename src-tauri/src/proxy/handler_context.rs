@@ -186,6 +186,18 @@ pub struct RequestContext {
     provider_retry_active: bool,
 }
 
+/// Parameters required to build a request context.
+pub struct RequestContextParams<'a> {
+    pub state: &'a ProxyState,
+    pub body: &'a serde_json::Value,
+    pub headers: &'a HeaderMap,
+    pub app_type: AppType,
+    pub tag: &'static str,
+    pub app_type_str: &'static str,
+    pub endpoint: &'a str,
+    pub peer_addr: Option<SocketAddr>,
+}
+
 impl RequestContext {
     /// 创建请求上下文
     ///
@@ -207,19 +219,30 @@ impl RequestContext {
         tag: &'static str,
         app_type_str: &'static str,
     ) -> Result<Self, ProxyError> {
-        Self::new_with_peer_addr(state, body, headers, app_type, tag, app_type_str, "", None).await
+        Self::new_with_peer_addr(RequestContextParams {
+            state,
+            body,
+            headers,
+            app_type,
+            tag,
+            app_type_str,
+            endpoint: "",
+            peer_addr: None,
+        })
+        .await
     }
 
-    pub async fn new_with_peer_addr(
-        state: &ProxyState,
-        body: &serde_json::Value,
-        headers: &HeaderMap,
-        app_type: AppType,
-        tag: &'static str,
-        app_type_str: &'static str,
-        endpoint: &str,
-        peer_addr: Option<SocketAddr>,
-    ) -> Result<Self, ProxyError> {
+    pub async fn new_with_peer_addr(params: RequestContextParams<'_>) -> Result<Self, ProxyError> {
+        let RequestContextParams {
+            state,
+            body,
+            headers,
+            app_type,
+            tag,
+            app_type_str,
+            endpoint,
+            peer_addr,
+        } = params;
         let start_time = Instant::now();
         let role_route =
             codex_role_route_for_request(&app_type, endpoint, body, headers, peer_addr)?;
@@ -479,7 +502,7 @@ pub(crate) fn extract_gemini_model_from_path(endpoint: &str) -> Option<String> {
 mod tests {
     use super::{
         codex_role_route_for_request, extract_gemini_model_from_path,
-        parse_codex_role_route_headers, CodexRoleRoute, RequestContext,
+        parse_codex_role_route_headers, CodexRoleRoute, RequestContext, RequestContextParams,
     };
     use crate::{
         app_config::AppType,
@@ -805,16 +828,16 @@ mod tests {
 
         let state = build_proxy_state(db);
         let body = json!({ "model": "capability-model", "input": "continue" });
-        let context = RequestContext::new_with_peer_addr(
-            &state,
-            &body,
-            &headers,
-            AppType::Codex,
-            "Codex",
-            "codex",
-            "/v1/responses",
-            Some("127.0.0.1:15721".parse().expect("loopback peer")),
-        )
+        let context = RequestContext::new_with_peer_addr(RequestContextParams {
+            state: &state,
+            body: &body,
+            headers: &headers,
+            app_type: AppType::Codex,
+            tag: "Codex",
+            app_type_str: "codex",
+            endpoint: "/v1/responses",
+            peer_addr: Some("127.0.0.1:15721".parse().expect("loopback peer")),
+        })
         .await
         .expect("create role request context");
 

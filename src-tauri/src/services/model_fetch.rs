@@ -244,7 +244,7 @@ pub async fn fetch_models(
                 .map(|m| FetchedModel {
                     context_window: m
                         .context_window()
-                        .or_else(|| embedded_context_window(&url, &m.id)),
+                        .or_else(|| embedded_context_window(url, &m.id)),
                     id: m.id,
                     owned_by: m.owned_by,
                 })

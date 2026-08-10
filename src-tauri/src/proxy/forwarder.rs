@@ -4009,6 +4009,7 @@ fn responses_json_document_parse_count() -> usize {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn set_responses_sse_inspect_delay(delay: std::time::Duration) {
     RESPONSES_SSE_INSPECT_DELAY.with(|configured| configured.set(delay));
 }
@@ -5525,6 +5526,7 @@ mod tests {
         (format!("http://{address}"), attempts, server)
     }
 
+    #[allow(dead_code)]
     async fn spawn_header_recording_responses_server() -> (
         String,
         tokio::sync::mpsc::UnboundedReceiver<HeaderMap>,
@@ -5607,6 +5609,7 @@ mod tests {
         (format!("http://{address}"), captured, server)
     }
 
+    #[allow(dead_code)]
     async fn spawn_sequence_responses_server(
         responses: Vec<(StatusCode, Value)>,
     ) -> (
@@ -5617,6 +5620,7 @@ mod tests {
         spawn_sequence_json_server("/v1/responses", responses).await
     }
 
+    #[allow(dead_code)]
     async fn spawn_sequence_json_server(
         path: &'static str,
         responses: Vec<(StatusCode, Value)>,
@@ -5708,12 +5712,14 @@ mod tests {
         (format!("http://{address}"), attempts, server)
     }
 
+    #[allow(dead_code)]
     #[derive(Clone)]
     enum MixedTestResponse {
         Json(StatusCode, Value),
         Sse(String),
     }
 
+    #[allow(dead_code)]
     async fn spawn_mixed_recording_server(
         path: &'static str,
         responses: Vec<MixedTestResponse>,

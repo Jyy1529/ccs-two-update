@@ -415,6 +415,7 @@ pub(crate) fn decompress_body_with_limit(
 
 /// 无输出上限的 [`decompress_body_with_limit`] 版本，供请求侧等已有自身
 /// 体积约束的调用方使用。
+#[allow(dead_code)]
 pub(crate) fn decompress_body(
     content_encoding: &str,
     body: &[u8],
@@ -489,6 +490,8 @@ pub(crate) fn get_content_encoding(headers: &HeaderMap) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type Encoder = fn(&[u8]) -> Vec<u8>;
     use axum::http::HeaderValue;
 
     fn gzip_member(payload: &[u8]) -> Vec<u8> {
@@ -601,8 +604,7 @@ mod tests {
     #[test]
     fn decompress_body_limited_deflate_distinguishes_exact_limit_from_expansion() {
         const LIMIT: usize = 8 * 1024;
-        let encoders: [(&str, fn(&[u8]) -> Vec<u8>); 2] =
-            [("zlib", zlib_stream), ("raw", raw_deflate_stream)];
+        let encoders: [(&str, Encoder); 2] = [("zlib", zlib_stream), ("raw", raw_deflate_stream)];
 
         for (format, encode) in encoders {
             for payload_len in [LIMIT, LIMIT + 1] {

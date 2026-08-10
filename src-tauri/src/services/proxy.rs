@@ -436,6 +436,7 @@ impl ProxyService {
         );
     }
 
+    #[cfg(test)]
     fn apply_claude_takeover_fields_with_policy(
         config: &mut Value,
         proxy_url: &str,
@@ -1344,6 +1345,7 @@ impl ProxyService {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn set_takeover_for_app_inner_preserving_health(
         &self,
         app_type: &str,
@@ -2576,6 +2578,7 @@ impl ProxyService {
         }
     }
 
+    #[cfg(test)]
     async fn restore_live_config_for_app_with_fallback(
         &self,
         app_type: &AppType,

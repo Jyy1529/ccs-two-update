@@ -358,6 +358,7 @@ fn disable_codex_agent_roles_unlocked() -> Result<CodexAgentRoleReconcileResult,
     disable_codex_agent_roles_at_paths(&paths)
 }
 
+#[allow(dead_code)]
 pub fn disable_codex_agent_roles_at(
     agents_dir: impl AsRef<Path>,
 ) -> Result<CodexAgentRoleReconcileResult, AppError> {
@@ -1160,10 +1161,7 @@ fn observe_transaction_path(
         return Ok(());
     }
 
-    if allowed_post_images
-        .iter()
-        .any(|expected| current.as_deref() == *expected)
-    {
+    if allowed_post_images.contains(&current.as_deref()) {
         snapshot.post_image = match current {
             Some(content) => TransactionPostImage::Content(content),
             None => TransactionPostImage::Missing,
