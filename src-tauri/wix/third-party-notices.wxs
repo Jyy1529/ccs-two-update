@@ -1,0 +1,22 @@
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+    <Fragment>
+        <DirectoryRef Id="INSTALLDIR">
+            <Component
+                Id="ThirdPartyNoticesComponent"
+                Guid="450d9dd5-f4aa-5170-9641-c78f5441d7ce">
+                <File
+                    Id="ThirdPartyNoticesFile"
+                    Source="$(sys.SOURCEFILEDIR)..\..\THIRD_PARTY_NOTICES.md"
+                    Name="THIRD_PARTY_NOTICES.md"
+                    KeyPath="no" />
+                <RegistryValue
+                    Root="HKCU"
+                    Key="Software\ccswitch\CC Switch"
+                    Name="Third Party Notices"
+                    Type="integer"
+                    Value="1"
+                    KeyPath="yes" />
+            </Component>
+        </DirectoryRef>
+    </Fragment>
+</Wix>
