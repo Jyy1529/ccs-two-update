@@ -1,5 +1,5 @@
 use crate::deeplink::{
-    import_mcp_from_deeplink, import_prompt_from_deeplink, import_provider_from_deeplink,
+    import_mcp_from_deeplink, import_prompt_from_deeplink, import_provider_from_deeplink_async,
     import_skill_from_deeplink, parse_deeplink_url, DeepLinkImportRequest,
 };
 use crate::store::AppState;
@@ -24,8 +24,8 @@ pub fn merge_deeplink_config(
 
 /// Import a provider from a deep link request (legacy, kept for compatibility)
 #[tauri::command]
-pub fn import_from_deeplink(
-    state: State<AppState>,
+pub async fn import_from_deeplink(
+    state: State<'_, AppState>,
     request: DeepLinkImportRequest,
 ) -> Result<String, String> {
     log::info!(
@@ -34,7 +34,9 @@ pub fn import_from_deeplink(
         request.app
     );
 
-    let provider_id = import_provider_from_deeplink(&state, request).map_err(|e| e.to_string())?;
+    let provider_id = import_provider_from_deeplink_async(state.inner().owned_clone(), request)
+        .await
+        .map_err(|e| e.to_string())?;
 
     log::info!("Successfully imported provider with ID: {provider_id}");
 
@@ -52,7 +54,9 @@ pub async fn import_from_deeplink_unified(
     match request.resource.as_str() {
         "provider" => {
             let provider_id =
-                import_provider_from_deeplink(&state, request).map_err(|e| e.to_string())?;
+                import_provider_from_deeplink_async(state.inner().owned_clone(), request)
+                    .await
+                    .map_err(|e| e.to_string())?;
             Ok(serde_json::json!({
                 "type": "provider",
                 "id": provider_id

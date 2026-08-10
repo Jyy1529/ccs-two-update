@@ -38,6 +38,7 @@ import { cn } from "@/lib/utils";
 import type {
   ClaudeApiKeyField,
   CodexApiFormat,
+  CodexAutoReviewMode,
   CodexCatalogModel,
   CodexChatReasoning,
   PromptCacheRoutingMode,
@@ -94,6 +95,10 @@ interface CodexFormFieldsProps {
   onCodexChatReasoningChange?: (value: CodexChatReasoning) => void;
   promptCacheRouting: PromptCacheRoutingMode;
   onPromptCacheRoutingChange: (value: PromptCacheRoutingMode) => void;
+  codexAutoReviewMode?: CodexAutoReviewMode;
+  onCodexAutoReviewModeChange?: (value: CodexAutoReviewMode) => void;
+  codexAutoReviewFallbackModel?: string;
+  onCodexAutoReviewFallbackModelChange?: (value: string) => void;
 
   // Model Catalog
   catalogModels?: CodexCatalogModel[];
@@ -130,6 +135,25 @@ function createCatalogRow(seed?: Partial<CodexCatalogModel>): CodexCatalogRow {
       : {}),
   };
 }
+
+export function buildFetchedCatalogSelection(
+  row: CodexCatalogModel,
+  model: FetchedModel,
+): Partial<CodexCatalogModel> {
+  return {
+    model: model.id,
+    displayName: row.displayName?.trim() ? row.displayName : model.id,
+    contextWindow: model.contextWindow ?? "",
+  };
+}
+
+const autoReviewModeSelectedClassName: Record<CodexAutoReviewMode, string> = {
+  native:
+    "bg-emerald-100 text-emerald-800 ring-1 ring-emerald-300 hover:bg-emerald-100 dark:bg-emerald-900/45 dark:text-emerald-200 dark:ring-emerald-700 dark:hover:bg-emerald-900/45",
+  auto: "bg-blue-100 text-blue-800 ring-1 ring-blue-300 hover:bg-blue-100 dark:bg-blue-900/45 dark:text-blue-200 dark:ring-blue-700 dark:hover:bg-blue-900/45",
+  fallback:
+    "bg-amber-100 text-amber-900 ring-1 ring-amber-300 hover:bg-amber-100 dark:bg-amber-900/45 dark:text-amber-200 dark:ring-amber-700 dark:hover:bg-amber-900/45",
+};
 
 // Compares rows (with rowId) to incoming models (without) by data fields only,
 // so both sync effects can use the same equality definition. Hidden native-profile
@@ -190,6 +214,10 @@ export function CodexFormFields({
   onCodexChatReasoningChange,
   promptCacheRouting,
   onPromptCacheRoutingChange,
+  codexAutoReviewMode = "native",
+  onCodexAutoReviewModeChange = () => {},
+  codexAutoReviewFallbackModel = "",
+  onCodexAutoReviewFallbackModelChange = () => {},
   catalogModels = [],
   onCatalogModelsChange,
   speedTestEndpoints,
@@ -212,6 +240,7 @@ export function CodexFormFields({
   useEffect(() => {
     fetchModelsSeqRef.current += 1;
     setFetchedModels((prev) => (prev.length === 0 ? prev : []));
+    setIsFetchingModels(false);
   }, [codexBaseUrl, isFullUrl, codexApiKey, customUserAgent]);
   // 思考能力随 Chat 格式显示（仅 Chat Completions 转换路径用得上）；模型映射常驻
   //（填了才生成 catalog）。两者都已与「路由接管」概念解耦。
@@ -238,6 +267,8 @@ export function CodexFormFields({
     supportsThinking ||
     supportsEffort ||
     promptCacheRouting !== "auto" ||
+    codexAutoReviewMode !== "native" ||
+    !!codexAutoReviewFallbackModel ||
     !!maxOutputTokens;
   const [advancedExpanded, setAdvancedExpanded] = useState(hasAnyAdvancedValue);
 
@@ -339,7 +370,11 @@ export function CodexFormFields({
         console.warn("[ModelFetch] Failed:", err);
         showFetchModelsError(err, t);
       })
-      .finally(() => setIsFetchingModels(false));
+      .finally(() => {
+        if (seq === fetchModelsSeqRef.current) {
+          setIsFetchingModels(false);
+        }
+      });
   }, [codexBaseUrl, codexApiKey, isFullUrl, customUserAgent, t]);
 
   const handleAddCatalogRow = useCallback(() => {
@@ -373,6 +408,10 @@ export function CodexFormFields({
         ownedBy: t("codexConfig.modelMappingTitle", {
           defaultValue: "模型映射",
         }),
+        contextWindow:
+          typeof row.contextWindow === "number"
+            ? row.contextWindow
+            : Number.parseInt(String(row.contextWindow), 10) || null,
       });
     }
     for (const model of fetchedModels) {
@@ -929,14 +968,17 @@ export function CodexFormFields({
                           {fetchedModels.length > 0 && (
                             <ModelDropdown
                               models={fetchedModels}
-                              onSelect={(id) =>
-                                handleUpdateCatalogRow(index, {
-                                  model: id,
-                                  displayName: row.displayName?.trim()
-                                    ? row.displayName
-                                    : id,
-                                })
-                              }
+                              onSelect={(id) => {
+                                const model = fetchedModels.find(
+                                  (candidate) => candidate.id === id,
+                                );
+                                if (model) {
+                                  handleUpdateCatalogRow(
+                                    index,
+                                    buildFetchedCatalogSelection(row, model),
+                                  );
+                                }
+                              }}
                             />
                           )}
                         </div>
@@ -989,6 +1031,106 @@ export function CodexFormFields({
                   "border-t border-border-default pt-3",
               )}
             >
+              {appId === "codex" && (
+                <div className="space-y-3 border-b border-border-default pb-3">
+                  <div className="space-y-1.5">
+                    <FormLabel>
+                      {t("codexConfig.autoReviewModeLabel", {
+                        defaultValue: "Approval reviewer routing",
+                      })}
+                    </FormLabel>
+                    <div
+                      className="grid grid-cols-3 gap-1 rounded-md bg-muted p-1"
+                      role="radiogroup"
+                      aria-label={t("codexConfig.autoReviewModeLabel", {
+                        defaultValue: "Approval reviewer routing",
+                      })}
+                    >
+                      {(["native", "auto", "fallback"] as const).map((mode) => (
+                        <Button
+                          key={mode}
+                          type="button"
+                          size="sm"
+                          variant="ghost"
+                          className={cn(
+                            "font-semibold",
+                            codexAutoReviewMode === mode
+                              ? autoReviewModeSelectedClassName[mode]
+                              : "text-muted-foreground",
+                          )}
+                          role="radio"
+                          aria-checked={codexAutoReviewMode === mode}
+                          data-state={
+                            codexAutoReviewMode === mode
+                              ? "selected"
+                              : "unselected"
+                          }
+                          onClick={() => onCodexAutoReviewModeChange(mode)}
+                        >
+                          {t(
+                            `codexConfig.autoReviewMode${
+                              mode === "native"
+                                ? "Native"
+                                : mode === "auto"
+                                  ? "Auto"
+                                  : "Fallback"
+                            }`,
+                            {
+                              defaultValue:
+                                mode === "native"
+                                  ? "Native"
+                                  : mode === "auto"
+                                    ? "Auto"
+                                    : "Fallback",
+                            },
+                          )}
+                        </Button>
+                      ))}
+                    </div>
+                    <p className="text-xs leading-relaxed text-muted-foreground">
+                      {t("codexConfig.autoReviewModeHint", {
+                        defaultValue:
+                          "Auto first tries codex-auto-review and switches to the fallback model when unavailable.",
+                      })}
+                    </p>
+                  </div>
+
+                  {codexAutoReviewMode !== "native" && (
+                    <div className="space-y-1.5">
+                      <FormLabel htmlFor="codexAutoReviewFallbackModel">
+                        {t("codexConfig.autoReviewFallbackModelLabel", {
+                          defaultValue: "Fallback reviewer model",
+                        })}
+                      </FormLabel>
+                      <div className="flex gap-1">
+                        <Input
+                          id="codexAutoReviewFallbackModel"
+                          value={codexAutoReviewFallbackModel}
+                          onChange={(event) =>
+                            onCodexAutoReviewFallbackModelChange(
+                              event.target.value,
+                            )
+                          }
+                          placeholder={codexModel || "gpt-5.6-sol"}
+                          className="flex-1"
+                        />
+                        {fetchedModels.length > 0 && (
+                          <ModelDropdown
+                            models={fetchedModels}
+                            onSelect={onCodexAutoReviewFallbackModelChange}
+                          />
+                        )}
+                      </div>
+                      <p className="text-xs leading-relaxed text-muted-foreground">
+                        {t("codexConfig.autoReviewFallbackModelHint", {
+                          defaultValue:
+                            "Leave empty to use this provider's default Codex model.",
+                        })}
+                      </p>
+                    </div>
+                  )}
+                </div>
+              )}
               <CustomUserAgentField
                 id="codex-custom-user-agent"
                 value={customUserAgent}

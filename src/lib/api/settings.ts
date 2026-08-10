@@ -7,6 +7,31 @@ import type {
 } from "@/types";
 import type { AppId } from "./types";
 
+export type CodexRepairState =
+  | "unsupported"
+  | "notInstalled"
+  | "healthy"
+  | "needsRepair"
+  | "unknown";
+
+export interface CodexRepairStatus {
+  state: CodexRepairState;
+  platformSupported: boolean;
+  codexInstalled: boolean;
+  runtimeInstalled: boolean;
+  repairRunning: boolean;
+  lastRepairError?: string | null;
+  packageVersion?: string | null;
+  warnings: string[];
+  checkedAt: string;
+  runtimeCommit: string;
+}
+
+export interface CodexRepairLaunchResult {
+  started: boolean;
+  runtimeInstalled: boolean;
+}
+
 export interface ConfigTransferResult {
   success: boolean;
   message: string;
@@ -231,6 +256,14 @@ export const settingsApi = {
 
   async getAutoLaunchStatus(): Promise<boolean> {
     return await invoke("get_auto_launch_status");
+  },
+
+  async getCodexRepairStatus(): Promise<CodexRepairStatus> {
+    return await invoke("get_codex_repair_status");
+  },
+
+  async launchCodexRepair(): Promise<CodexRepairLaunchResult> {
+    return await invoke("launch_codex_repair");
   },
 
   async getToolVersions(

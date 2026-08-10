@@ -29,7 +29,10 @@ import {
 import type { ProxyStatus } from "@/types/proxy";
 import { useTranslation } from "react-i18next";
 import { AnimatePresence, motion } from "framer-motion";
-import { extractErrorMessage } from "@/utils/errorUtils";
+import {
+  extractErrorMessage,
+  translateCodexAgentRoleProxyError,
+} from "@/utils/errorUtils";
 
 interface ProxyPanelProps {
   enableLocalProxy: boolean;
@@ -93,6 +96,11 @@ export function ProxyPanel({
       const detail =
         extractErrorMessage(error) ||
         t("common.unknown", { defaultValue: "未知错误" });
+      const roleRouteError = translateCodexAgentRoleProxyError(detail, t);
+      if (roleRouteError) {
+        toast.error(roleRouteError);
+        return;
+      }
       toast.error(
         t("proxy.takeover.failed", {
           detail,

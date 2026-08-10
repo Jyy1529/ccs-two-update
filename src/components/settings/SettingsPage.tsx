@@ -16,6 +16,7 @@ import {
   ScrollText,
   HardDriveDownload,
   FlaskConical,
+  ShieldCheck,
 } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -52,6 +53,7 @@ import { UsageDashboard } from "@/components/usage/UsageDashboard";
 import { LogConfigPanel } from "@/components/settings/LogConfigPanel";
 import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
 import { CodexAuthSettings } from "@/components/settings/CodexAuthSettings";
+import { CodexRepairSettings } from "@/components/settings/CodexRepairSettings";
 import { useInstalledSkills } from "@/hooks/useSkills";
 import { useSettings } from "@/hooks/useSettings";
 import { useImportExport } from "@/hooks/useImportExport";
@@ -451,6 +453,42 @@ export function SettingsPage({
                             s3Config={settings?.s3Sync}
                             settings={settings}
                             onAutoSave={handleAutoSave}
+                          />
+                        </AccordionContent>
+                      </AccordionItem>
+
+                      <AccordionItem
+                        value="codexRepair"
+                        className="rounded-xl glass-card overflow-hidden"
+                      >
+                        <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
+                          <div className="flex items-center gap-3">
+                            <ShieldCheck className="h-5 w-5 text-emerald-500" />
+                            <div className="text-left">
+                              <h3 className="text-base font-semibold">
+                                {t("settings.codexRepair.title", {
+                                  defaultValue: "Codex Desktop 修复",
+                                })}
+                              </h3>
+                              <p className="text-sm text-muted-foreground font-normal">
+                                {t("settings.codexRepair.description", {
+                                  defaultValue:
+                                    "检测更新后的功能状态并按需启动管理员修复",
+                                })}
+                              </p>
+                            </div>
+                          </div>
+                        </AccordionTrigger>
+                        <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
+                          <CodexRepairSettings
+                            enabled={
+                              settings.codexRepairDetectionEnabled ?? false
+                            }
+                            onEnabledChange={(codexRepairDetectionEnabled) =>
+                              void handleAutoSave({
+                                codexRepairDetectionEnabled,
+                              })
+                            }
                           />
                         </AccordionContent>
                       </AccordionItem>

@@ -2,6 +2,13 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Provider } from "@/types";
 
+const toastMocks = vi.hoisted(() => ({
+  success: vi.fn(),
+  info: vi.fn(),
+}));
+
+vi.mock("sonner", () => ({ toast: toastMocks }));
+
 const apiMocks = vi.hoisted(() => ({
   getCurrent: vi.fn(),
   getLiveProviderSettings: vi.fn(),
@@ -20,31 +27,15 @@ vi.mock("@/lib/api", () => ({
   },
 }));
 
-vi.mock("@/components/common/FullScreenPanel", () => ({
-  FullScreenPanel: ({
-    isOpen,
-    children,
-    footer,
-  }: {
-    isOpen: boolean;
-    children: React.ReactNode;
-    footer?: React.ReactNode;
-  }) =>
-    isOpen ? (
-      <div>
-        <div>{children}</div>
-        <div>{footer}</div>
-      </div>
-    ) : null,
-}));
-
 vi.mock("@/components/providers/forms/ProviderForm", () => ({
   ProviderForm: ({
     initialData,
     onSubmit,
     isProxyTakeover,
+    formId = "provider-form",
+    onRequestAddCodexProvider,
   }: {
-    initialData: {
+    initialData?: {
       name?: string;
       websiteUrl?: string;
       notes?: string;
@@ -61,32 +52,55 @@ vi.mock("@/components/providers/forms/ProviderForm", () => ({
       meta?: Record<string, unknown>;
       icon?: string;
       iconColor?: string;
-    }) => void;
+    }) => Promise<void> | void;
     isProxyTakeover?: boolean;
-  }) => (
-    <form
-      id="provider-form"
-      onSubmit={(event) => {
-        event.preventDefault();
-        onSubmit({
-          name: initialData.name ?? "",
-          websiteUrl: initialData.websiteUrl ?? "",
-          notes: initialData.notes,
-          settingsConfig: JSON.stringify(initialData.settingsConfig ?? {}),
-          meta: initialData.meta,
-          icon: initialData.icon,
-          iconColor: initialData.iconColor,
-        });
-      }}
-    >
-      <output data-testid="settings-config">
-        {JSON.stringify(initialData.settingsConfig ?? {})}
-      </output>
-      <output data-testid="is-proxy-takeover">
-        {isProxyTakeover ? "true" : "false"}
-      </output>
-    </form>
-  ),
+    formId?: string;
+    onRequestAddCodexProvider?: (
+      onCreated: (providerId: string) => void,
+    ) => void;
+  }) => {
+    const data = initialData ?? {};
+    return (
+      <div>
+        <form
+          id={formId}
+          onSubmit={(event) => {
+            event.preventDefault();
+            void Promise.resolve(
+              onSubmit({
+                name: data.name ?? "",
+                websiteUrl: data.websiteUrl ?? "",
+                notes: data.notes,
+                settingsConfig: JSON.stringify(data.settingsConfig ?? {}),
+                meta: data.meta,
+                icon: data.icon,
+                iconColor: data.iconColor,
+              }),
+            ).catch(() => undefined);
+          }}
+        >
+          <input
+            aria-label={`${formId}-draft`}
+            defaultValue={data.name ?? ""}
+          />
+          <output data-testid="settings-config">
+            {JSON.stringify(data.settingsConfig ?? {})}
+          </output>
+          <output data-testid="is-proxy-takeover">
+            {isProxyTakeover ? "true" : "false"}
+          </output>
+        </form>
+        {onRequestAddCodexProvider && (
+          <button
+            type="button"
+            onClick={() => onRequestAddCodexProvider(vi.fn())}
+          >
+            request role provider
+          </button>
+        )}
+      </div>
+    );
+  },
 }));
 
 import { EditProviderDialog } from "@/components/providers/EditProviderDialog";
@@ -96,6 +110,7 @@ describe("EditProviderDialog", () => {
     apiMocks.getCurrent.mockReset();
     apiMocks.getLiveProviderSettings.mockReset();
     apiMocks.getOpenClawLiveProvider.mockReset();
+    Object.values(toastMocks).forEach((mock) => mock.mockReset());
   });
 
   it("保留 Codex 数据库中的 modelCatalog，避免 live 配置缺字段时清空模型映射", async () => {
@@ -201,5 +216,196 @@ describe("EditProviderDialog", () => {
     expect(
       JSON.parse(screen.getByTestId("settings-config").textContent ?? "{}"),
     ).toEqual(provider.settingsConfig);
+  });
+
+  it("成功更新当前启用角色路由的 Codex Provider 后显示代理与重启提示", async () => {
+    const provider: Provider = {
+      id: "provider-a",
+      name: "Provider A",
+      settingsConfig: {},
+      meta: {
+        codexAgentRoleRouting: {
+          enabled: true,
+          frontend: {},
+          backend: {},
+        },
+      },
+    };
+    const handleSubmit = vi.fn().mockResolvedValue(undefined);
+    const handleOpenChange = vi.fn();
+    apiMocks.getCurrent.mockResolvedValue(provider.id);
+
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        onOpenChange={handleOpenChange}
+        onSubmit={handleSubmit}
+        appId="codex"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "common.save" }));
+
+    await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
+    expect(toastMocks.success).toHaveBeenCalledWith(
+      "providerAdvanced.agentRoleProxyAutoEnabled",
+    );
+    expect(toastMocks.info).toHaveBeenCalledWith(
+      "providerAdvanced.agentRoleRestartRequired",
+    );
+    expect(toastMocks.info).not.toHaveBeenCalledWith(
+      "providerAdvanced.agentRoleSavedSwitchRequired",
+    );
+    expect(handleOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("成功更新非当前角色路由 Provider 后提示切换再生效", async () => {
+    const provider: Provider = {
+      id: "provider-b",
+      name: "Provider B",
+      settingsConfig: {},
+      meta: {
+        codexAgentRoleRouting: {
+          enabled: true,
+          frontend: {},
+          backend: {},
+        },
+      },
+    };
+    const handleSubmit = vi.fn().mockResolvedValue(undefined);
+    apiMocks.getCurrent.mockResolvedValue("provider-a");
+
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+        appId="codex"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "common.save" }));
+
+    await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
+    expect(toastMocks.success).not.toHaveBeenCalledWith(
+      "providerAdvanced.agentRoleProxyAutoEnabled",
+    );
+    expect(toastMocks.info).toHaveBeenCalledWith(
+      "providerAdvanced.agentRoleSavedSwitchRequired",
+    );
+    expect(toastMocks.info).not.toHaveBeenCalledWith(
+      "providerAdvanced.agentRoleRestartRequired",
+    );
+  });
+
+  it("更新已关闭角色路由的 Codex Provider 后不显示角色路由提示", async () => {
+    const provider: Provider = {
+      id: "provider-a",
+      name: "Provider A",
+      settingsConfig: {},
+      meta: {
+        codexAgentRoleRouting: {
+          enabled: false,
+          frontend: {},
+          backend: {},
+        },
+      },
+    };
+    const handleSubmit = vi.fn().mockResolvedValue(undefined);
+    apiMocks.getCurrent.mockResolvedValue(undefined);
+
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+        appId="codex"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "common.save" }));
+
+    await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
+    expect(toastMocks.success).not.toHaveBeenCalled();
+    expect(toastMocks.info).not.toHaveBeenCalled();
+  });
+
+  it("更新启用角色路由的 Codex Provider 失败时保留表单且不提示", async () => {
+    const provider: Provider = {
+      id: "provider-a",
+      name: "Provider A",
+      settingsConfig: {},
+      meta: {
+        codexAgentRoleRouting: {
+          enabled: true,
+          frontend: {},
+          backend: {},
+        },
+      },
+    };
+    const handleSubmit = vi.fn().mockRejectedValue(new Error("save failed"));
+    const handleOpenChange = vi.fn();
+    apiMocks.getCurrent.mockResolvedValue(undefined);
+
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        onOpenChange={handleOpenChange}
+        onSubmit={handleSubmit}
+        appId="codex"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "common.save" }));
+
+    await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
+    expect(toastMocks.success).not.toHaveBeenCalled();
+    expect(toastMocks.info).not.toHaveBeenCalled();
+    expect(handleOpenChange).not.toHaveBeenCalled();
+    expect(document.getElementById("provider-form")).toBeInTheDocument();
+  });
+
+  it("嵌套新增 Provider 打开时 Escape 只关闭顶层并保留编辑输入", () => {
+    const provider: Provider = {
+      id: "provider-a",
+      name: "Provider A",
+      settingsConfig: {},
+    };
+    const handleOpenChange = vi.fn();
+
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        onOpenChange={handleOpenChange}
+        onSubmit={vi.fn()}
+        onAddProvider={vi.fn()}
+        appId="codex"
+        isProxyTakeover
+      />,
+    );
+
+    const ownerDraft = screen.getByLabelText("provider-form-draft");
+    fireEvent.change(ownerDraft, { target: { value: "Provider A draft" } });
+    fireEvent.click(
+      screen.getByRole("button", { name: "request role provider" }),
+    );
+
+    expect(
+      document.getElementById("agent-role-provider-form"),
+    ).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    expect(handleOpenChange).not.toHaveBeenCalled();
+    expect(document.getElementById("provider-form")).toBeInTheDocument();
+    expect(ownerDraft).toHaveValue("Provider A draft");
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(handleOpenChange).toHaveBeenCalledWith(false);
   });
 });

@@ -2,16 +2,18 @@
 
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
 
 use crate::commands::sync_support::{
-    post_sync_warning_from_result, run_post_import_sync, success_payload_with_warning,
+    post_sync_warning_from_result, run_post_import_sync_under_proxy_transaction,
+    success_payload_with_warning, sync_current_live_and_roles_under_proxy_transaction,
+    with_codex_provider_transaction,
 };
 use crate::database::backup::BackupEntry;
 use crate::database::Database;
 use crate::error::AppError;
-use crate::services::provider::ProviderService;
 use crate::store::AppState;
 
 // ─── File import/export ──────────────────────────────────────
@@ -43,36 +45,41 @@ pub async fn import_config_from_file(
     #[allow(non_snake_case)] filePath: String,
     state: State<'_, AppState>,
 ) -> Result<Value, String> {
-    let db = state.db.clone();
-    let db_for_sync = db.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let path_buf = PathBuf::from(&filePath);
-        let backup_id = db.import_sql(&path_buf)?;
-        let warning = post_sync_warning_from_result(Ok(run_post_import_sync(db_for_sync)));
+    let app_state = state.inner().owned_clone();
+    with_codex_provider_transaction(app_state, move |app_state| async move {
+        let state_for_import = Arc::clone(&app_state);
+        let backup_id = tauri::async_runtime::spawn_blocking(move || {
+            let path_buf = PathBuf::from(&filePath);
+            state_for_import.db.import_sql(&path_buf)
+        })
+        .await
+        .map_err(|error| format!("导入配置失败: {error}"))?
+        .map_err(|error| error.to_string())?;
+
+        let warning = post_sync_warning_from_result(Ok(
+            run_post_import_sync_under_proxy_transaction(app_state).await,
+        ));
         if let Some(msg) = warning.as_ref() {
             log::warn!("[Import] post-import sync warning: {msg}");
         }
-        Ok::<_, AppError>(success_payload_with_warning(backup_id, warning))
+        Ok(success_payload_with_warning(backup_id, warning))
     })
     .await
-    .map_err(|e| format!("导入配置失败: {e}"))?
-    .map_err(|e: AppError| e.to_string())
 }
 
 #[tauri::command]
 pub async fn sync_current_providers_live(state: State<'_, AppState>) -> Result<Value, String> {
-    let db = state.db.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let app_state = AppState::new(db);
-        ProviderService::sync_current_to_live(&app_state)?;
-        Ok::<_, AppError>(json!({
+    let app_state = state.inner().owned_clone();
+    with_codex_provider_transaction(app_state, move |app_state| async move {
+        sync_current_live_and_roles_under_proxy_transaction(app_state)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(json!({
             "success": true,
             "message": "Live configuration synchronized"
         }))
     })
     .await
-    .map_err(|e| format!("同步当前供应商失败: {e}"))?
-    .map_err(|e: AppError| e.to_string())
 }
 
 // ─── File dialogs ────────────────────────────────────────────
@@ -153,11 +160,61 @@ pub async fn restore_db_backup(
     state: State<'_, AppState>,
     filename: String,
 ) -> Result<String, String> {
-    let db = state.db.clone();
-    tauri::async_runtime::spawn_blocking(move || db.restore_from_backup(&filename))
+    let app_state = state.inner().owned_clone();
+    with_codex_provider_transaction(app_state, move |app_state| async move {
+        let state_for_restore = Arc::clone(&app_state);
+        let safety_id = tauri::async_runtime::spawn_blocking(move || {
+            state_for_restore.db.restore_from_backup(&filename)
+        })
         .await
-        .map_err(|e| format!("Restore failed: {e}"))?
-        .map_err(|e: AppError| e.to_string())
+        .map_err(|error| format!("Restore failed: {error}"))?
+        .map_err(|error| error.to_string())?;
+
+        if let Err(sync_error) =
+            run_post_import_sync_under_proxy_transaction(Arc::clone(&app_state)).await
+        {
+            let rollback_errors =
+                restore_safety_backup_after_sync_failure(app_state, &safety_id).await;
+            let rollback_context = if rollback_errors.is_empty() {
+                format!("database restored from safety backup {safety_id}")
+            } else {
+                format!("database rollback issues: {}", rollback_errors.join("; "))
+            };
+            return Err(format!(
+                "Restore post-operation synchronization failed: {sync_error}; {rollback_context}"
+            ));
+        }
+
+        Ok(safety_id)
+    })
+    .await
+}
+
+async fn restore_safety_backup_after_sync_failure(
+    state: Arc<AppState>,
+    safety_id: &str,
+) -> Vec<String> {
+    if safety_id.is_empty() {
+        return vec!["no safety backup was created".to_string()];
+    }
+
+    let filename = format!("{safety_id}.db");
+    let state_for_restore = Arc::clone(&state);
+    let restore_result = tauri::async_runtime::spawn_blocking(move || {
+        state_for_restore.db.restore_from_backup(&filename)
+    })
+    .await;
+
+    match restore_result {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => return vec![format!("restore safety backup: {error}")],
+        Err(error) => return vec![format!("join safety-backup restore task: {error}")],
+    }
+
+    match run_post_import_sync_under_proxy_transaction(state).await {
+        Ok(()) => Vec::new(),
+        Err(error) => vec![format!("resynchronize restored database: {error}")],
+    }
 }
 
 /// Rename a database backup file

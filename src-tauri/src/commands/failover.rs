@@ -6,6 +6,7 @@ use crate::database::FailoverQueueItem;
 use crate::provider::Provider;
 use crate::store::AppState;
 use std::str::FromStr;
+use std::sync::Arc;
 use tauri::Emitter;
 
 /// 获取故障转移队列
@@ -39,10 +40,27 @@ pub async fn add_to_failover_queue(
     app_type: String,
     provider_id: String,
 ) -> Result<(), String> {
-    state
-        .db
-        .add_to_failover_queue(&app_type, &provider_id)
-        .map_err(|e| e.to_string())
+    if app_type == crate::app_config::AppType::Codex.as_str() {
+        let owned_state = state.inner().owned_clone();
+        let operation_state = Arc::clone(&owned_state);
+        crate::commands::execute_codex_provider_mutation_all(
+            owned_state,
+            "添加 Codex 故障转移队列项",
+            move || {
+                operation_state
+                    .db
+                    .add_to_failover_queue(&app_type, &provider_id)
+                    .map(|_| true)
+            },
+        )
+        .await
+        .map(|_| ())
+    } else {
+        state
+            .db
+            .add_to_failover_queue(&app_type, &provider_id)
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// 从故障转移队列移除供应商
@@ -52,10 +70,27 @@ pub async fn remove_from_failover_queue(
     app_type: String,
     provider_id: String,
 ) -> Result<(), String> {
-    state
-        .db
-        .remove_from_failover_queue(&app_type, &provider_id)
-        .map_err(|e| e.to_string())
+    if app_type == crate::app_config::AppType::Codex.as_str() {
+        let owned_state = state.inner().owned_clone();
+        let operation_state = Arc::clone(&owned_state);
+        crate::commands::execute_codex_provider_mutation_all(
+            owned_state,
+            "移除 Codex 故障转移队列项",
+            move || {
+                operation_state
+                    .db
+                    .remove_from_failover_queue(&app_type, &provider_id)
+                    .map(|_| true)
+            },
+        )
+        .await
+        .map(|_| ())
+    } else {
+        state
+            .db
+            .remove_from_failover_queue(&app_type, &provider_id)
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// 获取指定应用的自动故障转移开关状态（从 proxy_config 表读取）
@@ -85,6 +120,8 @@ pub async fn set_auto_failover_enabled(
     log::info!(
         "[Failover] Setting auto_failover_enabled: app_type='{app_type}', enabled={enabled}"
     );
+    let app_enum = crate::app_config::AppType::from_str(&app_type)
+        .map_err(|_| format!("无效的应用类型: {app_type}"))?;
 
     // 读取当前配置
     let mut config = state
@@ -106,9 +143,6 @@ pub async fn set_auto_failover_enabled(
             .map_err(|e| e.to_string())?;
 
         if queue.is_empty() {
-            let app_enum = crate::app_config::AppType::from_str(&app_type)
-                .map_err(|_| format!("无效的应用类型: {app_type}"))?;
-
             let current_id = crate::settings::get_effective_current_provider(&state.db, &app_enum)
                 .map_err(|e| e.to_string())?;
 
@@ -139,11 +173,21 @@ pub async fn set_auto_failover_enabled(
     // 开启前先切到 P1。只有切换成功后才写入 auto_failover_enabled=true，
     // 避免 P1 不可切换（例如 official provider）时留下“开关已开但目标未切”的脏状态。
     if enabled {
-        if let Err(e) = state
-            .proxy_service
-            .switch_proxy_target(&app_type, &p1_provider_id)
+        let switch_result = if matches!(&app_enum, crate::app_config::AppType::Codex) {
+            crate::commands::enable_codex_auto_failover_to_provider(
+                state.inner().owned_clone(),
+                p1_provider_id.clone(),
+                false,
+            )
             .await
-        {
+            .map(|_| ())
+        } else {
+            state
+                .proxy_service
+                .switch_proxy_target(&app_type, &p1_provider_id)
+                .await
+        };
+        if let Err(e) = switch_result {
             if let Some(provider_id) = auto_added_provider_id {
                 let _ = state.db.remove_from_failover_queue(&app_type, &provider_id);
             }
@@ -152,14 +196,30 @@ pub async fn set_auto_failover_enabled(
     }
 
     // 更新 auto_failover_enabled 字段
-    config.auto_failover_enabled = enabled;
+    if !enabled || !matches!(&app_enum, crate::app_config::AppType::Codex) {
+        config.auto_failover_enabled = enabled;
 
-    // 写回数据库
-    state
-        .db
-        .update_proxy_config_for_app(config)
-        .await
-        .map_err(|e| e.to_string())?;
+        if matches!(&app_enum, crate::app_config::AppType::Codex) {
+            let owned_state = state.inner().owned_clone();
+            let operation_state = Arc::clone(&owned_state);
+            crate::commands::execute_codex_provider_mutation_all(
+                owned_state,
+                "关闭 Codex Auto 模式",
+                move || {
+                    futures::executor::block_on(
+                        operation_state.db.update_proxy_config_for_app(config),
+                    )
+                },
+            )
+            .await?;
+        } else {
+            state
+                .db
+                .update_proxy_config_for_app(config)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
 
     if enabled {
         // 发射 provider-switched 事件（让前端刷新当前供应商）

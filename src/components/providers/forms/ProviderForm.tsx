@@ -19,8 +19,10 @@ import type {
   ProviderMeta,
   ClaudeApiFormat,
   CodexApiFormat,
+  CodexAutoReviewMode,
   CodexCatalogModel,
   CodexChatReasoning,
+  CodexAgentRoleRouting,
   PromptCacheRoutingMode,
   ClaudeApiKeyField,
 } from "@/types";
@@ -86,6 +88,15 @@ import {
   ProviderAdvancedConfig,
   type PricingModelSourceOption,
 } from "./ProviderAdvancedConfig";
+import {
+  defaultLocalProxyRetryPolicy,
+  normalizeLocalProxyRetryPolicy,
+  validateLocalProxyRetryPolicy,
+} from "./ProviderRetryPolicyConfig";
+import {
+  defaultCodexAgentRoleRouting,
+  normalizeCodexAgentRoleRouting,
+} from "./CodexAgentRoleRoutingConfig";
 import {
   useProviderCategory,
   useApiKeyState,
@@ -238,6 +249,8 @@ export interface ProviderFormProps {
   };
   showButtons?: boolean;
   isProxyTakeover?: boolean;
+  formId?: string;
+  onRequestAddCodexProvider?: (onCreated: (providerId: string) => void) => void;
 }
 
 export function ProviderForm(props: ProviderFormProps) {
@@ -263,6 +276,8 @@ function ProviderFormFull({
   initialData,
   showButtons = true,
   isProxyTakeover = false,
+  formId = "provider-form",
+  onRequestAddCodexProvider,
 }: ProviderFormProps) {
   if (appId === "claude-desktop") {
     throw new Error("ProviderFormFull should not receive claude-desktop");
@@ -312,6 +327,8 @@ function ProviderFormFull({
     () => initialData?.meta?.endpointAutoSelect ?? true,
   );
   const supportsFullUrl = appId === "claude" || appId === "codex";
+  const supportsLocalProxyRetry =
+    appId === "claude" || appId === "codex" || appId === "gemini";
   const [localIsFullUrl, setLocalIsFullUrl] = useState<boolean>(() => {
     if (!supportsFullUrl) return false;
     return initialData?.meta?.isFullUrl ?? false;
@@ -330,6 +347,19 @@ function ProviderFormFull({
       initialData?.meta?.pricingModelSource,
     ),
   }));
+  const [localProxyRetryPolicy, setLocalProxyRetryPolicy] = useState(() =>
+    initialData?.meta?.localProxyRetryPolicy
+      ? normalizeLocalProxyRetryPolicy(initialData.meta.localProxyRetryPolicy)
+      : defaultLocalProxyRetryPolicy(),
+  );
+  const [codexAgentRoleRouting, setCodexAgentRoleRouting] =
+    useState<CodexAgentRoleRouting>(() =>
+      appId === "codex"
+        ? normalizeCodexAgentRoleRouting(
+            initialData?.meta?.codexAgentRoleRouting,
+          )
+        : defaultCodexAgentRoleRouting(),
+    );
 
   const { category } = useProviderCategory({
     appId,
@@ -363,6 +393,22 @@ function ProviderFormFull({
     });
     setCodexChatReasoning(initialData?.meta?.codexChatReasoning ?? {});
     setPromptCacheRouting(initialData?.meta?.promptCacheRouting ?? "auto");
+    setCodexAutoReviewMode(initialData?.meta?.codexAutoReviewMode ?? "native");
+    setCodexAutoReviewFallbackModel(
+      initialData?.meta?.codexAutoReviewFallbackModel ?? "",
+    );
+    setLocalProxyRetryPolicy(
+      initialData?.meta?.localProxyRetryPolicy
+        ? normalizeLocalProxyRetryPolicy(initialData.meta.localProxyRetryPolicy)
+        : defaultLocalProxyRetryPolicy(),
+    );
+    setCodexAgentRoleRouting(
+      appId === "codex"
+        ? normalizeCodexAgentRoleRouting(
+            initialData?.meta?.codexAgentRoleRouting,
+          )
+        : defaultCodexAgentRoleRouting(),
+    );
     setCustomUserAgent(initialData?.meta?.customUserAgent ?? "");
     setLocalProxyHeadersOverride(
       formatRequestOverrideObject(
@@ -539,6 +585,14 @@ function ProviderFormFull({
     useState<PromptCacheRoutingMode>(
       () => initialData?.meta?.promptCacheRouting ?? "auto",
     );
+  const [codexAutoReviewMode, setCodexAutoReviewMode] =
+    useState<CodexAutoReviewMode>(
+      () => initialData?.meta?.codexAutoReviewMode ?? "native",
+    );
+  const [codexAutoReviewFallbackModel, setCodexAutoReviewFallbackModel] =
+    useState<string>(
+      () => initialData?.meta?.codexAutoReviewFallbackModel ?? "",
+    );
   const [customUserAgent, setCustomUserAgent] = useState<string>(
     () => initialData?.meta?.customUserAgent ?? "",
   );
@@ -643,6 +697,8 @@ function ProviderFormFull({
       resetCodexConfig(template.auth, template.config);
       setCodexChatReasoning({});
       setPromptCacheRouting("auto");
+      setCodexAutoReviewMode("native");
+      setCodexAutoReviewFallbackModel("");
     }
   }, [appId, initialData, selectedPresetId, resetCodexConfig]);
 
@@ -996,6 +1052,23 @@ function ProviderFormFull({
     (appId === "claude" || appId === "codex") && category !== "official";
 
   const handleSubmit = async (values: ProviderFormData) => {
+    const retryPolicyError = supportsLocalProxyRetry
+      ? validateLocalProxyRetryPolicy(localProxyRetryPolicy)
+      : undefined;
+    if (retryPolicyError) {
+      toast.error(
+        t(`providerAdvanced.retryValidation.${retryPolicyError}`, {
+          defaultValue:
+            retryPolicyError === "maxRetries"
+              ? "Additional retries must be an integer from 0 to 50."
+              : retryPolicyError === "retryDelayMs"
+                ? "Retry interval must be an integer from 1 to 60000 ms."
+                : "Choose at least one error type or enter an error message when retries are enabled.",
+        }),
+      );
+      return;
+    }
+
     const overridesResult = shouldApplyLocalProxyRequestOverrides
       ? buildLocalProxyRequestOverrides(
           localProxyHeadersOverride,
@@ -1503,6 +1576,25 @@ function ProviderFormFull({
         promptCacheRouting !== "auto"
           ? promptCacheRouting
           : undefined,
+      codexAutoReviewMode:
+        appId === "codex" &&
+        category !== "official" &&
+        codexAutoReviewMode !== "native"
+          ? codexAutoReviewMode
+          : undefined,
+      codexAutoReviewFallbackModel:
+        appId === "codex" &&
+        category !== "official" &&
+        codexAutoReviewMode !== "native"
+          ? codexAutoReviewFallbackModel.trim() || undefined
+          : undefined,
+      localProxyRetryPolicy: supportsLocalProxyRetry
+        ? normalizeLocalProxyRetryPolicy(localProxyRetryPolicy)
+        : undefined,
+      codexAgentRoleRouting:
+        appId === "codex"
+          ? normalizeCodexAgentRoleRouting(codexAgentRoleRouting)
+          : undefined,
       customUserAgent:
         (appId === "claude" || appId === "codex") && category !== "official"
           ? customUserAgent.trim() || undefined
@@ -1560,7 +1652,6 @@ function ProviderFormFull({
     if (!isCodexOauthProvider && "codexFastMode" in nextMeta) {
       delete nextMeta.codexFastMode;
     }
-
     payload.meta = nextMeta;
 
     await onSubmit(payload);
@@ -1670,6 +1761,8 @@ function ProviderFormFull({
         resetCodexConfig(template.auth, template.config);
         setCodexChatReasoning({});
         setPromptCacheRouting("auto");
+        setCodexAutoReviewMode("native");
+        setCodexAutoReviewFallbackModel("");
         setLocalCodexApiFormat(
           codexApiFormatFromWireApi(extractCodexWireApi(template.config)) ??
             "openai_responses",
@@ -1712,6 +1805,8 @@ function ProviderFormFull({
       resetCodexConfig(auth, config, preset.modelCatalog ?? []);
       setCodexChatReasoning(preset.codexChatReasoning ?? {});
       setPromptCacheRouting(preset.promptCacheRouting ?? "auto");
+      setCodexAutoReviewMode("native");
+      setCodexAutoReviewFallbackModel("");
       setLocalCodexApiFormat(
         preset.apiFormat ??
           codexApiFormatFromWireApi(extractCodexWireApi(config)) ??
@@ -1857,7 +1952,7 @@ function ProviderFormFull({
     <>
       <Form {...form}>
         <form
-          id="provider-form"
+          id={formId}
           onSubmit={form.handleSubmit(handleSubmit)}
           className="space-y-6 glass rounded-xl p-6 border border-white/10"
         >
@@ -2204,6 +2299,12 @@ function ProviderFormFull({
               onCodexChatReasoningChange={setCodexChatReasoning}
               promptCacheRouting={promptCacheRouting}
               onPromptCacheRoutingChange={setPromptCacheRouting}
+              codexAutoReviewMode={codexAutoReviewMode}
+              onCodexAutoReviewModeChange={setCodexAutoReviewMode}
+              codexAutoReviewFallbackModel={codexAutoReviewFallbackModel}
+              onCodexAutoReviewFallbackModelChange={
+                setCodexAutoReviewFallbackModel
+              }
               catalogModels={codexCatalogModels}
               onCatalogModelsChange={setCodexCatalogModels}
               speedTestEndpoints={speedTestEndpoints}
@@ -2487,6 +2588,29 @@ function ProviderFormFull({
               <ProviderAdvancedConfig
                 pricingConfig={pricingConfig}
                 onPricingConfigChange={setPricingConfig}
+                retryPolicy={
+                  supportsLocalProxyRetry ? localProxyRetryPolicy : undefined
+                }
+                onRetryPolicyChange={
+                  supportsLocalProxyRetry ? setLocalProxyRetryPolicy : undefined
+                }
+                codexAgentRoleRouting={
+                  appId === "codex" ? codexAgentRoleRouting : undefined
+                }
+                onCodexAgentRoleRoutingChange={
+                  appId === "codex" ? setCodexAgentRoleRouting : undefined
+                }
+                ownerProviderId={providerId}
+                ownerDefaultModel={codexModel}
+                ownerCatalogModels={codexCatalogModels}
+                ownerBaseUrl={codexBaseUrl}
+                ownerApiKey={codexApiKey}
+                ownerIsFullUrl={localIsFullUrl}
+                ownerCustomUserAgent={customUserAgent}
+                onRequestAddCodexProvider={
+                  appId === "codex" ? onRequestAddCodexProvider : undefined
+                }
+                roleRoutingIdPrefix={`codex-role-${providerId ?? formId}`}
               />
             )}
 

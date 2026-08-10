@@ -3,7 +3,7 @@
 //! ChatGPT Codex exposes models through `chatgpt.com/backend-api/codex/models`,
 //! which is not an OpenAI-compatible `/v1/models` endpoint.
 
-use crate::services::model_fetch::FetchedModel;
+use crate::services::model_fetch::{extract_context_window, FetchedModel};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -74,6 +74,7 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
         models.push(FetchedModel {
             id: id.to_string(),
             owned_by: Some("Codex".to_string()),
+            context_window: None,
         });
         return;
     }
@@ -83,6 +84,7 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
             models.push(FetchedModel {
                 id: id.to_string(),
                 owned_by: Some("Codex".to_string()),
+                context_window: None,
             });
         }
         return;
@@ -104,7 +106,11 @@ fn push_model_entry(models: &mut Vec<FetchedModel>, entry: &Value, fallback_id: 
     )
     .or_else(|| Some("Codex".to_string()));
 
-    models.push(FetchedModel { id, owned_by });
+    models.push(FetchedModel {
+        id,
+        owned_by,
+        context_window: extract_context_window(entry),
+    });
 }
 
 fn string_field(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
@@ -135,7 +141,7 @@ mod tests {
     fn parse_codex_oauth_models_accepts_openai_style_data() {
         let models = parse_models(json!({
             "data": [
-                { "id": "gpt-5.4", "owned_by": "openai" },
+                { "id": "gpt-5.4", "owned_by": "openai", "context_window": 400000 },
                 { "id": "gpt-5.4-mini", "ownedBy": "openai" }
             ]
         }));
@@ -143,8 +149,10 @@ mod tests {
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].id, "gpt-5.4");
         assert_eq!(models[0].owned_by.as_deref(), Some("openai"));
+        assert_eq!(models[0].context_window, Some(400000));
         assert_eq!(models[1].id, "gpt-5.4-mini");
         assert_eq!(models[1].owned_by.as_deref(), Some("openai"));
+        assert_eq!(models[1].context_window, None);
     }
 
     #[test]

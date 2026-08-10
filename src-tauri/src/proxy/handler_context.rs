@@ -7,12 +7,116 @@ use crate::provider::Provider;
 use crate::proxy::{
     extract_session_id,
     forwarder::RequestForwarder,
+    provider_router::ProviderRoutePlan,
     server::ProxyState,
     types::{AppProxyConfig, CopilotOptimizerConfig, OptimizerConfig, RectifierConfig},
     ProxyError,
 };
 use axum::http::HeaderMap;
+use std::net::SocketAddr;
 use std::time::Instant;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexRoleRoute {
+    Frontend,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexRoleRouteHeaders {
+    pub route: CodexRoleRoute,
+    pub owner_provider_id: String,
+    pub token: String,
+}
+
+pub fn parse_codex_role_route_headers(
+    headers: &HeaderMap,
+) -> Result<Option<CodexRoleRouteHeaders>, ProxyError> {
+    use crate::services::codex_agent_roles::{
+        FRONTEND_ROLE_ROUTE_VALUE, ROLE_OWNER_HEADER, ROLE_ROUTE_HEADER, ROLE_TOKEN_HEADER,
+    };
+
+    let route = unique_role_header(headers, ROLE_ROUTE_HEADER)?;
+    let owner = unique_role_header(headers, ROLE_OWNER_HEADER)?;
+    let token = unique_role_header(headers, ROLE_TOKEN_HEADER)?;
+    match (route, owner, token) {
+        (None, None, None) => Ok(None),
+        (Some(route), Some(owner_provider_id), Some(token)) => {
+            let route = match route.as_str() {
+                FRONTEND_ROLE_ROUTE_VALUE => CodexRoleRoute::Frontend,
+                _ => {
+                    return Err(ProxyError::InvalidRequest(format!(
+                        "Unknown Codex role route: {route}"
+                    )))
+                }
+            };
+            Ok(Some(CodexRoleRouteHeaders {
+                route,
+                owner_provider_id,
+                token,
+            }))
+        }
+        _ => Err(ProxyError::InvalidRequest(
+            "Codex role route, owner, and token headers must be provided together".to_string(),
+        )),
+    }
+}
+
+fn codex_role_route_for_request(
+    app_type: &AppType,
+    body: &serde_json::Value,
+    headers: &HeaderMap,
+    peer_addr: Option<SocketAddr>,
+) -> Result<Option<CodexRoleRouteHeaders>, ProxyError> {
+    if !matches!(app_type, AppType::Codex) {
+        return Ok(None);
+    }
+
+    use crate::services::codex_agent_roles::{
+        ROLE_OWNER_HEADER, ROLE_ROUTE_HEADER, ROLE_TOKEN_HEADER,
+    };
+    let has_role_header = [ROLE_ROUTE_HEADER, ROLE_OWNER_HEADER, ROLE_TOKEN_HEADER]
+        .into_iter()
+        .any(|name| headers.contains_key(name));
+    if has_role_header && !peer_addr.is_some_and(|addr| addr.ip().is_loopback()) {
+        return Err(ProxyError::InvalidRequest(
+            "Codex role routing is only accepted from the local loopback interface".to_string(),
+        ));
+    }
+    if !has_role_header && super::codex_auto_review::is_auto_review_model(app_type, body) {
+        return Ok(None);
+    }
+    parse_codex_role_route_headers(headers)
+}
+
+fn unique_role_header(
+    headers: &HeaderMap,
+    name: &'static str,
+) -> Result<Option<String>, ProxyError> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(ProxyError::InvalidRequest(format!(
+            "Duplicate Codex role header: {name}"
+        )));
+    }
+    let value = value.to_str().map_err(|_| {
+        ProxyError::InvalidRequest(format!("Codex role header is not valid UTF-8: {name}"))
+    })?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ProxyError::InvalidRequest(format!(
+            "Codex role header is empty: {name}"
+        )));
+    }
+    if value.contains(',') {
+        return Err(ProxyError::InvalidRequest(format!(
+            "Codex role header contains multiple values: {name}"
+        )));
+    }
+    Ok(Some(value.to_string()))
+}
 
 /// 流式超时配置
 #[derive(Debug, Clone, Copy)]
@@ -41,6 +145,9 @@ pub struct RequestContext {
     pub provider: Provider,
     /// 完整的 Provider 列表（用于故障转移）
     providers: Vec<Provider>,
+    route_plan: ProviderRoutePlan,
+    /// 已通过 capability token 验证的角色配置拥有者，仅用于角色路由可观测性。
+    role_route_owner_id: Option<String>,
     /// 请求开始时的"当前供应商"（用于判断是否需要同步 UI/托盘）
     ///
     /// 这里使用本地 settings 的设备级 current provider。
@@ -93,6 +200,18 @@ impl RequestContext {
         tag: &'static str,
         app_type_str: &'static str,
     ) -> Result<Self, ProxyError> {
+        Self::new_with_peer_addr(state, body, headers, app_type, tag, app_type_str, None).await
+    }
+
+    pub async fn new_with_peer_addr(
+        state: &ProxyState,
+        body: &serde_json::Value,
+        headers: &HeaderMap,
+        app_type: AppType,
+        tag: &'static str,
+        app_type_str: &'static str,
+        peer_addr: Option<SocketAddr>,
+    ) -> Result<Self, ProxyError> {
         let start_time = Instant::now();
 
         // 从数据库读取应用级代理配置（per-app）
@@ -129,19 +248,36 @@ impl RequestContext {
             session_result.client_provided
         );
 
-        // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
-        // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
-        let providers = state
-            .provider_router
-            .select_providers(app_type_str)
-            .await
-            .map_err(|e| match e {
-                crate::error::AppError::AllProvidersCircuitOpen => {
-                    ProxyError::AllProvidersCircuitOpen
-                }
-                crate::error::AppError::NoProvidersConfigured => ProxyError::NoProvidersConfigured,
-                _ => ProxyError::DatabaseError(e.to_string()),
-            })?;
+        let role_route = codex_role_route_for_request(&app_type, body, headers, peer_addr)?;
+        let (role_route_plan, role_route_owner_id) = match role_route {
+            Some(CodexRoleRouteHeaders {
+                route: CodexRoleRoute::Frontend,
+                owner_provider_id,
+                token,
+            }) => {
+                let plan = state
+                    .provider_router
+                    .select_codex_frontend_route_plan(&owner_provider_id, &request_model, &token)
+                    .await
+                    .map_err(map_provider_selection_error)?;
+                (plan, Some(owner_provider_id))
+            }
+            None => (None, None),
+        };
+        let route_plan = match role_route_plan {
+            Some(plan) => plan,
+            None => {
+                // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
+                // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
+                let providers = state
+                    .provider_router
+                    .select_providers(app_type_str)
+                    .await
+                    .map_err(map_provider_selection_error)?;
+                ProviderRoutePlan::standard(providers, app_config.auto_failover_enabled)
+            }
+        };
+        let providers = route_plan.providers();
 
         let provider = providers
             .first()
@@ -162,6 +298,8 @@ impl RequestContext {
             app_config,
             provider,
             providers,
+            route_plan,
+            role_route_owner_id,
             current_provider_id,
             request_model,
             outbound_model: None,
@@ -200,7 +338,7 @@ impl RequestContext {
     /// - 故障转移关闭：超时配置不生效（全部传入 0）
     pub fn create_forwarder(&self, state: &ProxyState) -> RequestForwarder {
         let (non_streaming_timeout, first_byte_timeout, idle_timeout) =
-            if self.app_config.auto_failover_enabled {
+            if self.route_plan.use_failover_timeouts {
                 // 故障转移开启：使用配置的值（0 = 禁用超时）
                 (
                     self.app_config.non_streaming_timeout as u64,
@@ -242,6 +380,8 @@ impl RequestContext {
             self.copilot_optimizer_config.clone(),
             max_retries,
         )
+        .with_route_plan(&self.route_plan)
+        .with_role_context(self.role_route_owner_id.clone(), self.request_model.clone())
     }
 
     /// 获取 Provider 列表（用于故障转移）
@@ -264,7 +404,7 @@ impl RequestContext {
     /// - 故障转移关闭：返回 0（禁用超时检查）
     #[inline]
     pub fn streaming_timeout_config(&self) -> StreamingTimeoutConfig {
-        if self.app_config.auto_failover_enabled {
+        if self.route_plan.use_failover_timeouts {
             // 故障转移开启：使用配置的值（0 = 禁用超时）
             StreamingTimeoutConfig {
                 first_byte_timeout: self.app_config.streaming_first_byte_timeout as u64,
@@ -277,6 +417,15 @@ impl RequestContext {
                 idle_timeout: 0,
             }
         }
+    }
+}
+
+fn map_provider_selection_error(error: crate::error::AppError) -> ProxyError {
+    match error {
+        crate::error::AppError::AllProvidersCircuitOpen => ProxyError::AllProvidersCircuitOpen,
+        crate::error::AppError::NoProvidersConfigured => ProxyError::NoProvidersConfigured,
+        crate::error::AppError::InvalidInput(message) => ProxyError::InvalidRequest(message),
+        _ => ProxyError::DatabaseError(error.to_string()),
     }
 }
 
@@ -300,7 +449,223 @@ pub(crate) fn extract_gemini_model_from_path(endpoint: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_gemini_model_from_path;
+    use super::{
+        codex_role_route_for_request, extract_gemini_model_from_path, map_provider_selection_error,
+        parse_codex_role_route_headers, CodexRoleRoute,
+    };
+    use crate::app_config::AppType;
+    use crate::error::AppError;
+    use crate::proxy::ProxyError;
+    use axum::http::{HeaderMap, HeaderValue};
+    use serde_json::json;
+
+    #[test]
+    fn codex_role_headers_require_a_complete_unique_triple() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-cc-switch-role-route",
+            HeaderValue::from_static("frontend"),
+        );
+        headers.insert(
+            "x-cc-switch-role-owner",
+            HeaderValue::from_static("provider-a"),
+        );
+        headers.insert(
+            "x-cc-switch-role-token",
+            HeaderValue::from_static("signed-token"),
+        );
+
+        let route = parse_codex_role_route_headers(&headers)
+            .expect("valid role route headers")
+            .expect("role route");
+        assert_eq!(route.route, CodexRoleRoute::Frontend);
+        assert_eq!(route.owner_provider_id, "provider-a");
+        assert_eq!(route.token, "signed-token");
+
+        let mut missing_owner = HeaderMap::new();
+        missing_owner.insert(
+            "x-cc-switch-role-route",
+            HeaderValue::from_static("frontend"),
+        );
+        assert!(matches!(
+            parse_codex_role_route_headers(&missing_owner),
+            Err(ProxyError::InvalidRequest(_))
+        ));
+
+        let mut missing_token = HeaderMap::new();
+        missing_token.insert(
+            "x-cc-switch-role-route",
+            HeaderValue::from_static("frontend"),
+        );
+        missing_token.insert(
+            "x-cc-switch-role-owner",
+            HeaderValue::from_static("provider-a"),
+        );
+        assert!(matches!(
+            parse_codex_role_route_headers(&missing_token),
+            Err(ProxyError::InvalidRequest(_))
+        ));
+
+        let mut duplicate_route = headers.clone();
+        duplicate_route.append(
+            "x-cc-switch-role-route",
+            HeaderValue::from_static("frontend"),
+        );
+        assert!(matches!(
+            parse_codex_role_route_headers(&duplicate_route),
+            Err(ProxyError::InvalidRequest(_))
+        ));
+
+        let mut duplicate_token = headers.clone();
+        duplicate_token.append(
+            "x-cc-switch-role-token",
+            HeaderValue::from_static("second-token"),
+        );
+        assert!(matches!(
+            parse_codex_role_route_headers(&duplicate_token),
+            Err(ProxyError::InvalidRequest(_))
+        ));
+
+        let mut combined_owner = headers;
+        combined_owner.insert(
+            "x-cc-switch-role-owner",
+            HeaderValue::from_static("provider-a,provider-b"),
+        );
+        assert!(matches!(
+            parse_codex_role_route_headers(&combined_owner),
+            Err(ProxyError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn codex_role_headers_reject_unknown_empty_and_non_utf8_values() {
+        let cases = [
+            (
+                HeaderValue::from_static("backend"),
+                HeaderValue::from_static("provider-a"),
+                HeaderValue::from_static("signed-token"),
+            ),
+            (
+                HeaderValue::from_static("frontend"),
+                HeaderValue::from_static("   "),
+                HeaderValue::from_static("signed-token"),
+            ),
+            (
+                HeaderValue::from_bytes(&[0xff]).expect("opaque header value"),
+                HeaderValue::from_static("provider-a"),
+                HeaderValue::from_static("signed-token"),
+            ),
+            (
+                HeaderValue::from_static("frontend"),
+                HeaderValue::from_static("provider-a"),
+                HeaderValue::from_static("   "),
+            ),
+        ];
+
+        for (route, owner, token) in cases {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-cc-switch-role-route", route);
+            headers.insert("x-cc-switch-role-owner", owner);
+            headers.insert("x-cc-switch-role-token", token);
+            assert!(matches!(
+                parse_codex_role_route_headers(&headers),
+                Err(ProxyError::InvalidRequest(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn invalid_role_selection_maps_to_invalid_request() {
+        assert!(matches!(
+            map_provider_selection_error(AppError::InvalidInput("stale token".to_string())),
+            ProxyError::InvalidRequest(message) if message == "stale token"
+        ));
+    }
+
+    #[test]
+    fn auto_review_rejects_malformed_role_headers() {
+        let mut malformed = HeaderMap::new();
+        malformed.insert(
+            "x-cc-switch-role-route",
+            HeaderValue::from_static("unknown"),
+        );
+
+        assert!(matches!(
+            codex_role_route_for_request(
+                &AppType::Codex,
+                &json!({ "model": "codex-auto-review" }),
+                &malformed,
+                None,
+            ),
+            Err(ProxyError::InvalidRequest(_))
+        ));
+        assert_eq!(
+            codex_role_route_for_request(
+                &AppType::Codex,
+                &json!({ "model": "codex-auto-review" }),
+                &HeaderMap::new(),
+                None,
+            )
+            .expect("header-free auto review keeps its dedicated route"),
+            None
+        );
+        assert!(matches!(
+            codex_role_route_for_request(
+                &AppType::Codex,
+                &json!({ "model": "gpt-5.6-sol" }),
+                &malformed,
+                Some("127.0.0.1:15721".parse().expect("loopback address")),
+            ),
+            Err(ProxyError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn codex_role_routing_requires_a_loopback_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-cc-switch-role-route",
+            HeaderValue::from_static("frontend"),
+        );
+        headers.insert(
+            "x-cc-switch-role-owner",
+            HeaderValue::from_static("provider-a"),
+        );
+        headers.insert(
+            "x-cc-switch-role-token",
+            HeaderValue::from_static("signed-token"),
+        );
+        let body = json!({ "model": "gpt-5.6-sol" });
+
+        assert!(codex_role_route_for_request(
+            &AppType::Codex,
+            &body,
+            &headers,
+            Some("127.0.0.1:15721".parse().expect("loopback address")),
+        )
+        .expect("loopback role request")
+        .is_some());
+
+        for peer_addr in [
+            None,
+            Some("192.0.2.10:15721".parse().expect("remote address")),
+        ] {
+            assert!(matches!(
+                codex_role_route_for_request(&AppType::Codex, &body, &headers, peer_addr),
+                Err(ProxyError::InvalidRequest(message)) if message.contains("loopback")
+            ));
+        }
+
+        let mut token_only = HeaderMap::new();
+        token_only.insert(
+            "x-cc-switch-role-token",
+            HeaderValue::from_static("signed-token"),
+        );
+        assert!(matches!(
+            codex_role_route_for_request(&AppType::Codex, &body, &token_only, None),
+            Err(ProxyError::InvalidRequest(message)) if message.contains("loopback")
+        ));
+    }
 
     #[test]
     fn extract_model_with_action() {

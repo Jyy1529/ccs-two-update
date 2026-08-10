@@ -6,8 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { FullScreenPanel } from "@/components/common/FullScreenPanel";
 import type { Provider, CustomEndpoint, UniversalProvider } from "@/types";
-import type { AppId } from "@/lib/api";
-import { universalProvidersApi } from "@/lib/api";
+import { providersApi, universalProvidersApi, type AppId } from "@/lib/api";
 import {
   ProviderForm,
   type ProviderFormValues,
@@ -23,18 +22,22 @@ import { extractGrokBuildBaseUrl } from "@/utils/grokBuildConfig";
 import type { OpenClawSuggestedDefaults } from "@/config/openclawProviderPresets";
 import type { UniversalProviderPreset } from "@/config/universalProviderPresets";
 
+export type AddProviderInput = Omit<Provider, "id"> & {
+  providerKey?: string;
+  suggestedDefaults?: OpenClawSuggestedDefaults;
+  ensureClaudeDesktopOfficialSeed?: boolean;
+  ensureCodexOfficialSeed?: boolean;
+};
+
 interface AddProviderDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   appId: AppId;
   onSubmit: (
-    provider: Omit<Provider, "id"> & {
-      providerKey?: string;
-      suggestedDefaults?: OpenClawSuggestedDefaults;
-      ensureClaudeDesktopOfficialSeed?: boolean;
-      ensureCodexOfficialSeed?: boolean;
-    },
-  ) => Promise<void> | void;
+    provider: AddProviderInput,
+  ) => Promise<Provider | void> | Provider | void;
+  allowAgentRoleProviderCreate?: boolean;
+  onProviderCreated?: (provider: Provider) => void;
 }
 
 export function AddProviderDialog({
@@ -42,6 +45,8 @@ export function AddProviderDialog({
   onOpenChange,
   appId,
   onSubmit,
+  allowAgentRoleProviderCreate = true,
+  onProviderCreated,
 }: AddProviderDialogProps) {
   const { t } = useTranslation();
   // OpenCode and OpenClaw don't support universal providers
@@ -58,6 +63,22 @@ export function AddProviderDialog({
   const [selectedUniversalPreset, setSelectedUniversalPreset] =
     useState<UniversalProviderPreset | null>(null);
   const [isFormSubmitting, setIsFormSubmitting] = useState(false);
+  const [agentRoleProviderDialogOpen, setAgentRoleProviderDialogOpen] =
+    useState(false);
+  const [agentRoleProviderCreated, setAgentRoleProviderCreated] = useState<
+    ((providerId: string) => void) | null
+  >(null);
+  const providerFormId = allowAgentRoleProviderCreate
+    ? "provider-form"
+    : "agent-role-provider-form";
+
+  const handleRequestAddCodexProvider = useCallback(
+    (onCreated: (providerId: string) => void) => {
+      setAgentRoleProviderCreated(() => onCreated);
+      setAgentRoleProviderDialogOpen(true);
+    },
+    [],
+  );
 
   const handleUniversalProviderSave = useCallback(
     async (provider: UniversalProvider) => {
@@ -115,12 +136,7 @@ export function AddProviderDialog({
       >;
 
       // 构造基础提交数据
-      const providerData: Omit<Provider, "id"> & {
-        providerKey?: string;
-        suggestedDefaults?: OpenClawSuggestedDefaults;
-        ensureClaudeDesktopOfficialSeed?: boolean;
-        ensureCodexOfficialSeed?: boolean;
-      } = {
+      const providerData: AddProviderInput = {
         name: values.name.trim(),
         notes: values.notes?.trim() || undefined,
         websiteUrl: values.websiteUrl?.trim() || undefined,
@@ -304,10 +320,33 @@ export function AddProviderDialog({
         providerData.suggestedDefaults = values.suggestedDefaults;
       }
 
-      await onSubmit(providerData);
+      const createdProvider = await onSubmit(providerData);
+      if (
+        appId === "codex" &&
+        values.meta?.codexAgentRoleRouting?.enabled === true &&
+        createdProvider
+      ) {
+        try {
+          const currentProviderId = await providersApi.getCurrent("codex");
+          if (currentProviderId === createdProvider.id) {
+            toast.success(t("providerAdvanced.agentRoleProxyAutoEnabled"));
+            toast.info(t("providerAdvanced.agentRoleRestartRequired"));
+          } else {
+            toast.info(t("providerAdvanced.agentRoleSavedSwitchRequired"));
+          }
+        } catch (error) {
+          console.error(
+            "[AddProviderDialog] Failed to resolve current Codex provider after save",
+            error,
+          );
+        }
+      }
+      if (createdProvider) {
+        onProviderCreated?.(createdProvider);
+      }
       onOpenChange(false);
     },
-    [appId, onSubmit, onOpenChange],
+    [appId, onProviderCreated, onSubmit, onOpenChange, t],
   );
 
   const footer =
@@ -325,7 +364,7 @@ export function AddProviderDialog({
         </Button>
         <Button
           type="submit"
-          form="provider-form"
+          form={providerFormId}
           disabled={isFormSubmitting}
           className="bg-primary text-primary-foreground hover:bg-primary/90"
         >
@@ -382,6 +421,12 @@ export function AddProviderDialog({
               onCancel={() => onOpenChange(false)}
               onSubmittingChange={setIsFormSubmitting}
               showButtons={false}
+              formId={providerFormId}
+              onRequestAddCodexProvider={
+                allowAgentRoleProviderCreate
+                  ? handleRequestAddCodexProvider
+                  : undefined
+              }
             />
           </TabsContent>
 
@@ -398,6 +443,12 @@ export function AddProviderDialog({
           onCancel={() => onOpenChange(false)}
           onSubmittingChange={setIsFormSubmitting}
           showButtons={false}
+          formId={providerFormId}
+          onRequestAddCodexProvider={
+            allowAgentRoleProviderCreate
+              ? handleRequestAddCodexProvider
+              : undefined
+          }
         />
       )}
 
@@ -407,6 +458,22 @@ export function AddProviderDialog({
           onClose={handleUniversalFormClose}
           onSave={handleUniversalProviderSave}
           initialPreset={selectedUniversalPreset}
+        />
+      )}
+
+      {allowAgentRoleProviderCreate && (
+        <AddProviderDialog
+          open={agentRoleProviderDialogOpen}
+          onOpenChange={(nextOpen) => {
+            setAgentRoleProviderDialogOpen(nextOpen);
+            if (!nextOpen) setAgentRoleProviderCreated(null);
+          }}
+          appId="codex"
+          onSubmit={onSubmit}
+          allowAgentRoleProviderCreate={false}
+          onProviderCreated={(provider) => {
+            agentRoleProviderCreated?.(provider.id);
+          }}
         />
       )}
     </FullScreenPanel>

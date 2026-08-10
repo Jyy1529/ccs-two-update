@@ -13,13 +13,15 @@ use crate::services::provider::{
     build_effective_settings_with_common_config, write_live_with_common_config,
 };
 use serde_json::{json, Map, Value};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use tauri::Emitter;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 /// 用于接管 Live 配置时的占位符（避免客户端提示缺少 key，同时不泄露真实 Token）
 const PROXY_TOKEN_PLACEHOLDER: &str = "PROXY_MANAGED";
+const CODEX_AGENT_ROLE_LOOPBACK_REQUIRED: &str = "codex_agent_role_loopback_required";
 
 /// 代理接管模式下需要从 Claude Live 配置中移除的"模型覆盖"字段。
 ///
@@ -58,6 +60,8 @@ enum ClaudeTakeoverAuthPolicy {
 pub struct ProxyService {
     db: Arc<Database>,
     server: Arc<RwLock<Option<ProxyServer>>>,
+    /// Serializes every proxy state transaction across command and service callers.
+    transaction_lock: Arc<Mutex<()>>,
     /// AppHandle，用于传递给 ProxyServer 以支持故障转移时的 UI 更新
     app_handle: Arc<RwLock<Option<tauri::AppHandle>>>,
     switch_locks: SwitchLockManager,
@@ -68,11 +72,140 @@ pub struct HotSwitchOutcome {
     pub logical_target_changed: bool,
 }
 
+#[derive(Debug, Clone)]
+struct ProxyRuntimeSnapshot {
+    address: String,
+    port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProxyFileState {
+    Missing,
+    Bytes(Vec<u8>),
+}
+
+#[derive(Debug, Clone)]
+struct ProxyFileSnapshot {
+    path: PathBuf,
+    state: ProxyFileState,
+}
+
+impl ProxyFileSnapshot {
+    fn capture(path: PathBuf) -> Result<Self, String> {
+        let state = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(format!("事务快照拒绝符号链接: {}", path.display()));
+                }
+                if !metadata.is_file() {
+                    return Err(format!("事务快照目标不是普通文件: {}", path.display()));
+                }
+                ProxyFileState::Bytes(std::fs::read(&path).map_err(|error| {
+                    format!("读取事务快照文件 {} 失败: {error}", path.display())
+                })?)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ProxyFileState::Missing,
+            Err(error) => {
+                return Err(format!("检查事务快照文件 {} 失败: {error}", path.display()));
+            }
+        };
+        Ok(Self { path, state })
+    }
+
+    fn restore_if_changed(&self) -> Result<(), String> {
+        let current = match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(format!("事务回滚拒绝符号链接: {}", self.path.display()));
+                }
+                if !metadata.is_file() {
+                    return Err(format!("事务回滚目标不是普通文件: {}", self.path.display()));
+                }
+                ProxyFileState::Bytes(std::fs::read(&self.path).map_err(|error| {
+                    format!("读取事务回滚文件 {} 失败: {error}", self.path.display())
+                })?)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ProxyFileState::Missing,
+            Err(error) => {
+                return Err(format!(
+                    "检查事务回滚文件 {} 失败: {error}",
+                    self.path.display()
+                ));
+            }
+        };
+
+        if current == self.state {
+            return Ok(());
+        }
+
+        match &self.state {
+            ProxyFileState::Missing => std::fs::remove_file(&self.path).map_err(|error| {
+                format!("删除事务中新建文件 {} 失败: {error}", self.path.display())
+            }),
+            ProxyFileState::Bytes(bytes) => crate::config::atomic_write(&self.path, bytes)
+                .map_err(|error| format!("恢复事务文件 {} 失败: {error}", self.path.display())),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProxyTransactionSnapshot {
+    proxy_config: ProxyConfig,
+    global_config: GlobalProxyConfig,
+    app_configs: Vec<AppProxyConfig>,
+    live_backups: Vec<(String, Option<LiveBackup>)>,
+    live_files: Vec<ProxyFileSnapshot>,
+    runtime: Option<ProxyRuntimeSnapshot>,
+}
+
+fn with_state_restore_errors(primary_error: String, restore_errors: Vec<String>) -> String {
+    if restore_errors.is_empty() {
+        primary_error
+    } else {
+        format!(
+            "{primary_error}; 代理状态回滚遇到错误: {}",
+            restore_errors.join("; ")
+        )
+    }
+}
+
+fn codex_agent_role_connect_host(listen_address: &str) -> Result<String, String> {
+    let address = listen_address
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let ip = address.parse::<std::net::IpAddr>().map_err(|error| {
+        format!(
+            "{CODEX_AGENT_ROLE_LOOPBACK_REQUIRED}: 无法解析代理监听地址 {listen_address}: {error}"
+        )
+    })?;
+    let connect_ip = match ip {
+        std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        }
+        std::net::IpAddr::V6(ip) if ip.is_unspecified() => {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        }
+        ip if ip.is_loopback() => ip,
+        _ => {
+            return Err(format!(
+                "{CODEX_AGENT_ROLE_LOOPBACK_REQUIRED}: Codex Agent Role 路由要求代理监听地址为 loopback 或 wildcard，当前地址为 {listen_address}"
+            ));
+        }
+    };
+
+    Ok(match connect_ip {
+        std::net::IpAddr::V4(ip) => ip.to_string(),
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+    })
+}
+
 impl ProxyService {
     pub fn new(db: Arc<Database>) -> Self {
         Self {
             db,
             server: Arc::new(RwLock::new(None)),
+            transaction_lock: Arc::new(Mutex::new(())),
             app_handle: Arc::new(RwLock::new(None)),
             switch_locks: SwitchLockManager::new(),
         }
@@ -117,6 +250,7 @@ impl ProxyService {
         );
     }
 
+    #[cfg(test)]
     fn apply_claude_takeover_fields_with_policy(
         config: &mut Value,
         proxy_url: &str,
@@ -514,8 +648,263 @@ impl ProxyService {
         self.switch_locks.lock_for_app(app_type).await
     }
 
+    pub(crate) async fn lock_transaction(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.transaction_lock.clone().lock_owned().await
+    }
+
+    async fn delete_proxy_live_backups(&self) -> Result<(), String> {
+        let mut errors = Vec::new();
+        for app_type in ["claude", "codex", "gemini", "grokbuild"] {
+            if let Err(error) = self.db.delete_live_backup(app_type).await {
+                errors.push(format!("删除 {app_type} Live 备份失败: {error}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    pub(crate) async fn snapshot_transaction_state(
+        &self,
+    ) -> Result<ProxyTransactionSnapshot, String> {
+        let live_files = [
+            get_claude_settings_path(),
+            crate::codex_config::get_codex_config_path(),
+            crate::codex_config::get_codex_auth_path(),
+            crate::codex_config::get_codex_model_catalog_path(),
+            crate::gemini_config::get_gemini_env_path(),
+            crate::grok_config::get_grok_config_path(),
+        ]
+        .into_iter()
+        .map(ProxyFileSnapshot::capture)
+        .collect::<Result<Vec<_>, _>>()?;
+
+        let proxy_config = self
+            .db
+            .get_proxy_config()
+            .await
+            .map_err(|error| format!("读取代理配置快照失败: {error}"))?;
+        let global_config = self
+            .db
+            .get_global_proxy_config()
+            .await
+            .map_err(|error| format!("读取全局代理配置快照失败: {error}"))?;
+
+        let mut app_configs = Vec::new();
+        let mut live_backups = Vec::new();
+        for app_type in [
+            AppType::Claude,
+            AppType::Codex,
+            AppType::Gemini,
+            AppType::GrokBuild,
+        ] {
+            let app_type_str = app_type.as_str();
+            app_configs.push(
+                self.db
+                    .get_proxy_config_for_app(app_type_str)
+                    .await
+                    .map_err(|error| format!("读取 {app_type_str} 代理配置快照失败: {error}"))?,
+            );
+            live_backups.push((
+                app_type_str.to_string(),
+                self.db
+                    .get_live_backup(app_type_str)
+                    .await
+                    .map_err(|error| format!("读取 {app_type_str} Live 备份快照失败: {error}"))?,
+            ));
+        }
+
+        let status = self.get_status().await?;
+        let runtime = status.running.then_some(ProxyRuntimeSnapshot {
+            address: status.address,
+            port: status.port,
+        });
+
+        Ok(ProxyTransactionSnapshot {
+            proxy_config,
+            global_config,
+            app_configs,
+            live_backups,
+            live_files,
+            runtime,
+        })
+    }
+
+    pub(crate) async fn restore_transaction_state(
+        &self,
+        snapshot: &ProxyTransactionSnapshot,
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+        let current_status = self.get_status().await.unwrap_or_default();
+        let runtime_matches = snapshot.runtime.as_ref().is_some_and(|expected| {
+            current_status.running
+                && current_status.address == expected.address
+                && current_status.port == expected.port
+        });
+
+        if current_status.running && !runtime_matches {
+            if let Err(error) = self.stop_runtime_only().await {
+                errors.push(format!("停止当前代理监听器失败: {error}"));
+            }
+        }
+
+        if let Err(error) = self
+            .db
+            .update_proxy_config(snapshot.proxy_config.clone())
+            .await
+        {
+            errors.push(format!("恢复原代理配置失败: {error}"));
+        }
+
+        for app_config in &snapshot.app_configs {
+            if let Err(error) = self
+                .db
+                .update_proxy_config_for_app(app_config.clone())
+                .await
+            {
+                errors.push(format!(
+                    "恢复 {} 应用代理配置失败: {error}",
+                    app_config.app_type
+                ));
+            }
+        }
+
+        for (app_type, backup) in &snapshot.live_backups {
+            let result = match backup {
+                Some(backup) => {
+                    self.db
+                        .save_live_backup(app_type, &backup.original_config)
+                        .await
+                }
+                None => self.db.delete_live_backup(app_type).await,
+            };
+            if let Err(error) = result {
+                errors.push(format!("恢复 {app_type} Live 备份失败: {error}"));
+            }
+        }
+
+        for file in &snapshot.live_files {
+            if let Err(error) = file.restore_if_changed() {
+                errors.push(error);
+            }
+        }
+
+        match &snapshot.runtime {
+            Some(expected) => {
+                let status = self.get_status().await.unwrap_or_default();
+                if status.running
+                    && status.address == expected.address
+                    && status.port == expected.port
+                {
+                    if let Some(server) = self.server.read().await.as_ref() {
+                        server.apply_runtime_config(&snapshot.proxy_config).await;
+                    }
+                } else if !status.running {
+                    if let Err(error) = self
+                        .start_runtime_at(&snapshot.proxy_config, &expected.address, expected.port)
+                        .await
+                    {
+                        errors.push(format!(
+                            "恢复原代理监听地址 {}:{} 失败: {error}",
+                            expected.address, expected.port
+                        ));
+                    }
+                } else {
+                    errors.push(format!(
+                        "当前代理仍监听于 {}:{}，无法恢复 {}:{}",
+                        status.address, status.port, expected.address, expected.port
+                    ));
+                }
+            }
+            None => {
+                if self.is_running().await {
+                    if let Err(error) = self.stop_runtime_only().await {
+                        errors.push(format!("停止本次新启动的代理失败: {error}"));
+                    }
+                }
+            }
+        }
+
+        if let Err(error) = self
+            .db
+            .update_global_proxy_config(snapshot.global_config.clone())
+            .await
+        {
+            errors.push(format!("恢复全局代理配置失败: {error}"));
+        }
+
+        errors
+    }
+
+    async fn stop_runtime_only(&self) -> Result<(), String> {
+        let mut server_guard = self.server.write().await;
+        let Some(server) = server_guard.as_ref() else {
+            return Ok(());
+        };
+        let stop_result = server
+            .stop()
+            .await
+            .map_err(|error| format!("停止代理服务器失败: {error}"));
+        server_guard.take();
+        stop_result?;
+        Ok(())
+    }
+
+    async fn start_runtime_at(
+        &self,
+        config: &ProxyConfig,
+        address: &str,
+        port: u16,
+    ) -> Result<(), String> {
+        let mut server_guard = self.server.write().await;
+        if server_guard.is_some() {
+            return Err("代理服务器已在运行".to_string());
+        }
+        let mut runtime_config = config.clone();
+        runtime_config.listen_address = address.to_string();
+        runtime_config.listen_port = port;
+        let app_handle = self.app_handle.read().await.clone();
+        let server = ProxyServer::new(runtime_config, self.db.clone(), app_handle);
+        let info = server
+            .start()
+            .await
+            .map_err(|error| format!("启动代理服务器失败: {error}"))?;
+        if info.address != address || info.port != port {
+            let _ = server.stop().await;
+            return Err(format!(
+                "代理监听地址恢复不一致，期望 {address}:{port}，实际 {}:{}",
+                info.address, info.port
+            ));
+        }
+        *server_guard = Some(server);
+        Ok(())
+    }
+
+    async fn finish_transaction<T>(
+        &self,
+        snapshot: &ProxyTransactionSnapshot,
+        result: Result<T, String>,
+    ) -> Result<T, String> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(primary_error) => {
+                let restore_errors = self.restore_transaction_state(snapshot).await;
+                Err(with_state_restore_errors(primary_error, restore_errors))
+            }
+        }
+    }
+
     /// 启动代理服务器
     pub async fn start(&self) -> Result<ProxyServerInfo, String> {
+        let _transaction = self.lock_transaction().await;
+        let snapshot = self.snapshot_transaction_state().await?;
+        let result = self.start_inner().await;
+        self.finish_transaction(&snapshot, result).await
+    }
+
+    pub(crate) async fn start_inner(&self) -> Result<ProxyServerInfo, String> {
         // 1. 启动时自动设置 proxy_enabled = true
         let mut global_config = self
             .db
@@ -539,7 +928,8 @@ impl ProxyService {
             .map_err(|e| format!("获取代理配置失败: {e}"))?;
 
         // 3. 若已在运行：确保持久化状态（如需要）并返回当前信息
-        if let Some(server) = self.server.read().await.as_ref() {
+        let mut server_guard = self.server.write().await;
+        if let Some(server) = server_guard.as_ref() {
             let status = server.get_status().await;
             return Ok(ProxyServerInfo {
                 address: status.address,
@@ -565,7 +955,7 @@ impl ProxyService {
         }
 
         // 5. 保存服务器实例
-        *self.server.write().await = Some(server);
+        *server_guard = Some(server);
 
         log::info!("代理服务器已启动: {}:{}", info.address, info.port);
         Ok(info)
@@ -598,19 +988,26 @@ impl ProxyService {
             return Ok(false);
         }
 
-        self.start().await?;
+        self.start_inner().await?;
         Ok(true)
     }
 
     /// 启动代理服务器（带 Live 配置接管）
     pub async fn start_with_takeover(&self) -> Result<ProxyServerInfo, String> {
+        let _transaction = self.lock_transaction().await;
+        let snapshot = self.snapshot_transaction_state().await?;
+        let result = self.start_with_takeover_inner().await;
+        self.finish_transaction(&snapshot, result).await
+    }
+
+    async fn start_with_takeover_inner(&self) -> Result<ProxyServerInfo, String> {
         // 1. 备份各应用的 Live 配置
         self.backup_live_configs().await?;
 
         // 2. 同步 Live 配置中的 Token 到数据库（确保代理能读到最新的 Token）
         if let Err(e) = self.sync_live_to_providers().await {
             // 同步失败时尚未写入接管配置，但备份可能包含敏感信息，尽量清理
-            if let Err(clean_err) = self.db.delete_all_live_backups().await {
+            if let Err(clean_err) = self.delete_proxy_live_backups().await {
                 log::warn!("清理 Live 备份失败: {clean_err}");
             }
             return Err(e);
@@ -621,7 +1018,7 @@ impl ProxyService {
             match self.start_before_takeover_if_ephemeral_port().await {
                 Ok(started) => started,
                 Err(e) => {
-                    if let Err(clean_err) = self.db.delete_all_live_backups().await {
+                    if let Err(clean_err) = self.delete_proxy_live_backups().await {
                         log::warn!("清理 Live 备份失败: {clean_err}");
                     }
                     return Err(e);
@@ -631,11 +1028,11 @@ impl ProxyService {
         // 3. 在写入接管配置之前先落盘接管标志：
         //    这样即使在接管过程中断电/kill，下次启动也能检测到并自动恢复。
         if let Err(e) = self.db.set_live_takeover_active(true).await {
-            if let Err(clean_err) = self.db.delete_all_live_backups().await {
+            if let Err(clean_err) = self.delete_proxy_live_backups().await {
                 log::warn!("清理 Live 备份失败: {clean_err}");
             }
             if started_proxy_before_takeover {
-                let _ = self.stop().await;
+                let _ = self.stop_inner().await;
             }
             return Err(format!("设置接管状态失败: {e}"));
         }
@@ -647,20 +1044,20 @@ impl ProxyService {
             match self.restore_live_configs().await {
                 Ok(()) => {
                     let _ = self.db.set_live_takeover_active(false).await;
-                    let _ = self.db.delete_all_live_backups().await;
+                    let _ = self.delete_proxy_live_backups().await;
                 }
                 Err(restore_err) => {
                     log::error!("恢复原始配置失败，将保留备份以便下次启动恢复: {restore_err}");
                 }
             }
             if started_proxy_before_takeover {
-                let _ = self.stop().await;
+                let _ = self.stop_inner().await;
             }
             return Err(e);
         }
 
         // 5. 启动代理服务器
-        match self.start().await {
+        match self.start_inner().await {
             Ok(info) => Ok(info),
             Err(e) => {
                 // 启动失败，恢复原始配置
@@ -668,14 +1065,14 @@ impl ProxyService {
                 match self.restore_live_configs().await {
                     Ok(()) => {
                         let _ = self.db.set_live_takeover_active(false).await;
-                        let _ = self.db.delete_all_live_backups().await;
+                        let _ = self.delete_proxy_live_backups().await;
                     }
                     Err(restore_err) => {
                         log::error!("恢复原始配置失败，将保留备份以便下次启动恢复: {restore_err}");
                     }
                 }
                 if started_proxy_before_takeover {
-                    let _ = self.stop().await;
+                    let _ = self.stop_inner().await;
                 }
                 Err(e)
             }
@@ -690,25 +1087,25 @@ impl ProxyService {
             .get_proxy_config_for_app("claude")
             .await
             .map(|c| c.enabled)
-            .unwrap_or(false);
+            .map_err(|e| format!("读取 claude 接管状态失败: {e}"))?;
         let codex_enabled = self
             .db
             .get_proxy_config_for_app("codex")
             .await
             .map(|c| c.enabled)
-            .unwrap_or(false);
+            .map_err(|e| format!("读取 codex 接管状态失败: {e}"))?;
         let gemini_enabled = self
             .db
             .get_proxy_config_for_app("gemini")
             .await
             .map(|c| c.enabled)
-            .unwrap_or(false);
+            .map_err(|e| format!("读取 gemini 接管状态失败: {e}"))?;
         let grokbuild_enabled = self
             .db
             .get_proxy_config_for_app("grokbuild")
             .await
             .map(|c| c.enabled)
-            .unwrap_or(false);
+            .map_err(|e| format!("读取 grokbuild 接管状态失败: {e}"))?;
         // OpenCode and OpenClaw don't support proxy features, always return false
         let opencode_enabled = false;
         let openclaw_enabled = false;
@@ -728,6 +1125,36 @@ impl ProxyService {
     /// - 开启：自动启动代理服务，仅接管当前 app 的 Live 配置
     /// - 关闭：仅恢复当前 app 的 Live 配置；若无其它接管，则自动停止代理服务
     pub async fn set_takeover_for_app(&self, app_type: &str, enabled: bool) -> Result<(), String> {
+        let _transaction = self.lock_transaction().await;
+        let snapshot = self.snapshot_transaction_state().await?;
+        let result = self.set_takeover_for_app_inner(app_type, enabled).await;
+        self.finish_transaction(&snapshot, result).await
+    }
+
+    pub(crate) async fn set_takeover_for_app_inner(
+        &self,
+        app_type: &str,
+        enabled: bool,
+    ) -> Result<(), String> {
+        self.set_takeover_for_app_inner_with_health_reset(app_type, enabled, true)
+            .await
+    }
+
+    pub(crate) async fn set_takeover_for_app_inner_preserving_health(
+        &self,
+        app_type: &str,
+        enabled: bool,
+    ) -> Result<(), String> {
+        self.set_takeover_for_app_inner_with_health_reset(app_type, enabled, false)
+            .await
+    }
+
+    async fn set_takeover_for_app_inner_with_health_reset(
+        &self,
+        app_type: &str,
+        enabled: bool,
+        reset_health_on_disable: bool,
+    ) -> Result<(), String> {
         let app = AppType::from_str(app_type).map_err(|e| format!("无效的应用类型: {e}"))?;
         let app_type_str = app.as_str();
         let _guard = self.switch_locks.lock_for_app(app_type_str).await;
@@ -735,7 +1162,7 @@ impl ProxyService {
         if enabled {
             // 1) 代理服务未运行则自动启动
             if !self.is_running().await {
-                self.start().await?;
+                self.start_inner().await?;
             }
 
             // 2) 已接管则直接返回（幂等）；但如果缺少备份或占位符残留，需要重建接管
@@ -785,8 +1212,13 @@ impl ProxyService {
 
                 // 4) 同步 Live Token 到数据库（仅当前 app）
                 if let Err(e) = self.sync_live_to_provider(&app).await {
-                    let _ = self.db.delete_live_backup(app_type_str).await;
-                    return Err(e);
+                    let mut cleanup_errors = Vec::new();
+                    if let Err(cleanup_error) = self.db.delete_live_backup(app_type_str).await {
+                        cleanup_errors.push(format!(
+                            "清理 {app_type_str} Live 备份失败: {cleanup_error}"
+                        ));
+                    }
+                    return Err(with_state_restore_errors(e, cleanup_errors));
                 }
             }
 
@@ -796,12 +1228,20 @@ impl ProxyService {
                 match self.restore_live_config_for_app_inner(&app).await {
                     Ok(()) => {
                         // 恢复成功才清理备份，避免失败场景下丢失唯一可回滚来源
-                        let _ = self.db.delete_live_backup(app_type_str).await;
+                        if let Err(cleanup_error) = self.db.delete_live_backup(app_type_str).await {
+                            return Err(with_state_restore_errors(
+                                e,
+                                vec![format!(
+                                    "清理 {app_type_str} Live 备份失败: {cleanup_error}"
+                                )],
+                            ));
+                        }
                     }
                     Err(restore_err) => {
-                        log::error!(
-                            "{app_type_str} 恢复 Live 配置失败，将保留备份以便下次启动恢复: {restore_err}"
-                        );
+                        return Err(with_state_restore_errors(
+                            e,
+                            vec![format!("恢复 {app_type_str} Live 配置失败: {restore_err}")],
+                        ));
                     }
                 }
                 return Err(e);
@@ -819,8 +1259,11 @@ impl ProxyService {
                 .await
                 .map_err(|e| format!("设置 {app_type_str} enabled 状态失败: {e}"))?;
 
-            // 7) 兼容旧逻辑：写入 any-of 标志（失败不影响功能）
-            let _ = self.db.set_live_takeover_active(true).await;
+            // 7) 兼容旧逻辑：写入 any-of 标志
+            self.db
+                .set_live_takeover_active(true)
+                .await
+                .map_err(|e| format!("设置接管状态失败: {e}"))?;
 
             self.refresh_active_target_from_current_provider(&app).await;
 
@@ -887,11 +1330,13 @@ impl ProxyService {
             .await
             .map_err(|e| format!("清除 {app_type_str} enabled 状态失败: {e}"))?;
 
-        // 4) 清除该应用的健康状态（关闭代理时重置队列状态）
-        self.db
-            .clear_provider_health_for_app(app_type_str)
-            .await
-            .map_err(|e| format!("清除 {app_type_str} 健康状态失败: {e}"))?;
+        // 4) 用户主动关闭时重置队列健康状态；事务回滚保留故障历史。
+        if reset_health_on_disable {
+            self.db
+                .clear_provider_health_for_app(app_type_str)
+                .await
+                .map_err(|e| format!("清除 {app_type_str} 健康状态失败: {e}"))?;
+        }
 
         // 5) 若无其它接管，更新旧标志，并停止代理服务
         // 检查是否还有其它 app 的 enabled = true
@@ -902,11 +1347,14 @@ impl ProxyService {
             .map_err(|e| format!("检查接管状态失败: {e}"))?;
 
         if !any_enabled {
-            let _ = self.db.set_live_takeover_active(false).await;
+            self.db
+                .set_live_takeover_active(false)
+                .await
+                .map_err(|e| format!("清除接管状态失败: {e}"))?;
 
             if self.is_running().await {
                 // 此时没有任何 app 处于接管状态，停止服务即可
-                let _ = self.stop().await;
+                self.stop_inner().await?;
             }
         }
 
@@ -1259,11 +1707,22 @@ impl ProxyService {
 
     /// 停止代理服务器
     pub async fn stop(&self) -> Result<(), String> {
-        if let Some(server) = self.server.write().await.take() {
-            server
+        let _transaction = self.lock_transaction().await;
+        let snapshot = self.snapshot_transaction_state().await?;
+        let result = self.stop_inner().await;
+        self.finish_transaction(&snapshot, result).await
+    }
+
+    pub(crate) async fn stop_inner(&self) -> Result<(), String> {
+        let mut server_guard = self.server.write().await;
+        if let Some(server) = server_guard.as_ref() {
+            let stop_result = server
                 .stop()
                 .await
-                .map_err(|e| format!("停止代理服务器失败: {e}"))?;
+                .map_err(|e| format!("停止代理服务器失败: {e}"));
+            server_guard.take();
+            drop(server_guard);
+            stop_result?;
 
             // 停止时设置 proxy_enabled = false
             let mut global_config = self
@@ -1274,9 +1733,10 @@ impl ProxyService {
 
             if global_config.proxy_enabled {
                 global_config.proxy_enabled = false;
-                if let Err(e) = self.db.update_global_proxy_config(global_config).await {
-                    log::warn!("更新代理总开关失败: {e}");
-                }
+                self.db
+                    .update_global_proxy_config(global_config)
+                    .await
+                    .map_err(|e| format!("更新代理总开关失败: {e}"))?;
             }
 
             log::info!("代理服务器已停止");
@@ -1290,43 +1750,66 @@ impl ProxyService {
     ///
     /// 会清除 settings 表中的代理状态，下次启动不会自动恢复。
     pub async fn stop_with_restore(&self) -> Result<(), String> {
+        let _transaction = self.lock_transaction().await;
+        let snapshot = self.snapshot_transaction_state().await?;
+        let result = self.stop_with_restore_inner().await;
+        self.finish_transaction(&snapshot, result).await
+    }
+
+    pub(crate) async fn stop_with_restore_inner(&self) -> Result<(), String> {
+        let mut errors = Vec::new();
         // 1. 停止代理服务器（即使未运行也继续执行恢复逻辑）
-        if let Err(e) = self.stop().await {
-            log::warn!("停止代理服务器失败（将继续恢复 Live 配置）: {e}");
-        }
-
-        // 2. 恢复原始 Live 配置
-        self.restore_live_configs().await?;
-
-        // 3. 清除 proxy_config 表中的接管状态（兼容旧版）
-        self.db
-            .set_live_takeover_active(false)
-            .await
-            .map_err(|e| format!("清除接管状态失败: {e}"))?;
-
-        // 4. 清除所有应用的 enabled 状态（用户手动关闭，不需要下次自动恢复）
-        for app_type in ["claude", "codex", "gemini", "grokbuild"] {
-            if let Ok(mut config) = self.db.get_proxy_config_for_app(app_type).await {
-                if config.enabled {
-                    config.enabled = false;
-                    if let Err(e) = self.db.update_proxy_config_for_app(config).await {
-                        log::warn!("清除 {app_type} enabled 状态失败: {e}");
-                    }
-                }
+        if self.is_running().await {
+            if let Err(e) = self.stop_inner().await {
+                errors.push(e);
             }
         }
 
-        // 5. 删除备份
-        self.db
-            .delete_all_live_backups()
-            .await
-            .map_err(|e| format!("删除备份失败: {e}"))?;
+        // 2. 恢复原始 Live 配置
+        if let Err(e) = self.restore_live_configs().await {
+            errors.push(e);
+        }
+
+        // 3. 清除 proxy_config 表中的接管状态（兼容旧版）
+        if let Err(e) = self.db.set_live_takeover_active(false).await {
+            errors.push(format!("清除接管状态失败: {e}"));
+        }
+
+        // 4. 清除所有应用的 enabled 状态（用户手动关闭，不需要下次自动恢复）
+        for app_type in ["claude", "codex", "gemini", "grokbuild"] {
+            match self.db.get_proxy_config_for_app(app_type).await {
+                Ok(mut config) if config.enabled => {
+                    config.enabled = false;
+                    if let Err(e) = self.db.update_proxy_config_for_app(config).await {
+                        errors.push(format!("清除 {app_type} enabled 状态失败: {e}"));
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => errors.push(format!("读取 {app_type} enabled 状态失败: {e}")),
+            }
+        }
+
+        if !errors.is_empty() {
+            return Err(errors.join("; "));
+        }
+
+        // 5. 仅删除代理支持的四类备份，保留其它应用的独立备份。
+        if let Err(error) = self.delete_proxy_live_backups().await {
+            errors.push(error);
+        }
+
+        if !errors.is_empty() {
+            return Err(errors.join("; "));
+        }
 
         // 6. 重置健康状态（让健康徽章恢复为正常）
-        self.db
-            .clear_all_provider_health()
-            .await
-            .map_err(|e| format!("重置健康状态失败: {e}"))?;
+        if let Err(e) = self.db.clear_all_provider_health().await {
+            errors.push(format!("重置健康状态失败: {e}"));
+        }
+
+        if !errors.is_empty() {
+            return Err(errors.join("; "));
+        }
 
         // 注意：不清除故障转移队列和开关状态，保留供下次开启代理时使用
         log::info!("代理已停止，Live 配置已恢复");
@@ -1337,32 +1820,59 @@ impl ProxyService {
     ///
     /// 用于程序正常退出时，保留代理状态以便下次启动时自动恢复
     pub async fn stop_with_restore_keep_state(&self) -> Result<(), String> {
+        let _transaction = self.lock_transaction().await;
+        let snapshot = self.snapshot_transaction_state().await?;
+        let result = self.stop_with_restore_keep_state_inner().await;
+        self.finish_transaction(&snapshot, result).await
+    }
+
+    async fn stop_with_restore_keep_state_inner(&self) -> Result<(), String> {
+        let mut errors = Vec::new();
         // 1. 停止代理服务器（即使未运行也继续执行恢复逻辑）
-        if let Err(e) = self.stop().await {
-            log::warn!("停止代理服务器失败（将继续恢复 Live 配置）: {e}");
+        if self.is_running().await {
+            if let Err(e) = self.stop_inner().await {
+                errors.push(e);
+            }
         }
 
         // 2. 恢复原始 Live 配置
-        self.restore_live_configs().await?;
+        if let Err(e) = self.restore_live_configs().await {
+            errors.push(e);
+        }
 
         // 3. 更新 proxy_config 表中的 live_takeover_active 标志（兼容旧版）
         //    注意：保留 proxy_config.enabled 状态，下次启动时自动恢复
-        if let Ok(mut config) = self.db.get_proxy_config().await {
-            config.live_takeover_active = false;
-            let _ = self.db.update_proxy_config(config).await;
+        match self.db.get_proxy_config().await {
+            Ok(mut config) => {
+                config.live_takeover_active = false;
+                if let Err(e) = self.db.update_proxy_config(config).await {
+                    errors.push(format!("清除旧接管状态失败: {e}"));
+                }
+            }
+            Err(e) => errors.push(format!("读取旧接管状态失败: {e}")),
         }
 
-        // 4. 删除备份（Live 配置已恢复，备份不再需要）
-        self.db
-            .delete_all_live_backups()
-            .await
-            .map_err(|e| format!("删除备份失败: {e}"))?;
+        if !errors.is_empty() {
+            return Err(errors.join("; "));
+        }
+
+        // 4. 仅删除代理支持的四类备份，保留其它应用的独立备份。
+        if let Err(error) = self.delete_proxy_live_backups().await {
+            errors.push(error);
+        }
+
+        if !errors.is_empty() {
+            return Err(errors.join("; "));
+        }
 
         // 5. 重置健康状态
-        self.db
-            .clear_all_provider_health()
-            .await
-            .map_err(|e| format!("重置健康状态失败: {e}"))?;
+        if let Err(e) = self.db.clear_all_provider_health().await {
+            errors.push(format!("重置健康状态失败: {e}"));
+        }
+
+        if !errors.is_empty() {
+            return Err(errors.join("; "));
+        }
 
         log::info!("代理已停止，Live 配置已恢复（保留代理状态，下次启动将自动恢复）");
         Ok(())
@@ -1502,6 +2012,33 @@ impl ProxyService {
         Ok((proxy_url, proxy_codex_base_url))
     }
 
+    /// 返回 Codex Agent Role 使用的本地 Responses 代理地址。
+    ///
+    /// 角色路由 Header 只接受 loopback peer，因此 wildcard 监听映射到对应
+    /// 回环地址，显式 LAN-only 监听在投影前被拒绝。
+    pub(crate) async fn codex_proxy_base_url(&self) -> Result<String, String> {
+        let config = self
+            .db
+            .get_proxy_config()
+            .await
+            .map_err(|error| format!("获取代理配置失败: {error}"))?;
+        let connect_host = codex_agent_role_connect_host(&config.listen_address)?;
+        let mut listen_port = config.listen_port;
+        if let Some(server) = self.server.read().await.as_ref() {
+            let status = server.get_status().await;
+            if status.running {
+                listen_port = status.port;
+            }
+        }
+        if listen_port == 0 {
+            return Err(
+                "代理监听端口为 0，但代理服务器尚未运行，无法生成 Codex Agent Role 地址"
+                    .to_string(),
+            );
+        }
+        Ok(format!("http://{connect_host}:{listen_port}/v1"))
+    }
+
     fn apply_grok_takeover_fields(config: &mut Value, proxy_base_url: &str) -> Result<(), String> {
         let config_toml = config
             .get("config")
@@ -1635,77 +2172,6 @@ impl ProxyService {
                 log::info!("Grok Build Live 配置已接管，代理地址: {proxy_grok_base_url}");
             }
             _ => return Err("该应用不支持代理功能".to_string()),
-        }
-
-        Ok(())
-    }
-
-    /// 接管指定应用的 Live 配置（尽力而为：配置不存在/读取失败则跳过）
-    async fn takeover_live_config_best_effort(&self, app_type: &AppType) -> Result<(), String> {
-        let (proxy_url, proxy_codex_base_url) = self.build_proxy_urls().await?;
-        let proxy_grok_base_url = format!("{}/grokbuild/v1", proxy_url.trim_end_matches('/'));
-
-        match app_type {
-            AppType::Claude => {
-                if let Ok(mut live_config) = self.read_claude_live() {
-                    let claude_provider = self
-                        .get_current_provider_for_app(&AppType::Claude)
-                        .ok()
-                        .flatten();
-                    if let Some(provider) = claude_provider.as_ref() {
-                        let provider = self.claude_provider_with_effective_settings(provider)?;
-                        Self::apply_claude_takeover_fields_for_provider(
-                            &mut live_config,
-                            &proxy_url,
-                            &provider,
-                        );
-                    } else {
-                        Self::apply_claude_takeover_fields_with_policy(
-                            &mut live_config,
-                            &proxy_url,
-                            ClaudeTakeoverAuthPolicy::PreserveExistingOrAuthToken,
-                        );
-                    }
-                    let _ = self.write_claude_live(&live_config);
-                }
-            }
-            AppType::Codex => {
-                if let Ok(mut live_config) = self.read_codex_live() {
-                    let codex_provider = self.require_current_provider_for_app(&AppType::Codex)?;
-                    Self::apply_codex_takeover_fields_for_provider(
-                        &mut live_config,
-                        &proxy_codex_base_url,
-                        &codex_provider,
-                    )?;
-
-                    self.write_codex_takeover_live_for_provider(
-                        &live_config,
-                        Some(&codex_provider),
-                    )?;
-                }
-            }
-            AppType::Gemini => {
-                if let Ok(mut live_config) = self.read_gemini_live() {
-                    if let Some(env) = live_config.get_mut("env").and_then(|v| v.as_object_mut()) {
-                        env.insert("GOOGLE_GEMINI_BASE_URL".to_string(), json!(&proxy_url));
-                        env.insert("GEMINI_API_KEY".to_string(), json!(PROXY_TOKEN_PLACEHOLDER));
-                    } else {
-                        live_config["env"] = json!({
-                            "GOOGLE_GEMINI_BASE_URL": &proxy_url,
-                            "GEMINI_API_KEY": PROXY_TOKEN_PLACEHOLDER
-                        });
-                    }
-
-                    let _ = self.write_gemini_live(&live_config);
-                }
-            }
-            AppType::GrokBuild => {
-                if let Ok(mut live_config) = self.read_grok_live() {
-                    Self::apply_grok_takeover_fields(&mut live_config, &proxy_grok_base_url)?;
-                    let _ = self.write_grok_live(&live_config);
-                }
-            }
-            _ => {}
         }
 
         Ok(())
@@ -2156,10 +2622,7 @@ impl ProxyService {
             .map_err(|e| format!("清除接管状态失败: {e}"))?;
 
         // 3. 删除备份
-        self.db
-            .delete_all_live_backups()
-            .await
-            .map_err(|e| format!("删除备份失败: {e}"))?;
+        self.delete_proxy_live_backups().await?;
 
         log::info!("已从异常退出中恢复 Live 配置");
         Ok(())
@@ -3010,8 +3473,13 @@ impl ProxyService {
 
     /// 获取服务器状态
     pub async fn get_status(&self) -> Result<ProxyStatus, String> {
-        if let Some(server) = self.server.read().await.as_ref() {
-            Ok(server.get_status().await)
+        let mut server_guard = self.server.write().await;
+        if let Some(server) = server_guard.as_ref() {
+            let status = server.get_status().await;
+            if !status.running {
+                server_guard.take();
+            }
+            Ok(status)
         } else {
             // 服务器未运行时返回默认状态
             Ok(ProxyStatus {
@@ -3031,6 +3499,13 @@ impl ProxyService {
 
     /// 更新代理配置
     pub async fn update_config(&self, config: &ProxyConfig) -> Result<(), String> {
+        let _transaction = self.lock_transaction().await;
+        let snapshot = self.snapshot_transaction_state().await?;
+        let result = self.update_config_inner(config).await;
+        self.finish_transaction(&snapshot, result).await
+    }
+
+    pub(crate) async fn update_config_inner(&self, config: &ProxyConfig) -> Result<(), String> {
         // 记录旧配置用于判定是否需要重启
         let previous = self
             .db
@@ -3047,22 +3522,33 @@ impl ProxyService {
             .await
             .map_err(|e| format!("保存代理配置失败: {e}"))?;
 
-        // 检查服务器当前状态
-        let mut server_guard = self.server.write().await;
-        if server_guard.is_none() {
-            return Ok(());
-        }
-
-        // 判断是否需要重启（地址或端口变更）
+        // 地址或端口变更必须同步 runtime 与所有 enabled Live 接管。
         let require_restart = new_config.listen_address != previous.listen_address
             || new_config.listen_port != previous.listen_port;
 
+        // 检查服务器当前状态
+        let mut server_guard = self.server.write().await;
+        if server_guard.is_none() {
+            if require_restart {
+                let takeover = self.get_takeover_status().await?;
+                if takeover.claude || takeover.codex || takeover.gemini || takeover.grokbuild {
+                    return Err(
+                        "存在已启用的 Live 接管，但代理服务器未运行，拒绝留下陈旧代理地址"
+                            .to_string(),
+                    );
+                }
+            }
+            return Ok(());
+        }
+
         if require_restart {
-            if let Some(server) = server_guard.take() {
-                server
+            if let Some(server) = server_guard.as_ref() {
+                let stop_result = server
                     .stop()
                     .await
-                    .map_err(|e| format!("重启前停止代理服务器失败: {e}"))?;
+                    .map_err(|e| format!("重启前停止代理服务器失败: {e}"));
+                server_guard.take();
+                stop_result?;
             }
 
             let app_handle = self.app_handle.read().await.clone();
@@ -3084,33 +3570,23 @@ impl ProxyService {
 
             // 如果当前存在任意 app 的 Live 接管，需要同步更新 Live 中的代理地址（否则客户端仍指向旧端口）
             drop(server_guard);
-            if let Ok(takeover) = self.get_takeover_status().await {
-                let mut updated_any = false;
+            let takeover = self.get_takeover_status().await?;
+            let mut updated_any = false;
 
-                if takeover.claude {
-                    self.takeover_live_config_best_effort(&AppType::Claude)
-                        .await?;
+            for (enabled, app_type) in [
+                (takeover.claude, AppType::Claude),
+                (takeover.codex, AppType::Codex),
+                (takeover.gemini, AppType::Gemini),
+                (takeover.grokbuild, AppType::GrokBuild),
+            ] {
+                if enabled {
+                    self.takeover_live_config_strict(&app_type).await?;
                     updated_any = true;
                 }
-                if takeover.codex {
-                    self.takeover_live_config_best_effort(&AppType::Codex)
-                        .await?;
-                    updated_any = true;
-                }
-                if takeover.gemini {
-                    self.takeover_live_config_best_effort(&AppType::Gemini)
-                        .await?;
-                    updated_any = true;
-                }
-                if takeover.grokbuild {
-                    self.takeover_live_config_best_effort(&AppType::GrokBuild)
-                        .await?;
-                    updated_any = true;
-                }
+            }
 
-                if updated_any {
-                    log::info!("已同步更新 Live 配置中的代理地址");
-                }
+            if updated_any {
+                log::info!("已严格同步更新 Live 配置中的代理地址");
             }
 
             return Ok(());
@@ -3124,7 +3600,15 @@ impl ProxyService {
 
     /// 检查服务器是否正在运行
     pub async fn is_running(&self) -> bool {
-        self.server.read().await.is_some()
+        let mut server_guard = self.server.write().await;
+        let Some(server) = server_guard.as_ref() else {
+            return false;
+        };
+        let running = server.get_status().await.running;
+        if !running {
+            server_guard.take();
+        }
+        running
     }
 
     /// 热更新熔断器配置
@@ -3186,6 +3670,34 @@ mod tests {
     use std::env;
     use tempfile::TempDir;
 
+    #[test]
+    fn codex_agent_role_maps_wildcard_and_loopback_listeners_to_loopback_urls() {
+        for (listen_address, expected_host) in [
+            ("0.0.0.0", "127.0.0.1"),
+            ("::", "[::1]"),
+            ("127.0.0.1", "127.0.0.1"),
+            ("::1", "[::1]"),
+        ] {
+            assert_eq!(
+                codex_agent_role_connect_host(listen_address)
+                    .expect("wildcard or loopback listener must be accepted"),
+                expected_host
+            );
+        }
+    }
+
+    #[test]
+    fn codex_agent_role_rejects_explicit_lan_listeners() {
+        for listen_address in ["192.0.2.10", "2001:db8::10"] {
+            let error = codex_agent_role_connect_host(listen_address)
+                .expect_err("a single LAN-only listener is unreachable through loopback");
+            assert!(
+                error.starts_with(&format!("{CODEX_AGENT_ROLE_LOOPBACK_REQUIRED}:")),
+                "LAN rejection must expose the stable marker: {error}"
+            );
+        }
+    }
+
     struct TempHome {
         #[allow(dead_code)]
         dir: TempDir,
@@ -3231,6 +3743,151 @@ mod tests {
                 None => env::remove_var("CC_SWITCH_TEST_HOME"),
             }
         }
+    }
+
+    fn transaction_live_paths() -> Vec<PathBuf> {
+        vec![
+            get_claude_settings_path(),
+            crate::codex_config::get_codex_config_path(),
+            crate::codex_config::get_codex_auth_path(),
+            crate::codex_config::get_codex_model_catalog_path(),
+            crate::gemini_config::get_gemini_env_path(),
+            crate::grok_config::get_grok_config_path(),
+        ]
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn transaction_snapshot_restores_exact_bytes_and_missing_files() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("in-memory database"));
+        let service = ProxyService::new(db);
+        let paths = transaction_live_paths();
+        let missing_path = crate::codex_config::get_codex_model_catalog_path();
+        let mut expected = Vec::new();
+
+        for (index, path) in paths.iter().enumerate() {
+            if path == &missing_path {
+                continue;
+            }
+            std::fs::create_dir_all(path.parent().expect("live file parent"))
+                .expect("create live file parent");
+            let bytes = format!("exact-{index}\r\n\0tail").into_bytes();
+            std::fs::write(path, &bytes).expect("seed exact live bytes");
+            expected.push((path.clone(), bytes));
+        }
+
+        let snapshot = service
+            .snapshot_transaction_state()
+            .await
+            .expect("capture exact transaction snapshot");
+        assert_eq!(snapshot.live_files.len(), paths.len());
+
+        for path in &paths {
+            std::fs::create_dir_all(path.parent().expect("live file parent"))
+                .expect("create live file parent");
+            std::fs::write(path, b"mutated").expect("mutate live file");
+        }
+
+        let errors = service.restore_transaction_state(&snapshot).await;
+        assert!(errors.is_empty(), "restore errors: {errors:?}");
+        for (path, bytes) in expected {
+            assert_eq!(std::fs::read(path).expect("read restored bytes"), bytes);
+        }
+        assert!(
+            !missing_path.exists(),
+            "a file missing at snapshot time must be removed during rollback"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn transaction_snapshot_rejects_directory_before_start_mutation() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("in-memory database"));
+        let service = ProxyService::new(db.clone());
+        let claude_path = get_claude_settings_path();
+        std::fs::create_dir_all(&claude_path).expect("create conflicting directory");
+        let before = db
+            .get_global_proxy_config()
+            .await
+            .expect("read global config before start");
+
+        let error = service
+            .start()
+            .await
+            .expect_err("directory snapshot target must reject start");
+        let after = db
+            .get_global_proxy_config()
+            .await
+            .expect("read global config after rejected start");
+
+        assert!(error.contains("不是普通文件"), "{error}");
+        assert_eq!(after.proxy_enabled, before.proxy_enabled);
+        assert!(!service.is_running().await);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stop_restore_preserves_non_proxy_backups() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("in-memory database"));
+        let service = ProxyService::new(db.clone());
+        db.save_live_backup("other-app", "other-backup")
+            .await
+            .expect("seed unrelated backup");
+
+        service
+            .stop_with_restore()
+            .await
+            .expect("restore while stopped");
+
+        assert_eq!(
+            db.get_live_backup("other-app")
+                .await
+                .expect("read unrelated backup")
+                .expect("unrelated backup must remain")
+                .original_config,
+            "other-backup"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn restore_failure_preserves_proxy_and_non_proxy_backups() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("in-memory database"));
+        let service = ProxyService::new(db.clone());
+        db.save_live_backup("claude", "not-json")
+            .await
+            .expect("seed invalid Claude backup");
+        db.save_live_backup("other-app", "other-backup")
+            .await
+            .expect("seed unrelated backup");
+
+        service
+            .stop_with_restore()
+            .await
+            .expect_err("invalid restore backup must fail");
+
+        assert!(
+            db.get_live_backup("claude")
+                .await
+                .expect("read Claude backup")
+                .is_some(),
+            "failed restore must retain the proxy backup"
+        );
+        assert!(
+            db.get_live_backup("other-app")
+                .await
+                .expect("read unrelated backup")
+                .is_some(),
+            "failed restore must retain unrelated backups"
+        );
     }
 
     fn assert_env_str(env: &Map<String, Value>, key: &str, expected: Option<&str>) {
@@ -3729,6 +4386,62 @@ mod tests {
             .stop_with_restore()
             .await
             .expect("stop proxy and restore live config");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rollback_takeover_disable_preserves_codex_provider_health() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db.clone());
+        let provider = Provider::with_id(
+            "role-owner".to_string(),
+            "Role Owner".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "test-key" },
+                "config": "model_provider = \"test\"\n[model_providers.test]\nbase_url = \"https://example.invalid/v1\"\nwire_api = \"responses\"\n"
+            }),
+            None,
+        );
+        db.save_provider(AppType::Codex.as_str(), &provider)
+            .expect("save provider");
+        db.set_current_provider(AppType::Codex.as_str(), &provider.id)
+            .expect("set database current provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some(&provider.id))
+            .expect("set local current provider");
+        crate::codex_config::write_codex_live_atomic(
+            &json!({ "OPENAI_API_KEY": "live-key" }),
+            Some("model = \"gpt-5.4\"\n"),
+        )
+        .expect("seed Codex live files");
+
+        service
+            .set_takeover_for_app(AppType::Codex.as_str(), true)
+            .await
+            .expect("enable Codex takeover");
+        db.update_provider_health_with_threshold(
+            &provider.id,
+            AppType::Codex.as_str(),
+            false,
+            Some("seed failure".to_string()),
+            1,
+        )
+        .await
+        .expect("seed provider health");
+
+        service
+            .set_takeover_for_app_inner_preserving_health(AppType::Codex.as_str(), false)
+            .await
+            .expect("rollback takeover without clearing health");
+
+        let health = db
+            .get_provider_health(&provider.id, AppType::Codex.as_str())
+            .await
+            .expect("read provider health");
+        assert_eq!(health.consecutive_failures, 1);
+        assert!(!health.is_healthy);
     }
 
     #[test]

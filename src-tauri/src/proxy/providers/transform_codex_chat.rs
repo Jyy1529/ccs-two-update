@@ -586,6 +586,11 @@ fn append_responses_input_as_chat_messages(
         &mut pending_reasoning,
         &mut last_assistant_index,
     );
+    attach_pending_reasoning_to_previous_assistant(
+        messages,
+        last_assistant_index,
+        &mut pending_reasoning,
+    );
     backfill_tool_call_reasoning_placeholders(messages);
     Ok(())
 }
@@ -650,12 +655,7 @@ fn append_responses_item_as_chat_message(
             }));
         }
         Some("reasoning") => {
-            let reasoning = responses_reasoning_item_text(item);
-            let attached_to_previous = pending_tool_calls.is_empty()
-                && attach_reasoning_to_last_assistant(messages, *last_assistant_index, &reasoning);
-            if !attached_to_previous {
-                append_pending_reasoning(pending_reasoning, reasoning);
-            }
+            append_pending_reasoning(pending_reasoning, responses_reasoning_item_text(item));
         }
         Some("input_text" | "input_image" | "input_file" | "input_audio") => {
             flush_pending_tool_calls(
@@ -679,8 +679,12 @@ fn append_responses_item_as_chat_message(
                 update_last_assistant_index(messages, &message, last_assistant_index);
                 messages.push(message);
                 return Ok(());
-            } else if pending_reasoning.is_some() {
-                pending_reasoning.take();
+            } else {
+                attach_pending_reasoning_to_previous_assistant(
+                    messages,
+                    *last_assistant_index,
+                    pending_reasoning,
+                );
             }
             update_last_assistant_index(messages, &message, last_assistant_index);
             messages.push(message);
@@ -693,7 +697,12 @@ fn append_responses_item_as_chat_message(
                 last_assistant_index,
             );
             if item.get("role").is_some() || item.get("content").is_some() {
-                let message = responses_message_item_to_chat_message(item, pending_reasoning);
+                let message = responses_message_item_to_chat_message(
+                    item,
+                    pending_reasoning,
+                    messages,
+                    *last_assistant_index,
+                );
                 update_last_assistant_index(messages, &message, last_assistant_index);
                 messages.push(message);
             }
@@ -706,7 +715,12 @@ fn append_responses_item_as_chat_message(
                 last_assistant_index,
             );
             if item.get("role").is_some() || item.get("content").is_some() {
-                let message = responses_message_item_to_chat_message(item, pending_reasoning);
+                let message = responses_message_item_to_chat_message(
+                    item,
+                    pending_reasoning,
+                    messages,
+                    *last_assistant_index,
+                );
                 update_last_assistant_index(messages, &message, last_assistant_index);
                 messages.push(message);
             }
@@ -739,6 +753,8 @@ fn flush_pending_tool_calls(
 fn responses_message_item_to_chat_message(
     item: &Value,
     pending_reasoning: &mut Option<String>,
+    messages: &mut [Value],
+    last_assistant_index: Option<usize>,
 ) -> Value {
     let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
     let chat_role = responses_role_to_chat_role(role);
@@ -755,8 +771,12 @@ fn responses_message_item_to_chat_message(
     if chat_role == "assistant" {
         append_pending_reasoning(pending_reasoning, responses_message_reasoning_text(item));
         attach_pending_reasoning_to_assistant(&mut message, pending_reasoning);
-    } else if pending_reasoning.is_some() {
-        pending_reasoning.take();
+    } else {
+        attach_pending_reasoning_to_previous_assistant(
+            messages,
+            last_assistant_index,
+            pending_reasoning,
+        );
     }
 
     message
@@ -850,7 +870,7 @@ fn attach_pending_reasoning_to_assistant(
 
 /// 在所有 input 处理完毕后，对仍缺 `reasoning_content` 的 assistant tool-call 消息补占位。
 /// 必须作为管线末端的最终兜底执行：真实 reasoning 可能以尾随 `reasoning` item 的形式经
-/// `attach_reasoning_to_last_assistant` 回填，过早注入占位会被 `append_reasoning_content`
+/// 尾部 reasoning 回填，过早注入占位会被 `append_reasoning_content`
 /// 追加而污染真实思考。
 fn backfill_tool_call_reasoning_placeholders(messages: &mut [Value]) {
     for message in messages.iter_mut() {
@@ -887,34 +907,28 @@ fn ensure_tool_call_reasoning_content(message: &mut Value) {
     }
 }
 
-fn attach_reasoning_to_last_assistant(
+fn attach_pending_reasoning_to_previous_assistant(
     messages: &mut [Value],
     last_assistant_index: Option<usize>,
-    reasoning: &Option<String>,
-) -> bool {
-    let Some(reasoning) = reasoning
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    else {
-        return true;
+    pending_reasoning: &mut Option<String>,
+) {
+    let Some(reasoning) = pending_reasoning.take() else {
+        return;
     };
-    let Some(index) = last_assistant_index else {
-        return false;
-    };
-    let Some(message) = messages.get_mut(index) else {
-        return false;
+    let reasoning = reasoning.trim();
+    if reasoning.is_empty() {
+        return;
+    }
+    let Some(message) = last_assistant_index.and_then(|index| messages.get_mut(index)) else {
+        return;
     };
     if message.get("role").and_then(|v| v.as_str()) != Some("assistant") {
-        return false;
+        return;
     }
 
     if let Some(obj) = message.as_object_mut() {
         append_reasoning_content(obj, reasoning);
-        return true;
     }
-
-    false
 }
 
 fn responses_message_reasoning_text(item: &Value) -> Option<String> {
@@ -1131,12 +1145,8 @@ fn responses_function_tool_to_chat_tool(tool: &Value, chat_name: &str) -> Option
             .and_then(|value| value.as_object_mut())
         {
             // Ensure parameters.type is "object" for strict OpenAI-compatible providers
-            if let Some(params) = obj.get("parameters") {
-                let normalized = normalize_function_parameters(Some(params));
-                if normalized != *params {
-                    obj.insert("parameters".to_string(), normalized);
-                }
-            }
+            let parameters = normalize_function_parameters(obj.get("parameters"));
+            obj.insert("parameters".to_string(), parameters);
 
             obj.insert("name".to_string(), json!(chat_name));
             if let Some(strict) = tool.get("strict").cloned() {
@@ -2079,6 +2089,44 @@ mod tests {
     }
 
     #[test]
+    fn responses_request_to_chat_normalizes_missing_and_union_tool_parameters() {
+        let input = json!({
+            "model": "gpt-5.4",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "missing_schema",
+                    "parameters": null
+                },
+                {
+                    "type": "function",
+                    "name": "union_schema",
+                    "parameters": {
+                        "oneOf": [
+                            {"type": "object", "properties": {"id": {"type": "string"}}},
+                            {"type": "object", "properties": {"slug": {"type": "string"}}}
+                        ]
+                    }
+                }
+            ],
+            "input": "hi"
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        assert_eq!(
+            result["tools"][0]["function"]["parameters"],
+            json!({"type": "object", "properties": {}})
+        );
+        assert_eq!(
+            result["tools"][1]["function"]["parameters"]["type"],
+            "object"
+        );
+        assert!(result["tools"][1]["function"]["parameters"]
+            .get("oneOf")
+            .is_some());
+    }
+
+    #[test]
     fn responses_request_to_chat_maps_custom_tool_and_choice() {
         let input = json!({
             "model": "gpt-5.4",
@@ -2518,6 +2566,66 @@ mod tests {
             messages[0]["reasoning_content"],
             "I need to preserve thinking history."
         );
+    }
+
+    #[test]
+    fn responses_request_to_chat_keeps_reasoning_on_each_assistant_turn() {
+        let input = json!({
+            "model": "kimi-k2-thinking",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "first thought"}]
+                },
+                {"type": "message", "role": "assistant", "content": "First answer."},
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "second thought"}]
+                },
+                {"type": "message", "role": "assistant", "content": "Second answer."},
+                {"role": "user", "content": "Continue"}
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages[0]["reasoning_content"], "first thought");
+        assert_eq!(messages[1]["reasoning_content"], "second thought");
+        assert!(messages[2].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn responses_request_to_chat_keeps_reasoning_on_final_answer_after_tool_call() {
+        let input = json!({
+            "model": "kimi-k2-thinking",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "read the file"}]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"README.md\"}"
+                },
+                {"type": "function_call_output", "call_id": "call_1", "output": "content"},
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "answer now"}]
+                },
+                {"type": "message", "role": "assistant", "content": "The file says hello."},
+                {"role": "user", "content": "Continue"}
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages[0]["reasoning_content"], "read the file");
+        assert_eq!(messages[2]["reasoning_content"], "answer now");
+        assert!(messages[3].get("reasoning_content").is_none());
     }
 
     #[test]

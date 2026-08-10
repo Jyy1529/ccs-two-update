@@ -11,6 +11,7 @@ use crate::store::AppState;
 use crate::AppType;
 use serde_json::json;
 use std::str::FromStr;
+use std::sync::Arc;
 
 /// Import a provider from a deep link request
 ///
@@ -22,6 +23,16 @@ use std::str::FromStr;
 /// 5. Optionally sets as current provider if enabled=true
 pub fn import_provider_from_deeplink(
     state: &AppState,
+    request: DeepLinkImportRequest,
+) -> Result<String, AppError> {
+    tauri::async_runtime::block_on(import_provider_from_deeplink_async(
+        state.owned_clone(),
+        request,
+    ))
+}
+
+pub async fn import_provider_from_deeplink_async(
+    state: Arc<AppState>,
     request: DeepLinkImportRequest,
 ) -> Result<String, AppError> {
     // Verify this is a provider request
@@ -94,7 +105,6 @@ pub fn import_provider_from_deeplink(
     // Parse app type
     let app_type = AppType::from_str(&app_str)
         .map_err(|_| AppError::InvalidInput(format!("Invalid app type: {app_str}")))?;
-
     // Build provider configuration based on app type
     let mut provider = build_provider_from_request(&app_type, &merged_request)?;
 
@@ -107,28 +117,55 @@ pub fn import_provider_from_deeplink(
         .to_lowercase();
     provider.id = format!("{sanitized_name}-{timestamp}");
 
-    let provider_id = provider.id.clone();
+    let enabled = merged_request.enabled.unwrap_or(false);
+    let operation_state = Arc::clone(&state);
+    let operation_app_type = app_type.clone();
+    let operation = move || {
+        persist_provider_from_deeplink(
+            operation_state.as_ref(),
+            operation_app_type,
+            provider,
+            all_endpoints,
+            enabled,
+        )
+    };
 
-    // Use ProviderService to add the provider
+    if matches!(app_type, AppType::Codex) {
+        crate::execute_codex_provider_mutation_all(state, "导入 Codex Provider 深链", operation)
+            .await
+            .map_err(AppError::Message)
+    } else {
+        tokio::task::spawn_blocking(operation)
+            .await
+            .map_err(|error| AppError::Message(format!("Provider 深链导入任务失败: {error}")))?
+    }
+}
+
+fn persist_provider_from_deeplink(
+    state: &AppState,
+    app_type: AppType,
+    provider: Provider,
+    all_endpoints: Vec<String>,
+    enabled: bool,
+) -> Result<String, AppError> {
+    let provider_id = provider.id.clone();
     ProviderService::add(state, app_type.clone(), provider, true)?;
 
-    // Add extra endpoints as custom endpoints (skip first one as it's the primary)
-    for ep in all_endpoints.iter().skip(1) {
-        let normalized = ep.trim().trim_end_matches('/').to_string();
+    for endpoint in all_endpoints.iter().skip(1) {
+        let normalized = endpoint.trim().trim_end_matches('/').to_string();
         if !normalized.is_empty() {
-            if let Err(e) = ProviderService::add_custom_endpoint(
+            if let Err(error) = ProviderService::add_custom_endpoint(
                 state,
                 app_type.clone(),
                 &provider_id,
                 normalized.clone(),
             ) {
-                log::warn!("Failed to add custom endpoint '{normalized}': {e}");
+                log::warn!("Failed to add custom endpoint '{normalized}': {error}");
             }
         }
     }
 
-    // If enabled=true, set as current provider
-    if merged_request.enabled.unwrap_or(false) {
+    if enabled {
         ProviderService::switch(state, app_type.clone(), &provider_id)?;
         log::info!("Provider '{provider_id}' set as current for {app_type:?}");
     }

@@ -12,6 +12,13 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
+import type {
+  CodexAgentRoleRouting,
+  CodexCatalogModel,
+  LocalProxyRetryPolicy,
+} from "@/types";
+import { ProviderRetryPolicyConfig } from "./ProviderRetryPolicyConfig";
+import { CodexAgentRoleRoutingConfig } from "./CodexAgentRoleRoutingConfig";
 export type PricingModelSourceOption = "inherit" | "request" | "response";
 
 interface ProviderPricingConfig {
@@ -23,11 +30,37 @@ interface ProviderPricingConfig {
 interface ProviderAdvancedConfigProps {
   pricingConfig: ProviderPricingConfig;
   onPricingConfigChange: (config: ProviderPricingConfig) => void;
+  retryPolicy?: LocalProxyRetryPolicy;
+  onRetryPolicyChange?: (policy: LocalProxyRetryPolicy) => void;
+  codexAgentRoleRouting?: CodexAgentRoleRouting;
+  onCodexAgentRoleRoutingChange?: (routing: CodexAgentRoleRouting) => void;
+  ownerProviderId?: string;
+  ownerDefaultModel?: string;
+  ownerCatalogModels?: CodexCatalogModel[];
+  ownerBaseUrl?: string;
+  ownerApiKey?: string;
+  ownerIsFullUrl?: boolean;
+  ownerCustomUserAgent?: string;
+  onRequestAddCodexProvider?: (onCreated: (providerId: string) => void) => void;
+  roleRoutingIdPrefix?: string;
 }
 
 export function ProviderAdvancedConfig({
   pricingConfig,
   onPricingConfigChange,
+  retryPolicy,
+  onRetryPolicyChange,
+  codexAgentRoleRouting,
+  onCodexAgentRoleRoutingChange,
+  ownerProviderId,
+  ownerDefaultModel,
+  ownerCatalogModels,
+  ownerBaseUrl,
+  ownerApiKey,
+  ownerIsFullUrl,
+  ownerCustomUserAgent,
+  onRequestAddCodexProvider,
+  roleRoutingIdPrefix,
 }: ProviderAdvancedConfigProps) {
   const { t } = useTranslation();
   const [isPricingConfigOpen, setIsPricingConfigOpen] = useState(
@@ -40,12 +73,41 @@ export function ProviderAdvancedConfig({
 
   return (
     <div className="space-y-4">
+      {retryPolicy && onRetryPolicyChange && (
+        <ProviderRetryPolicyConfig
+          value={retryPolicy}
+          onChange={onRetryPolicyChange}
+        />
+      )}
+      {codexAgentRoleRouting && onCodexAgentRoleRoutingChange && (
+        <CodexAgentRoleRoutingConfig
+          value={codexAgentRoleRouting}
+          onChange={onCodexAgentRoleRoutingChange}
+          ownerProviderId={ownerProviderId}
+          ownerDefaultModel={ownerDefaultModel}
+          ownerCatalogModels={ownerCatalogModels}
+          ownerBaseUrl={ownerBaseUrl}
+          ownerApiKey={ownerApiKey}
+          ownerIsFullUrl={ownerIsFullUrl}
+          ownerCustomUserAgent={ownerCustomUserAgent}
+          onRequestAddProvider={onRequestAddCodexProvider}
+          idPrefix={roleRoutingIdPrefix}
+        />
+      )}
       {/* 计费配置 */}
       <div className="rounded-lg border border-border/50 bg-muted/20">
-        <button
-          type="button"
+        <div
+          role="button"
+          tabIndex={0}
+          aria-expanded={isPricingConfigOpen}
           className="flex w-full items-center justify-between p-4 hover:bg-muted/30 transition-colors"
           onClick={() => setIsPricingConfigOpen(!isPricingConfigOpen)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              setIsPricingConfigOpen(!isPricingConfigOpen);
+            }
+          }}
         >
           <div className="flex items-center gap-3">
             <Coins className="h-4 w-4 text-muted-foreground" />
@@ -83,7 +145,7 @@ export function ProviderAdvancedConfig({
               <ChevronRight className="h-4 w-4 text-muted-foreground" />
             )}
           </div>
-        </button>
+        </div>
         <div
           className={cn(
             "overflow-hidden transition-all duration-200",

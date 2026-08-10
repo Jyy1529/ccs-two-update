@@ -5,6 +5,7 @@
 mod endpoints;
 mod gemini_auth;
 mod live;
+mod transfer;
 mod usage;
 
 use indexmap::IndexMap;
@@ -27,6 +28,7 @@ pub use live::{
     should_import_default_config_on_startup, sync_current_to_live,
     update_toml_common_config_snippet,
 };
+pub use transfer::{ProviderTransferPreview, ProviderTransferRequest, ProviderTransferResult};
 
 // Internal re-exports (pub(crate))
 pub(crate) use live::sanitize_claude_settings_for_live;
@@ -42,6 +44,9 @@ use live::{
     remove_opencode_provider_from_live, write_gemini_live,
 };
 use usage::validate_usage_script;
+
+const CODEX_AGENT_ROLE_OWNER_DELETE_BLOCKED: &str = "codex_agent_role_owner_delete_blocked";
+const CODEX_AGENT_ROLE_TARGET_DELETE_BLOCKED: &str = "codex_agent_role_target_delete_blocked";
 
 /// The built-in Codex official provider is safe to select during takeover:
 /// Codex keeps ownership of its ChatGPT login and the proxy only forwards the
@@ -124,7 +129,9 @@ mod tests {
     use crate::database::Database;
     #[cfg(any(target_os = "macos", windows))]
     use crate::provider::{ClaudeDesktopMode, ClaudeDesktopModelRoute};
-    use crate::provider::{ProviderMeta, UsageScript};
+    use crate::provider::{
+        CodexAgentRoleRouting, CodexFrontendAgentRoleOverride, ProviderMeta, UsageScript,
+    };
     use crate::proxy::types::ProxyConfig;
     use crate::store::AppState;
     use serde_json::json;
@@ -309,6 +316,169 @@ mod tests {
             ..Default::default()
         });
         provider
+    }
+
+    fn codex_provider_with_role_routing(
+        id: &str,
+        enabled: bool,
+        frontend_provider_id: Option<&str>,
+    ) -> Provider {
+        let mut provider = Provider::with_id(
+            id.to_string(),
+            format!("Provider {id}"),
+            codex_settings("https://example.com/v1", "test-key"),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            codex_agent_role_routing: Some(CodexAgentRoleRouting {
+                enabled: Some(enabled),
+                frontend: Some(CodexFrontendAgentRoleOverride {
+                    provider_id: frontend_provider_id.map(str::to_string),
+                    ..Default::default()
+                }),
+                backend: None,
+            }),
+            ..Default::default()
+        });
+        provider
+    }
+
+    #[test]
+    fn deleting_enabled_codex_role_owner_is_blocked() {
+        with_test_home(|state, _| {
+            let owner = codex_provider_with_role_routing("owner", true, None);
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &owner)
+                .expect("save owner");
+
+            let error = ProviderService::delete(state, AppType::Codex, &owner.id)
+                .expect_err("enabled role owner must be protected");
+            assert_eq!(
+                error.to_string(),
+                format!("{CODEX_AGENT_ROLE_OWNER_DELETE_BLOCKED}:")
+            );
+        });
+    }
+
+    #[test]
+    fn deleting_codex_frontend_target_is_blocked_by_any_saved_reference() {
+        with_test_home(|state, _| {
+            let owner = codex_provider_with_role_routing("owner", false, Some("frontend-b"));
+            let target = codex_provider_with_role_routing("frontend-b", false, None);
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &owner)
+                .expect("save owner");
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &target)
+                .expect("save target");
+
+            let error = ProviderService::delete(state, AppType::Codex, &target.id)
+                .expect_err("referenced frontend provider must be protected");
+            let message = error.to_string();
+            let payload = message
+                .strip_prefix(&format!("{CODEX_AGENT_ROLE_TARGET_DELETE_BLOCKED}:"))
+                .expect("target delete marker");
+            let owners: Vec<String> = serde_json::from_str(payload).expect("owners payload");
+            assert_eq!(owners, vec!["Provider owner"]);
+        });
+    }
+
+    #[test]
+    fn deleting_universal_with_current_codex_child_is_preflighted_before_any_write() {
+        with_test_home(|state, _| {
+            let mut universal = UniversalProvider::new(
+                "universal-a".to_string(),
+                "Universal A".to_string(),
+                "custom".to_string(),
+                "https://example.com".to_string(),
+                "test-key".to_string(),
+            );
+            universal.apps.claude = true;
+            universal.apps.codex = true;
+            state
+                .db
+                .save_universal_provider(&universal)
+                .expect("save universal provider");
+            let claude = universal.to_claude_provider().expect("Claude child");
+            let codex = universal.to_codex_provider().expect("Codex child");
+            state
+                .db
+                .save_provider(AppType::Claude.as_str(), &claude)
+                .expect("save Claude child");
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &codex)
+                .expect("save Codex child");
+            state
+                .db
+                .set_current_provider(AppType::Codex.as_str(), &codex.id)
+                .expect("set database current Codex child");
+
+            ProviderService::delete_universal(state, &universal.id)
+                .expect_err("current Codex child must block Universal deletion");
+
+            assert!(state
+                .db
+                .get_universal_provider(&universal.id)
+                .expect("read Universal provider")
+                .is_some());
+            assert!(state
+                .db
+                .get_provider_by_id(&claude.id, AppType::Claude.as_str())
+                .expect("read Claude child")
+                .is_some());
+        });
+    }
+
+    #[test]
+    fn disabling_current_universal_codex_child_is_preflighted_before_claude_sync() {
+        with_test_home(|state, _| {
+            let mut universal = UniversalProvider::new(
+                "universal-b".to_string(),
+                "Universal B Updated".to_string(),
+                "custom".to_string(),
+                "https://example.com".to_string(),
+                "test-key".to_string(),
+            );
+            universal.apps.claude = true;
+            universal.apps.codex = false;
+            state
+                .db
+                .save_universal_provider(&universal)
+                .expect("save Universal provider");
+
+            let mut claude = universal.to_claude_provider().expect("Claude child");
+            claude.name = "Claude Before Sync".to_string();
+            state
+                .db
+                .save_provider(AppType::Claude.as_str(), &claude)
+                .expect("save Claude child");
+            let codex_id = format!("universal-codex-{}", universal.id);
+            let codex = codex_provider_with_role_routing(&codex_id, false, None);
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &codex)
+                .expect("save historical Codex child");
+            crate::settings::set_current_provider(&AppType::Codex, Some(&codex_id))
+                .expect("set device current Codex child");
+
+            ProviderService::sync_universal_to_apps(state, &universal.id)
+                .expect_err("current Codex child must block disabling Codex sync");
+
+            assert_eq!(
+                state
+                    .db
+                    .get_provider_by_id(&claude.id, AppType::Claude.as_str())
+                    .expect("read Claude child")
+                    .expect("Claude child remains")
+                    .name,
+                "Claude Before Sync",
+                "Claude must remain untouched until all Codex deletion preflights pass"
+            );
+        });
     }
 
     fn openclaw_provider(id: &str) -> Provider {
@@ -700,6 +870,63 @@ mod tests {
             err.to_string().contains("auth"),
             "expected auth error, got {err:?}"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn invalid_switch_target_preserves_current_provider() {
+        with_test_home(|state, _| {
+            crate::settings::reload_settings().expect("reload isolated settings");
+
+            let current = Provider::with_id(
+                "current".into(),
+                "Current".into(),
+                codex_settings("https://current.example/v1", "current-key"),
+                None,
+            );
+            let invalid = Provider::with_id(
+                "invalid".into(),
+                "Invalid".into(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "invalid-key" },
+                    "config": "[invalid"
+                }),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &current)
+                .expect("save current provider");
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &invalid)
+                .expect("save invalid provider");
+            state
+                .db
+                .set_current_provider(AppType::Codex.as_str(), &current.id)
+                .expect("set database current provider");
+            crate::settings::set_current_provider(&AppType::Codex, Some(&current.id))
+                .expect("set local current provider");
+
+            ProviderService::switch(state, AppType::Codex, &invalid.id)
+                .expect_err("invalid target must fail before changing current state");
+
+            assert_eq!(
+                state
+                    .db
+                    .get_current_provider(AppType::Codex.as_str())
+                    .expect("read database current provider")
+                    .as_deref(),
+                Some(current.id.as_str())
+            );
+            assert_eq!(
+                crate::settings::get_current_provider(&AppType::Codex).as_deref(),
+                Some(current.id.as_str())
+            );
+
+            crate::settings::set_current_provider(&AppType::Codex, None)
+                .expect("clear isolated current provider");
+        });
     }
 
     #[test]
@@ -1278,6 +1505,14 @@ requires_openai_auth = true
         crate::settings::set_current_provider(&AppType::ClaudeDesktop, Some("p1"))
             .expect("set local current provider");
 
+        db.update_proxy_config(ProxyConfig {
+            live_takeover_active: true,
+            listen_port: 0,
+            ..Default::default()
+        })
+        .await
+        .expect("update proxy config");
+
         // Claude Desktop keeps backup state from takeover startup; this sentinel only
         // marks takeover as active so provider updates rewrite the 3P profile.
         db.save_live_backup("claude-desktop", "{}")
@@ -1294,7 +1529,7 @@ requires_openai_auth = true
                 .expect("update app proxy config");
         }
 
-        state
+        let proxy_info = state
             .proxy_service
             .start()
             .await
@@ -1342,7 +1577,10 @@ requires_openai_auth = true
         let profile: Value = read_json_file(&profile_path).expect("read desktop profile");
         assert_eq!(
             profile["inferenceGatewayBaseUrl"],
-            json!("http://127.0.0.1:15721/claude-desktop"),
+            json!(format!(
+                "http://127.0.0.1:{}/claude-desktop",
+                proxy_info.port
+            )),
             "desktop profile should stay pointed at the local gateway during takeover"
         );
         assert_eq!(profile["inferenceGatewayAuthScheme"], json!("bearer"));
@@ -2084,6 +2322,83 @@ impl ProviderService {
             .map(|opt| opt.unwrap_or_default())
     }
 
+    fn codex_role_routing_enabled(provider: &Provider) -> bool {
+        provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.codex_agent_role_routing.as_ref())
+            .is_some_and(|routing| routing.is_enabled())
+    }
+
+    fn codex_frontend_provider_reference(provider: &Provider) -> Option<&str> {
+        provider
+            .meta
+            .as_ref()?
+            .codex_agent_role_routing
+            .as_ref()?
+            .frontend
+            .as_ref()?
+            .provider_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|provider_id| !provider_id.is_empty())
+    }
+
+    fn ensure_codex_provider_can_be_deleted(
+        state: &AppState,
+        provider_id: &str,
+    ) -> Result<(), AppError> {
+        let providers = state.db.get_all_providers(AppType::Codex.as_str())?;
+
+        if providers
+            .get(provider_id)
+            .is_some_and(Self::codex_role_routing_enabled)
+        {
+            return Err(AppError::Message(format!(
+                "{CODEX_AGENT_ROLE_OWNER_DELETE_BLOCKED}:"
+            )));
+        }
+
+        let mut owners = providers
+            .values()
+            .filter(|provider| provider.id != provider_id)
+            .filter(|provider| {
+                Self::codex_frontend_provider_reference(provider) == Some(provider_id)
+            })
+            .map(|provider| provider.name.trim())
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        owners.sort();
+        owners.dedup();
+
+        if !owners.is_empty() {
+            return Err(AppError::Message(format!(
+                "{CODEX_AGENT_ROLE_TARGET_DELETE_BLOCKED}:{}",
+                serde_json::json!(owners)
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn ensure_provider_is_not_current(
+        state: &AppState,
+        app_type: &AppType,
+        provider_id: &str,
+    ) -> Result<(), AppError> {
+        let local_current = crate::settings::get_current_provider(app_type);
+        let database_current = state.db.get_current_provider(app_type.as_str())?;
+        if local_current.as_deref() == Some(provider_id)
+            || database_current.as_deref() == Some(provider_id)
+        {
+            return Err(AppError::Message(
+                "无法删除当前正在使用的供应商".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Add a new provider
     pub fn add(
         state: &AppState,
@@ -2366,6 +2681,10 @@ impl ProviderService {
     /// 同时检查本地 settings 和数据库的当前供应商，防止删除任一端正在使用的供应商。
     /// 对于累加模式应用（OpenCode, OpenClaw），可以随时删除任意供应商，同时从 live 配置中移除。
     pub fn delete(state: &AppState, app_type: AppType, id: &str) -> Result<(), AppError> {
+        if matches!(app_type, AppType::Codex) {
+            Self::ensure_codex_provider_can_be_deleted(state, id)?;
+        }
+
         // Additive mode apps - no current provider concept
         if app_type.is_additive_mode() {
             // Single DB read shared across all additive-mode sub-paths below.
@@ -2415,14 +2734,7 @@ impl ProviderService {
         }
 
         // For other apps: Check both local settings and database
-        let local_current = crate::settings::get_current_provider(&app_type);
-        let db_current = state.db.get_current_provider(app_type.as_str())?;
-
-        if local_current.as_deref() == Some(id) || db_current.as_deref() == Some(id) {
-            return Err(AppError::Message(
-                "无法删除当前正在使用的供应商".to_string(),
-            ));
-        }
+        Self::ensure_provider_is_not_current(state, &app_type, id)?;
 
         state.db.delete_provider(app_type.as_str(), id)
     }
@@ -2602,6 +2914,10 @@ impl ProviderService {
             .get(id)
             .ok_or_else(|| AppError::Message(format!("供应商 {id} 不存在")))?;
 
+        // Validate before backfill or current-provider updates so an invalid
+        // target cannot partially change provider state.
+        Self::validate_provider_settings(&app_type, provider)?;
+
         // OMO ↔ OMO Slim are mutually exclusive; activating one removes the other's config file.
         if matches!(app_type, AppType::OpenCode) {
             let omo_pair = match provider.category.as_deref() {
@@ -2667,17 +2983,15 @@ impl ProviderService {
             }
         }
 
-        // Additive mode apps skip setting is_current (no such concept)
-        if !app_type.is_additive_mode() {
-            // Update local settings (device-level, takes priority)
-            crate::settings::set_current_provider(&app_type, Some(id))?;
-
-            // Update database is_current (as default for new devices)
-            state.db.set_current_provider(app_type.as_str(), id)?;
-        }
-
         // Sync to live (write_gemini_live handles security flag internally for Gemini)
         write_live_with_common_config(state.db.as_ref(), &app_type, provider)?;
+
+        // Persist current-provider state only after the live configuration has
+        // been written successfully.
+        if !app_type.is_additive_mode() {
+            crate::settings::set_current_provider(&app_type, Some(id))?;
+            state.db.set_current_provider(app_type.as_str(), id)?;
+        }
 
         // Hermes is additive, so "switching" doesn't overwrite a live config file
         // — we instead update the top-level `model:` section to point at this
@@ -3884,27 +4198,32 @@ impl ProviderService {
 
     /// 删除统一供应商
     pub fn delete_universal(state: &AppState, id: &str) -> Result<bool, AppError> {
-        // 获取统一供应商（用于删除生成的子供应商）
         let provider = state.db.get_universal_provider(id)?;
 
-        // 删除统一供应商
-        state.db.delete_universal_provider(id)?;
+        if provider
+            .as_ref()
+            .is_some_and(|provider| provider.apps.codex)
+        {
+            let codex_id = format!("universal-codex-{id}");
+            Self::ensure_codex_provider_can_be_deleted(state, &codex_id)?;
+            Self::ensure_provider_is_not_current(state, &AppType::Codex, &codex_id)?;
+        }
 
-        // 删除生成的子供应商
         if let Some(p) = provider {
             if p.apps.claude {
                 let claude_id = format!("universal-claude-{id}");
-                let _ = state.db.delete_provider("claude", &claude_id);
+                state.db.delete_provider("claude", &claude_id)?;
             }
             if p.apps.codex {
                 let codex_id = format!("universal-codex-{id}");
-                let _ = state.db.delete_provider("codex", &codex_id);
+                state.db.delete_provider("codex", &codex_id)?;
             }
             if p.apps.gemini {
                 let gemini_id = format!("universal-gemini-{id}");
-                let _ = state.db.delete_provider("gemini", &gemini_id);
+                state.db.delete_provider("gemini", &gemini_id)?;
             }
         }
+        state.db.delete_universal_provider(id)?;
 
         Ok(true)
     }
@@ -3916,47 +4235,68 @@ impl ProviderService {
             .get_universal_provider(id)?
             .ok_or_else(|| AppError::Message(format!("统一供应商 {id} 不存在")))?;
 
-        // 同步到 Claude
-        if let Some(mut claude_provider) = provider.to_claude_provider() {
-            // 合并已有配置
+        let mut claude_provider = provider.to_claude_provider();
+        if let Some(claude_provider) = claude_provider.as_mut() {
             if let Some(existing) = state.db.get_provider_by_id(&claude_provider.id, "claude")? {
                 let mut merged = existing.settings_config.clone();
                 Self::merge_json(&mut merged, &claude_provider.settings_config);
                 claude_provider.settings_config = merged;
             }
-            state.db.save_provider("claude", &claude_provider)?;
-        } else {
-            // 如果禁用了 Claude，删除对应的子供应商
-            let claude_id = format!("universal-claude-{id}");
-            let _ = state.db.delete_provider("claude", &claude_id);
         }
 
-        // 同步到 Codex
-        if let Some(mut codex_provider) = provider.to_codex_provider() {
-            // 合并已有配置
+        let mut codex_provider = provider.to_codex_provider();
+        if let Some(codex_provider) = codex_provider.as_mut() {
             if let Some(existing) = state.db.get_provider_by_id(&codex_provider.id, "codex")? {
                 let mut merged = existing.settings_config.clone();
                 Self::merge_json(&mut merged, &codex_provider.settings_config);
                 codex_provider.settings_config = merged;
+
+                if let Some(role_routing) = existing
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.codex_agent_role_routing.clone())
+                {
+                    codex_provider
+                        .meta
+                        .get_or_insert_with(Default::default)
+                        .codex_agent_role_routing = Some(role_routing);
+                }
             }
-            state.db.save_provider("codex", &codex_provider)?;
         } else {
             let codex_id = format!("universal-codex-{id}");
-            let _ = state.db.delete_provider("codex", &codex_id);
+            Self::ensure_codex_provider_can_be_deleted(state, &codex_id)?;
+            Self::ensure_provider_is_not_current(state, &AppType::Codex, &codex_id)?;
         }
 
-        // 同步到 Gemini
-        if let Some(mut gemini_provider) = provider.to_gemini_provider() {
-            // 合并已有配置
+        let mut gemini_provider = provider.to_gemini_provider();
+        if let Some(gemini_provider) = gemini_provider.as_mut() {
             if let Some(existing) = state.db.get_provider_by_id(&gemini_provider.id, "gemini")? {
                 let mut merged = existing.settings_config.clone();
                 Self::merge_json(&mut merged, &gemini_provider.settings_config);
                 gemini_provider.settings_config = merged;
             }
+        }
+
+        if let Some(claude_provider) = claude_provider {
+            state.db.save_provider("claude", &claude_provider)?;
+        } else {
+            state
+                .db
+                .delete_provider("claude", &format!("universal-claude-{id}"))?;
+        }
+        if let Some(codex_provider) = codex_provider {
+            state.db.save_provider("codex", &codex_provider)?;
+        } else {
+            state
+                .db
+                .delete_provider("codex", &format!("universal-codex-{id}"))?;
+        }
+        if let Some(gemini_provider) = gemini_provider {
             state.db.save_provider("gemini", &gemini_provider)?;
         } else {
-            let gemini_id = format!("universal-gemini-{id}");
-            let _ = state.db.delete_provider("gemini", &gemini_id);
+            state
+                .db
+                .delete_provider("gemini", &format!("universal-gemini-{id}"))?;
         }
 
         Ok(true)

@@ -27,6 +27,14 @@ vi.mock("react-i18next", () => ({
         return `代理服务已启动 - ${options?.address}:${options?.port}`;
       }
 
+      if (key === "providerAdvanced.agentRoleProxyDisableBlocked") {
+        return "当前子代理角色路由依赖 Codex 代理接管，请先关闭角色路由。";
+      }
+
+      if (key === "providerAdvanced.agentRoleLoopbackRequired") {
+        return "前端子代理独立 Provider 路由要求 Codex 本地代理监听回环地址（127.0.0.1 或 ::1）。请修改监听地址后重试。";
+      }
+
       if (typeof options?.defaultValue === "string") {
         return options.defaultValue;
       }
@@ -115,5 +123,73 @@ describe("useProxyStatus", () => {
       "代理服务已启动 - 127.0.0.1:15721",
       { closeButton: true },
     );
+  });
+
+  it("shows the localized role-route message when Codex takeover cannot be disabled", async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "get_proxy_status") {
+        return Promise.resolve({
+          running: true,
+          address: "127.0.0.1",
+          port: 15721,
+        });
+      }
+      if (command === "get_proxy_takeover_status") {
+        return Promise.resolve({ codex: true });
+      }
+      if (command === "set_proxy_takeover_for_app") {
+        return Promise.reject(
+          new Error(
+            "codex_agent_role_proxy_required: disable role routing first",
+          ),
+        );
+      }
+      return Promise.resolve(null);
+    });
+    const { wrapper } = createWrapper();
+    const { result } = renderHook(() => useProxyStatus(), { wrapper });
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    await expect(
+      result.current.setTakeoverForApp({ appType: "codex", enabled: false }),
+    ).rejects.toThrow("codex_agent_role_proxy_required");
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "当前子代理角色路由依赖 Codex 代理接管，请先关闭角色路由。",
+      );
+    });
+  });
+
+  it("shows the localized loopback requirement when the proxy cannot start", async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "get_proxy_status") {
+        return Promise.resolve({ running: false });
+      }
+      if (command === "get_proxy_takeover_status") {
+        return Promise.resolve({ codex: false });
+      }
+      if (command === "start_proxy_server") {
+        return Promise.reject(
+          new Error(
+            "codex_agent_role_loopback_required: listen address must be loopback",
+          ),
+        );
+      }
+      return Promise.resolve(null);
+    });
+    const { wrapper } = createWrapper();
+    const { result } = renderHook(() => useProxyStatus(), { wrapper });
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    await expect(result.current.startProxyServer()).rejects.toThrow(
+      "codex_agent_role_loopback_required",
+    );
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "前端子代理独立 Provider 路由要求 Codex 本地代理监听回环地址（127.0.0.1 或 ::1）。请修改监听地址后重试。",
+      );
+    });
   });
 });

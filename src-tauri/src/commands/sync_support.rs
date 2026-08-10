@@ -1,15 +1,51 @@
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-use crate::database::Database;
 use crate::error::AppError;
 use crate::services::provider::ProviderService;
 use crate::settings;
 use crate::store::AppState;
 
-pub(crate) fn run_post_import_sync(db: Arc<Database>) -> Result<(), AppError> {
-    let app_state = AppState::new(db);
-    ProviderService::sync_current_to_live(&app_state)?;
+pub(crate) async fn with_codex_provider_transaction<T, F, Fut>(
+    state: Arc<AppState>,
+    operation: F,
+) -> T
+where
+    F: FnOnce(Arc<AppState>) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let _codex_lifecycle_guard = state.lock_codex_provider_lifecycle().await;
+    let _proxy_transaction_guard = state.proxy_service.lock_transaction().await;
+    operation(state).await
+}
+
+pub(crate) async fn sync_current_live_and_roles_under_proxy_transaction(
+    state: Arc<AppState>,
+) -> Result<(), AppError> {
+    let state_for_live = Arc::clone(&state);
+    let live_result = tauri::async_runtime::spawn_blocking(move || {
+        ProviderService::sync_current_to_live(state_for_live.as_ref())
+    })
+    .await
+    .map_err(|error| AppError::Message(format!("Live sync task failed: {error}")))?;
+
+    let role_result = crate::services::codex_agent_roles::
+        reconcile_current_codex_agent_roles_under_proxy_transaction(state.as_ref())
+        .await;
+
+    match (live_result, role_result) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Err(error), Ok(_)) | (Ok(()), Err(error)) => Err(error),
+        (Err(live_error), Err(role_error)) => Err(AppError::Message(format!(
+            "Live configuration sync failed: {live_error}; Codex Agent Role reconciliation also failed: {role_error}"
+        ))),
+    }
+}
+
+pub(crate) async fn run_post_import_sync_under_proxy_transaction(
+    state: Arc<AppState>,
+) -> Result<(), AppError> {
+    sync_current_live_and_roles_under_proxy_transaction(state).await?;
     settings::reload_settings()?;
     Ok(())
 }
@@ -55,8 +91,13 @@ pub(crate) fn success_payload_with_warning(backup_id: String, warning: Option<St
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_warning, post_sync_warning_from_result};
+    use super::{attach_warning, post_sync_warning_from_result, with_codex_provider_transaction};
+    use crate::database::Database;
+    use crate::store::AppState;
     use serde_json::json;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn post_sync_warning_from_result_returns_none_on_success() {
@@ -93,5 +134,32 @@ mod tests {
             updated.get("warning").and_then(|v| v.as_str()),
             Some("post sync warning")
         );
+    }
+
+    #[tokio::test]
+    async fn provider_transaction_uses_the_shared_lifecycle_lock() {
+        let state = Arc::new(AppState::new(Arc::new(
+            Database::memory().expect("in-memory database"),
+        )));
+        let lifecycle_guard = state.lock_codex_provider_lifecycle().await;
+        let task_state = state.owned_clone();
+        let operation_started = Arc::new(AtomicBool::new(false));
+        let task_operation_started = Arc::clone(&operation_started);
+
+        let task = tokio::spawn(async move {
+            with_codex_provider_transaction(task_state, move |_| async move {
+                task_operation_started.store(true, Ordering::SeqCst);
+            })
+            .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!operation_started.load(Ordering::SeqCst));
+        drop(lifecycle_guard);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("transaction should continue after releasing the lifecycle lock")
+            .expect("transaction task should complete");
+        assert!(operation_started.load(Ordering::SeqCst));
     }
 }

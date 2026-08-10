@@ -357,6 +357,9 @@ pub struct AppSettings {
     /// 是否开机自启
     #[serde(default)]
     pub launch_on_startup: bool,
+    /// 是否启用 Codex Desktop 健康检测
+    #[serde(default)]
+    pub codex_repair_detection_enabled: bool,
     /// 静默启动（程序启动时不显示主窗口，仅托盘运行）
     #[serde(default)]
     pub silent_startup: bool,
@@ -511,6 +514,7 @@ impl Default for AppSettings {
             enable_claude_plugin_integration: false,
             skip_claude_onboarding: false,
             launch_on_startup: false,
+            codex_repair_detection_enabled: false,
             silent_startup: false,
             enable_local_proxy: false,
             proxy_confirmed: None,

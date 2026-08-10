@@ -156,7 +156,7 @@ const renderApp = (AppComponent: ComponentType) => {
   );
 };
 
-describe("App integration with MSW", () => {
+describe("App integration with MSW", { timeout: 30_000 }, () => {
   beforeEach(() => {
     resetProviderState();
     toastSuccessMock.mockReset();

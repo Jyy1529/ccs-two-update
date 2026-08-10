@@ -27,6 +27,7 @@ interface FullScreenPanelProps {
 
 const DRAG_BAR_HEIGHT = isWindows() || isLinux() ? 0 : 28; // px - match App.tsx
 const HEADER_HEIGHT = 64; // px - match App.tsx
+const openPanelStack: symbol[] = [];
 
 /**
  * Reusable full-screen panel component
@@ -41,12 +42,27 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
   footer,
   contentClassName,
 }) => {
+  const panelIdRef = React.useRef(Symbol("full-screen-panel"));
+
   React.useEffect(() => {
-    if (isOpen) {
-      document.body.style.overflow = "hidden";
+    if (!isOpen) return;
+
+    const panelId = panelIdRef.current;
+    const existingIndex = openPanelStack.lastIndexOf(panelId);
+    if (existingIndex >= 0) {
+      openPanelStack.splice(existingIndex, 1);
     }
+    openPanelStack.push(panelId);
+    document.body.style.overflow = "hidden";
+
     return () => {
-      document.body.style.overflow = "";
+      const index = openPanelStack.lastIndexOf(panelId);
+      if (index >= 0) {
+        openPanelStack.splice(index, 1);
+      }
+      if (openPanelStack.length === 0) {
+        document.body.style.overflow = "";
+      }
     };
   }, [isOpen]);
 
@@ -62,6 +78,10 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
+        if (openPanelStack[openPanelStack.length - 1] !== panelIdRef.current) {
+          return;
+        }
+
         // 子组件（例如 Radix 的 Select/Dialog/Dropdown）如果已经消费了 ESC，就不要再关闭整个面板
         if (event.defaultPrevented) {
           return;
@@ -71,7 +91,7 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
           return; // 让输入框自己处理 ESC（比如清空、失焦等）
         }
 
-        event.stopPropagation(); // 阻止事件继续冒泡到 window，避免触发 App.tsx 的全局监听
+        event.stopImmediatePropagation();
         onCloseRef.current();
       }
     };

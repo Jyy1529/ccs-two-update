@@ -16,7 +16,12 @@ export { workspaceApi } from "./workspace";
 export * as configApi from "./config";
 export * as authApi from "./auth";
 export * as copilotApi from "./copilot";
-export type { ProviderSwitchEvent } from "./providers";
+export type {
+  ProviderSwitchEvent,
+  ProviderTransferPreview,
+  ProviderTransferRequest,
+  ProviderTransferResult,
+} from "./providers";
 export type { Prompt } from "./prompts";
 export type { Profile, ProfilePayload, ProfilesResponse } from "./profiles";
 export type {

@@ -10,7 +10,7 @@ use super::{
     failover_switch::FailoverSwitchManager,
     json_canonical::{canonicalize_value, short_value_hash},
     log_codes::fwd as log_fwd,
-    provider_router::ProviderRouter,
+    provider_router::{ProviderRequestPermit, ProviderRoutePlan, ProviderRouter},
     providers::{
         codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore, get_adapter,
         AuthInfo, AuthStrategy, ProviderAdapter, ProviderType,
@@ -145,6 +145,11 @@ pub struct RequestForwarder {
     /// `max_attempts = max_retries + 1`，所以 max_retries=0 表示仅尝试一家、
     /// max_retries=3（默认）表示最多 4 家。loop 同时受 providers.len() 自然限制。
     max_attempts: usize,
+    sync_logical_target: bool,
+    bypass_single_provider_circuit_breaker: bool,
+    outbound_model_overrides: std::collections::HashMap<String, String>,
+    role_route_owner_id: Option<String>,
+    role_route_capability_model: Option<String>,
 }
 
 impl RequestForwarder {
@@ -235,19 +240,94 @@ impl RequestForwarder {
                 streaming_first_byte_timeout,
             ),
             max_attempts,
+            sync_logical_target: true,
+            bypass_single_provider_circuit_breaker: true,
+            outbound_model_overrides: std::collections::HashMap::new(),
+            role_route_owner_id: None,
+            role_route_capability_model: None,
         }
+    }
+
+    pub fn with_route_plan(mut self, plan: &ProviderRoutePlan) -> Self {
+        self.sync_logical_target = plan.sync_logical_target;
+        self.bypass_single_provider_circuit_breaker = plan.bypass_single_provider_circuit_breaker;
+        self.outbound_model_overrides = plan
+            .attempts
+            .iter()
+            .filter_map(|attempt| {
+                attempt
+                    .outbound_model_override
+                    .as_ref()
+                    .map(|model| (attempt.provider.id.clone(), model.clone()))
+            })
+            .collect();
+        if !plan.sync_logical_target {
+            self.max_attempts = plan.attempts.len().max(1);
+        }
+        self
+    }
+
+    pub fn with_role_context(
+        mut self,
+        owner_provider_id: Option<String>,
+        capability_model: String,
+    ) -> Self {
+        self.role_route_capability_model = owner_provider_id.as_ref().map(|_| capability_model);
+        self.role_route_owner_id = owner_provider_id;
+        self
+    }
+
+    fn log_role_terminal(
+        &self,
+        provider: &Provider,
+        outbound_model: Option<&str>,
+        route_fallback: bool,
+        terminal: &str,
+        error: Option<&str>,
+    ) {
+        let (Some(owner), Some(capability_model)) = (
+            self.role_route_owner_id.as_deref(),
+            self.role_route_capability_model.as_deref(),
+        ) else {
+            return;
+        };
+        let outbound_model = outbound_model
+            .or_else(|| {
+                self.outbound_model_overrides
+                    .get(&provider.id)
+                    .map(String::as_str)
+            })
+            .unwrap_or(capability_model);
+        log::info!(
+            "[CodexRoleRoute] role=frontend owner_provider={} target_provider={} capability_model={} outbound_model={} route_fallback={} sync_logical_target=false terminal={} error={}",
+            owner,
+            provider.id,
+            capability_model,
+            outbound_model,
+            route_fallback,
+            terminal,
+            error.unwrap_or("none")
+        );
     }
 
     async fn record_success_result(
         &self,
         provider_id: &str,
         app_type: &str,
-        used_half_open_permit: bool,
+        provider_permit: &mut Option<ProviderRequestPermit>,
     ) {
-        if used_half_open_permit {
+        if provider_permit
+            .as_ref()
+            .is_some_and(|permit| permit.used_half_open_permit())
+        {
             if let Err(e) = self
-                .router
-                .record_result(provider_id, app_type, true, true, None)
+                .record_half_open_result_cancellation_safe(
+                    provider_permit,
+                    provider_id,
+                    app_type,
+                    true,
+                    None,
+                )
                 .await
             {
                 log::warn!(
@@ -272,6 +352,164 @@ impl RequestForwarder {
         });
     }
 
+    fn defer_role_stream_result(
+        &self,
+        response: ProxyResponse,
+        provider: &Provider,
+        app_type: &str,
+        provider_permit: &mut Option<ProviderRequestPermit>,
+        route_fallback: bool,
+    ) -> (ProxyResponse, bool) {
+        if self.sync_logical_target || !response.is_sse() {
+            return (response, false);
+        }
+
+        let status_code = response.status();
+        let headers = response.headers().clone();
+        let mut upstream = Box::pin(response.bytes_stream());
+        let router = Arc::clone(&self.router);
+        let proxy_status = Arc::clone(&self.status);
+        let provider_id = provider.id.clone();
+        let provider_name = provider.name.clone();
+        let app_type = app_type.to_string();
+        let permit = provider_permit.take();
+        let role_owner = self.role_route_owner_id.clone();
+        let capability_model = self.role_route_capability_model.clone();
+        let outbound_model = self
+            .outbound_model_overrides
+            .get(&provider.id)
+            .cloned()
+            .or_else(|| capability_model.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let monitored = async_stream::stream! {
+            let mut parse_buffer = String::new();
+            let mut utf8_remainder = Vec::new();
+            let mut terminal_error: Option<String> = None;
+
+            while let Some(next) = upstream.next().await {
+                match next {
+                    Ok(chunk) => {
+                        crate::proxy::sse::append_utf8_safe(
+                            &mut parse_buffer,
+                            &mut utf8_remainder,
+                            &chunk,
+                        );
+                        while let Some(block) = crate::proxy::sse::take_sse_block(&mut parse_buffer) {
+                            if let Some(Err(error)) = inspect_responses_start_event(&block) {
+                                terminal_error.get_or_insert_with(|| error.to_string());
+                            }
+                        }
+                        yield Ok(chunk);
+                    }
+                    Err(error) => {
+                        terminal_error.get_or_insert_with(|| {
+                            format!("Role-routed stream read failed after output: {error}")
+                        });
+                        yield Err(error);
+                        break;
+                    }
+                }
+            }
+
+            if terminal_error.is_none() && !parse_buffer.trim().is_empty() {
+                if let Some(Err(error)) = inspect_responses_start_event(parse_buffer.trim()) {
+                    terminal_error = Some(error.to_string());
+                }
+            }
+
+            let used_half_open_permit = permit
+                .map(ProviderRequestPermit::into_used_half_open_permit)
+                .unwrap_or(false);
+            let succeeded = terminal_error.is_none();
+            if let Err(error) = router
+                .record_result(
+                    &provider_id,
+                    &app_type,
+                    used_half_open_permit,
+                    succeeded,
+                    terminal_error.clone(),
+                )
+                .await
+            {
+                log::warn!(
+                    "[{app_type}] 记录角色路由流终态失败: provider_id={provider_id}, error={error}"
+                );
+            }
+
+            let mut status = proxy_status.write().await;
+            if succeeded {
+                status.success_requests += 1;
+                status.last_error = None;
+                log::info!(
+                    "[CodexRoleRoute] role=frontend owner_provider={} target_provider={} capability_model={} outbound_model={} route_fallback={} sync_logical_target=false terminal=success",
+                    role_owner.as_deref().unwrap_or("unknown"),
+                    provider_id,
+                    capability_model.as_deref().unwrap_or("unknown"),
+                    outbound_model,
+                    route_fallback
+                );
+            } else {
+                status.failed_requests += 1;
+                status.last_error = terminal_error.clone();
+                log::warn!(
+                    "[CodexRoleRoute] role=frontend owner_provider={} target_provider={} capability_model={} outbound_model={} route_fallback={} sync_logical_target=false terminal=failed error={}",
+                    role_owner.as_deref().unwrap_or("unknown"),
+                    provider_id,
+                    capability_model.as_deref().unwrap_or("unknown"),
+                    outbound_model,
+                    route_fallback,
+                    terminal_error.as_deref().unwrap_or("unknown stream failure")
+                );
+            }
+            if status.total_requests > 0 {
+                status.success_rate =
+                    (status.success_requests as f32 / status.total_requests as f32) * 100.0;
+            }
+            drop(status);
+            log::debug!(
+                "[CodexRoleRoute] terminal health recorded: provider={} ({})",
+                provider_name,
+                provider_id
+            );
+        };
+
+        (
+            ProxyResponse::streamed(status_code, headers, monitored),
+            true,
+        )
+    }
+
+    async fn record_half_open_result_cancellation_safe(
+        &self,
+        provider_permit: &mut Option<ProviderRequestPermit>,
+        provider_id: &str,
+        app_type: &str,
+        success: bool,
+        error_msg: Option<String>,
+    ) -> Result<(), crate::error::AppError> {
+        let permit = provider_permit.take();
+        let router = self.router.clone();
+        let provider_id = provider_id.to_string();
+        let app_type = app_type.to_string();
+        tokio::spawn(async move {
+            let used_half_open_permit = permit
+                .map(ProviderRequestPermit::into_used_half_open_permit)
+                .unwrap_or(false);
+            router
+                .record_result(
+                    &provider_id,
+                    &app_type,
+                    used_half_open_permit,
+                    success,
+                    error_msg,
+                )
+                .await
+        })
+        .await
+        .map_err(|error| crate::error::AppError::Message(error.to_string()))?
+    }
+
     /// 整流（thinking signature 或 budget）重试失败后的统一收尾。
     ///
     /// `None` 表示已记录熔断器、累积 `last_error`/`last_provider`，
@@ -284,7 +522,7 @@ impl RequestForwarder {
         retry_err: ProxyError,
         provider: &Provider,
         app_type_str: &str,
-        used_half_open_permit: bool,
+        provider_permit: &mut Option<ProviderRequestPermit>,
         rectifier_label: &str,
         last_error: &mut Option<ProxyError>,
         last_provider: &mut Option<Provider>,
@@ -298,16 +536,29 @@ impl RequestForwarder {
         };
 
         if is_provider_error {
-            let _ = self
-                .router
-                .record_result(
+            let _ = if provider_permit
+                .as_ref()
+                .is_some_and(|permit| permit.used_half_open_permit())
+            {
+                self.record_half_open_result_cancellation_safe(
+                    provider_permit,
                     &provider.id,
                     app_type_str,
-                    used_half_open_permit,
                     false,
                     Some(retry_err.to_string()),
                 )
-                .await;
+                .await
+            } else {
+                self.router
+                    .record_result(
+                        &provider.id,
+                        app_type_str,
+                        false,
+                        false,
+                        Some(retry_err.to_string()),
+                    )
+                    .await
+            };
             {
                 let mut status = self.status.write().await;
                 status.last_error = Some(format!(
@@ -320,9 +571,7 @@ impl RequestForwarder {
             return None;
         }
 
-        self.router
-            .release_permit_neutral(&provider.id, app_type_str, used_half_open_permit)
-            .await;
+        drop(provider_permit.take());
         let mut status = self.status.write().await;
         status.failed_requests += 1;
         status.last_error = Some(retry_err.to_string());
@@ -409,7 +658,8 @@ impl RequestForwarder {
         let mut attempted_providers = 0usize;
 
         // 单 Provider 场景下跳过熔断器检查（故障转移关闭时）
-        let bypass_circuit_breaker = providers.len() == 1;
+        let bypass_circuit_breaker =
+            self.bypass_single_provider_circuit_breaker && providers.len() == 1;
 
         // 依次尝试每个供应商
         for provider in providers.iter() {
@@ -432,20 +682,22 @@ impl RequestForwarder {
 
             // 发起请求前先获取熔断器放行许可（HalfOpen 会占用探测名额）
             // 单 Provider 场景下跳过此检查，避免熔断器阻塞所有请求
-            let (allowed, used_half_open_permit) = if bypass_circuit_breaker {
-                (true, false)
+            let mut provider_permit = if bypass_circuit_breaker {
+                None
             } else {
-                let permit = self
-                    .router
-                    .allow_provider_request(&provider.id, app_type_str)
-                    .await;
-                (permit.allowed, permit.used_half_open_permit)
+                Some(
+                    self.router
+                        .allow_provider_request(&provider.id, app_type_str)
+                        .await,
+                )
             };
 
-            if !allowed {
+            if provider_permit
+                .as_ref()
+                .is_some_and(|permit| !permit.allowed())
+            {
                 continue;
             }
-
             // PRE-SEND 优化器：每个 provider 独立决定是否优化
             // clone body 以避免 Bedrock 优化字段泄漏到非 Bedrock provider（failover 场景）
             let mut provider_body =
@@ -462,41 +714,173 @@ impl RequestForwarder {
                     body.clone()
                 };
 
+            if let Some(model) = self.outbound_model_overrides.get(&provider.id) {
+                provider_body["model"] = Value::String(model.clone());
+            }
+
+            let provider_retry_policy =
+                super::provider_retry::resolve_retry_policy(app_type, &provider_body, provider);
+
+            if let Some(model) = super::codex_auto_review::apply_initial_policy(
+                app_type,
+                endpoint,
+                provider,
+                &mut provider_body,
+            ) {
+                log::info!("[CodexAutoReview] force fallback: codex-auto-review -> {model}");
+            }
+
             attempted_providers += 1;
+            if let (Some(owner), Some(capability_model)) = (
+                self.role_route_owner_id.as_deref(),
+                self.role_route_capability_model.as_deref(),
+            ) {
+                let outbound_model = provider_body
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or(capability_model);
+                let retry_limit = provider_retry_policy
+                    .as_ref()
+                    .map(|policy| policy.max_retries())
+                    .unwrap_or(0);
+                log::info!(
+                    "[CodexRoleRoute] role=frontend owner_provider={} target_provider={} capability_model={} outbound_model={} provider_retry=0/{} route_fallback={} sync_logical_target=false terminal=attempt",
+                    owner,
+                    provider.id,
+                    capability_model,
+                    outbound_model,
+                    retry_limit,
+                    attempted_providers > 1
+                );
+            }
 
             // 更新状态中的当前 Provider 信息（per-attempt 维度的标识）
             //
             // total_requests / last_request_at / active_connections 已由
             // forward_with_retry wrapper 在客户端请求维度统一处理，这里只刷
             // 新「正在尝试哪个 provider」的展示字段。
-            {
+            if self.sync_logical_target {
                 let mut status = self.status.write().await;
                 status.current_provider = Some(provider.name.clone());
                 status.current_provider_id = Some(provider.id.clone());
             }
 
-            // 转发请求（每个 Provider 只尝试一次，重试由客户端控制）
-            match self
-                .forward(
+            let mut provider_retries = 0usize;
+            let mut provider_retry_exhausted_with_match = false;
+            let forward_result = loop {
+                let result = self
+                    .forward(
+                        app_type,
+                        &method,
+                        provider,
+                        endpoint,
+                        &provider_body,
+                        &headers,
+                        &extensions,
+                        adapter.as_ref(),
+                    )
+                    .await;
+
+                let result = match (result, provider_retry_policy.as_ref()) {
+                    (Ok((response, claude_api_format, outbound_model)), Some(policy)) => {
+                        let request_is_streaming =
+                            is_streaming_request(endpoint, &provider_body, &headers);
+                        self.validate_provider_retry_success_response(
+                            response,
+                            request_is_streaming,
+                            policy,
+                        )
+                        .await
+                        .map(|response| (response, claude_api_format, outbound_model))
+                    }
+                    (result, _) => result,
+                };
+
+                let Err(error) = &result else {
+                    break result;
+                };
+
+                if let Some(model) = super::codex_auto_review::fallback_after_error(
                     app_type,
-                    &method,
-                    provider,
                     endpoint,
+                    provider,
                     &provider_body,
-                    &headers,
-                    &extensions,
-                    adapter.as_ref(),
-                )
-                .await
-            {
+                    error,
+                ) {
+                    super::codex_auto_review::apply_fallback(&mut provider_body, &model);
+                    log::info!(
+                        "[CodexAutoReview] native model unavailable; retrying same provider with {model}"
+                    );
+                    continue;
+                }
+
+                if let Some(policy) = provider_retry_policy.as_ref() {
+                    if let Some(reason) = policy.match_error(error) {
+                        if provider_retries < policy.max_retries() {
+                            provider_retries += 1;
+                            let delay_ms = policy.retry_delay_ms();
+                            let model = retry_log_model(app_type, endpoint, &provider_body);
+                            if let (Some(owner), Some(capability_model)) = (
+                                self.role_route_owner_id.as_deref(),
+                                self.role_route_capability_model.as_deref(),
+                            ) {
+                                log::warn!(
+                                    "[ProviderRetry] app={} role=frontend owner_provider={} target_provider={} capability_model={} outbound_model={} reason={} provider_retry={}/{} route_fallback={} sync_logical_target=false delay_ms={}",
+                                    app_type_str,
+                                    owner,
+                                    provider.id,
+                                    capability_model,
+                                    model,
+                                    reason,
+                                    provider_retries,
+                                    policy.max_retries(),
+                                    attempted_providers > 1,
+                                    delay_ms
+                                );
+                            } else {
+                                log::warn!(
+                                    "[ProviderRetry] app={} provider={} model={} reason={} retry={}/{} delay_ms={}",
+                                    app_type_str,
+                                    provider.name,
+                                    model,
+                                    reason,
+                                    provider_retries,
+                                    policy.max_retries(),
+                                    delay_ms
+                                );
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            continue;
+                        }
+                        provider_retry_exhausted_with_match = true;
+                    }
+                }
+
+                break result;
+            };
+
+            match forward_result {
                 Ok((response, claude_api_format, outbound_model)) => {
+                    let (response, deferred_role_stream) = self.defer_role_stream_result(
+                        response,
+                        provider,
+                        app_type_str,
+                        &mut provider_permit,
+                        attempted_providers > 1,
+                    );
                     // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
                     // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
-                    self.record_success_result(&provider.id, app_type_str, used_half_open_permit)
+                    if !deferred_role_stream {
+                        self.record_success_result(
+                            &provider.id,
+                            app_type_str,
+                            &mut provider_permit,
+                        )
                         .await;
+                    }
 
                     // 更新当前应用类型使用的 provider
-                    {
+                    if self.sync_logical_target {
                         let mut current_providers = self.current_providers.write().await;
                         current_providers.insert(
                             app_type_str.to_string(),
@@ -505,12 +889,12 @@ impl RequestForwarder {
                     }
 
                     // 更新成功统计
-                    {
+                    if !deferred_role_stream {
                         let mut status = self.status.write().await;
                         status.success_requests += 1;
                         status.last_error = None;
-                        let should_switch =
-                            self.current_provider_id_at_start.as_str() != provider.id.as_str();
+                        let should_switch = self.sync_logical_target
+                            && self.current_provider_id_at_start.as_str() != provider.id.as_str();
                         if should_switch {
                             status.failover_count += 1;
 
@@ -520,9 +904,12 @@ impl RequestForwarder {
                             let pid = provider.id.clone();
                             let pname = provider.name.clone();
                             let at = app_type_str.to_string();
+                            let expected = self.current_provider_id_at_start.clone();
 
                             tokio::spawn(async move {
-                                let _ = fm.try_switch(ah.as_ref(), &at, &pid, &pname).await;
+                                let _ = fm
+                                    .try_switch(ah.as_ref(), &at, &expected, &pid, &pname)
+                                    .await;
                             });
                         }
                         // 重新计算成功率
@@ -533,6 +920,15 @@ impl RequestForwarder {
                         }
                     }
 
+                    if !deferred_role_stream {
+                        self.log_role_terminal(
+                            provider,
+                            outbound_model.as_deref(),
+                            attempted_providers > 1,
+                            "success",
+                            None,
+                        );
+                    }
                     return Ok(ForwardResult {
                         response,
                         provider: provider.clone(),
@@ -592,14 +988,24 @@ impl RequestForwarder {
                                     log::info!(
                                         "[{app_type_str}] [Media] Unsupported-image retry succeeded"
                                     );
-                                    self.record_success_result(
-                                        &provider.id,
-                                        app_type_str,
-                                        used_half_open_permit,
-                                    )
-                                    .await;
+                                    let (response, deferred_role_stream) = self
+                                        .defer_role_stream_result(
+                                            response,
+                                            provider,
+                                            app_type_str,
+                                            &mut provider_permit,
+                                            attempted_providers > 1,
+                                        );
+                                    if !deferred_role_stream {
+                                        self.record_success_result(
+                                            &provider.id,
+                                            app_type_str,
+                                            &mut provider_permit,
+                                        )
+                                        .await;
+                                    }
 
-                                    {
+                                    if self.sync_logical_target {
                                         let mut current_providers =
                                             self.current_providers.write().await;
                                         current_providers.insert(
@@ -608,12 +1014,12 @@ impl RequestForwarder {
                                         );
                                     }
 
-                                    {
+                                    if !deferred_role_stream {
                                         let mut status = self.status.write().await;
                                         status.success_requests += 1;
                                         status.last_error = None;
-                                        let should_switch =
-                                            self.current_provider_id_at_start.as_str()
+                                        let should_switch = self.sync_logical_target
+                                            && self.current_provider_id_at_start.as_str()
                                                 != provider.id.as_str();
                                         if should_switch {
                                             status.failover_count += 1;
@@ -622,10 +1028,18 @@ impl RequestForwarder {
                                             let pid = provider.id.clone();
                                             let pname = provider.name.clone();
                                             let at = app_type_str.to_string();
+                                            let expected =
+                                                self.current_provider_id_at_start.clone();
 
                                             tokio::spawn(async move {
                                                 let _ = fm
-                                                    .try_switch(ah.as_ref(), &at, &pid, &pname)
+                                                    .try_switch(
+                                                        ah.as_ref(),
+                                                        &at,
+                                                        &expected,
+                                                        &pid,
+                                                        &pname,
+                                                    )
                                                     .await;
                                             });
                                         }
@@ -636,6 +1050,15 @@ impl RequestForwarder {
                                         }
                                     }
 
+                                    if !deferred_role_stream {
+                                        self.log_role_terminal(
+                                            provider,
+                                            outbound_model.as_deref(),
+                                            attempted_providers > 1,
+                                            "success",
+                                            None,
+                                        );
+                                    }
                                     return Ok(ForwardResult {
                                         response,
                                         provider: provider.clone(),
@@ -653,7 +1076,7 @@ impl RequestForwarder {
                                             retry_err,
                                             provider,
                                             app_type_str,
-                                            used_half_open_permit,
+                                            &mut provider_permit,
                                             "media 降级",
                                             &mut last_error,
                                             &mut last_provider,
@@ -678,13 +1101,7 @@ impl RequestForwarder {
                             if rectifier_retried {
                                 log::warn!("[{app_type_str}] [RECT-005] 整流器已触发过，不再重试");
                                 // 释放 HalfOpen permit（不记录熔断器，这是客户端兼容性问题）
-                                self.router
-                                    .release_permit_neutral(
-                                        &provider.id,
-                                        app_type_str,
-                                        used_half_open_permit,
-                                    )
-                                    .await;
+                                drop(provider_permit.take());
                                 let mut status = self.status.write().await;
                                 status.failed_requests += 1;
                                 status.last_error = Some(e.to_string());
@@ -736,15 +1153,25 @@ impl RequestForwarder {
                                 {
                                     Ok((response, claude_api_format, outbound_model)) => {
                                         log::info!("[{app_type_str}] [RECT-002] 整流重试成功");
-                                        self.record_success_result(
-                                            &provider.id,
-                                            app_type_str,
-                                            used_half_open_permit,
-                                        )
-                                        .await;
+                                        let (response, deferred_role_stream) = self
+                                            .defer_role_stream_result(
+                                                response,
+                                                provider,
+                                                app_type_str,
+                                                &mut provider_permit,
+                                                attempted_providers > 1,
+                                            );
+                                        if !deferred_role_stream {
+                                            self.record_success_result(
+                                                &provider.id,
+                                                app_type_str,
+                                                &mut provider_permit,
+                                            )
+                                            .await;
+                                        }
 
                                         // 更新当前应用类型使用的 provider
-                                        {
+                                        if self.sync_logical_target {
                                             let mut current_providers =
                                                 self.current_providers.write().await;
                                             current_providers.insert(
@@ -754,12 +1181,12 @@ impl RequestForwarder {
                                         }
 
                                         // 更新成功统计
-                                        {
+                                        if !deferred_role_stream {
                                             let mut status = self.status.write().await;
                                             status.success_requests += 1;
                                             status.last_error = None;
-                                            let should_switch =
-                                                self.current_provider_id_at_start.as_str()
+                                            let should_switch = self.sync_logical_target
+                                                && self.current_provider_id_at_start.as_str()
                                                     != provider.id.as_str();
                                             if should_switch {
                                                 status.failover_count += 1;
@@ -770,10 +1197,18 @@ impl RequestForwarder {
                                                 let pid = provider.id.clone();
                                                 let pname = provider.name.clone();
                                                 let at = app_type_str.to_string();
+                                                let expected =
+                                                    self.current_provider_id_at_start.clone();
 
                                                 tokio::spawn(async move {
                                                     let _ = fm
-                                                        .try_switch(ah.as_ref(), &at, &pid, &pname)
+                                                        .try_switch(
+                                                            ah.as_ref(),
+                                                            &at,
+                                                            &expected,
+                                                            &pid,
+                                                            &pname,
+                                                        )
                                                         .await;
                                                 });
                                             }
@@ -785,6 +1220,15 @@ impl RequestForwarder {
                                             }
                                         }
 
+                                        if !deferred_role_stream {
+                                            self.log_role_terminal(
+                                                provider,
+                                                outbound_model.as_deref(),
+                                                attempted_providers > 1,
+                                                "success",
+                                                None,
+                                            );
+                                        }
                                         return Ok(ForwardResult {
                                             response,
                                             provider: provider.clone(),
@@ -802,7 +1246,7 @@ impl RequestForwarder {
                                                 retry_err,
                                                 provider,
                                                 app_type_str,
-                                                used_half_open_permit,
+                                                &mut provider_permit,
                                                 "整流",
                                                 &mut last_error,
                                                 &mut last_provider,
@@ -830,13 +1274,7 @@ impl RequestForwarder {
                                 log::warn!(
                                     "[{app_type_str}] [RECT-013] budget 整流器已触发过，不再重试"
                                 );
-                                self.router
-                                    .release_permit_neutral(
-                                        &provider.id,
-                                        app_type_str,
-                                        used_half_open_permit,
-                                    )
-                                    .await;
+                                drop(provider_permit.take());
                                 let mut status = self.status.write().await;
                                 status.failed_requests += 1;
                                 status.last_error = Some(e.to_string());
@@ -856,13 +1294,7 @@ impl RequestForwarder {
                                 log::warn!(
                                     "[{app_type_str}] [RECT-014] budget 整流器触发但无可整流内容，不做无意义重试"
                                 );
-                                self.router
-                                    .release_permit_neutral(
-                                        &provider.id,
-                                        app_type_str,
-                                        used_half_open_permit,
-                                    )
-                                    .await;
+                                drop(provider_permit.take());
                                 let mut status = self.status.write().await;
                                 status.failed_requests += 1;
                                 status.last_error = Some(e.to_string());
@@ -902,14 +1334,24 @@ impl RequestForwarder {
                             {
                                 Ok((response, claude_api_format, outbound_model)) => {
                                     log::info!("[{app_type_str}] [RECT-011] budget 整流重试成功");
-                                    self.record_success_result(
-                                        &provider.id,
-                                        app_type_str,
-                                        used_half_open_permit,
-                                    )
-                                    .await;
+                                    let (response, deferred_role_stream) = self
+                                        .defer_role_stream_result(
+                                            response,
+                                            provider,
+                                            app_type_str,
+                                            &mut provider_permit,
+                                            attempted_providers > 1,
+                                        );
+                                    if !deferred_role_stream {
+                                        self.record_success_result(
+                                            &provider.id,
+                                            app_type_str,
+                                            &mut provider_permit,
+                                        )
+                                        .await;
+                                    }
 
-                                    {
+                                    if self.sync_logical_target {
                                         let mut current_providers =
                                             self.current_providers.write().await;
                                         current_providers.insert(
@@ -918,12 +1360,12 @@ impl RequestForwarder {
                                         );
                                     }
 
-                                    {
+                                    if !deferred_role_stream {
                                         let mut status = self.status.write().await;
                                         status.success_requests += 1;
                                         status.last_error = None;
-                                        let should_switch =
-                                            self.current_provider_id_at_start.as_str()
+                                        let should_switch = self.sync_logical_target
+                                            && self.current_provider_id_at_start.as_str()
                                                 != provider.id.as_str();
                                         if should_switch {
                                             status.failover_count += 1;
@@ -932,9 +1374,17 @@ impl RequestForwarder {
                                             let pid = provider.id.clone();
                                             let pname = provider.name.clone();
                                             let at = app_type_str.to_string();
+                                            let expected =
+                                                self.current_provider_id_at_start.clone();
                                             tokio::spawn(async move {
                                                 let _ = fm
-                                                    .try_switch(ah.as_ref(), &at, &pid, &pname)
+                                                    .try_switch(
+                                                        ah.as_ref(),
+                                                        &at,
+                                                        &expected,
+                                                        &pid,
+                                                        &pname,
+                                                    )
                                                     .await;
                                             });
                                         }
@@ -945,6 +1395,15 @@ impl RequestForwarder {
                                         }
                                     }
 
+                                    if !deferred_role_stream {
+                                        self.log_role_terminal(
+                                            provider,
+                                            outbound_model.as_deref(),
+                                            attempted_providers > 1,
+                                            "success",
+                                            None,
+                                        );
+                                    }
                                     return Ok(ForwardResult {
                                         response,
                                         provider: provider.clone(),
@@ -962,7 +1421,7 @@ impl RequestForwarder {
                                             retry_err,
                                             provider,
                                             app_type_str,
-                                            used_half_open_permit,
+                                            &mut provider_permit,
                                             "budget 整流",
                                             &mut last_error,
                                             &mut last_provider,
@@ -978,13 +1437,7 @@ impl RequestForwarder {
                     }
 
                     if signature_rectifier_non_retryable_client_error {
-                        self.router
-                            .release_permit_neutral(
-                                &provider.id,
-                                app_type_str,
-                                used_half_open_permit,
-                            )
-                            .await;
+                        drop(provider_permit.take());
                         let mut status = self.status.write().await;
                         status.failed_requests += 1;
                         status.last_error = Some(e.to_string());
@@ -1002,21 +1455,38 @@ impl RequestForwarder {
                     // 先分类错误，决定是否计入 provider 健康度
                     // —— NonRetryable / ClientAbort 是客户端层错误，无论换哪家 provider 都会被拒绝，
                     //    不应污染熔断器和数据库健康度（与 release_permit_neutral 同语义）。
-                    let category = self.categorize_proxy_error(&e, provider);
+                    let category = if provider_retry_exhausted_with_match {
+                        ErrorCategory::Retryable
+                    } else {
+                        self.categorize_proxy_error(&e, provider)
+                    };
 
                     match category {
                         ErrorCategory::Retryable => {
                             // 可重试：真正的 provider 故障 → 记录失败并更新熔断器/DB 健康度
-                            let _ = self
-                                .router
-                                .record_result(
+                            let _ = if provider_permit
+                                .as_ref()
+                                .is_some_and(|permit| permit.used_half_open_permit())
+                            {
+                                self.record_half_open_result_cancellation_safe(
+                                    &mut provider_permit,
                                     &provider.id,
                                     app_type_str,
-                                    used_half_open_permit,
                                     false,
                                     Some(e.to_string()),
                                 )
-                                .await;
+                                .await
+                            } else {
+                                self.router
+                                    .record_result(
+                                        &provider.id,
+                                        app_type_str,
+                                        false,
+                                        false,
+                                        Some(e.to_string()),
+                                    )
+                                    .await
+                            };
 
                             {
                                 let mut status = self.status.write().await;
@@ -1031,6 +1501,14 @@ impl RequestForwarder {
                                 &e,
                             );
                             log::warn!("[{app_type_str}] [{log_code}] {log_message}");
+                            let role_error = e.to_string();
+                            self.log_role_terminal(
+                                provider,
+                                provider_body.get("model").and_then(Value::as_str),
+                                attempted_providers > 1,
+                                "attempt_failed",
+                                Some(&role_error),
+                            );
 
                             last_error = Some(e);
                             last_provider = Some(provider.clone());
@@ -1039,13 +1517,7 @@ impl RequestForwarder {
                         }
                         ErrorCategory::NonRetryable | ErrorCategory::ClientAbort => {
                             // 不可重试：客户端层错误或客户端断连 → 不污染健康度，仅释放 HalfOpen permit
-                            self.router
-                                .release_permit_neutral(
-                                    &provider.id,
-                                    app_type_str,
-                                    used_half_open_permit,
-                                )
-                                .await;
+                            drop(provider_permit.take());
                             {
                                 let mut status = self.status.write().await;
                                 status.failed_requests += 1;
@@ -1056,6 +1528,14 @@ impl RequestForwarder {
                                         * 100.0;
                                 }
                             }
+                            let role_error = e.to_string();
+                            self.log_role_terminal(
+                                provider,
+                                provider_body.get("model").and_then(Value::as_str),
+                                attempted_providers > 1,
+                                "failed",
+                                Some(&role_error),
+                            );
                             return Err(ForwardError {
                                 error: e,
                                 provider: Some(provider.clone()),
@@ -1098,6 +1578,18 @@ impl RequestForwarder {
             build_terminal_failure_log(attempted_providers, providers.len(), last_error.as_ref())
         {
             log::warn!("[{app_type_str}] [{log_code}] {log_message}");
+        }
+        if let Some(provider) = last_provider.as_ref() {
+            let role_error = last_error.as_ref().map(ToString::to_string);
+            self.log_role_terminal(
+                provider,
+                self.outbound_model_overrides
+                    .get(&provider.id)
+                    .map(String::as_str),
+                attempted_providers > 1,
+                "failed",
+                role_error.as_deref(),
+            );
         }
 
         Err(ForwardError {
@@ -1167,11 +1659,15 @@ impl RequestForwarder {
 
         // 与 CCH 对齐：请求前不做 thinking 主动改写（仅保留兼容入口）
         let mut mapped_body = normalize_thinking_type(mapped_body);
+        let outbound_model_override = self.outbound_model_overrides.get(&provider.id);
+        if let Some(model) = outbound_model_override {
+            mapped_body["model"] = Value::String(model.clone());
+        }
 
         // Grok Build exposes a stable client-side model profile in config.toml.
         // Route requests to the provider's real upstream model before applying
         // the optional Responses -> Chat/Anthropic bridge.
-        if matches!(app_type, AppType::GrokBuild) {
+        if matches!(app_type, AppType::GrokBuild) && outbound_model_override.is_none() {
             super::providers::apply_codex_upstream_model(provider, &mut mapped_body);
         }
 
@@ -1427,7 +1923,9 @@ impl RequestForwarder {
                     "[Codex] Restored or enriched {restored} cached function call item(s) for Chat upstream"
                 );
             }
-            super::providers::apply_codex_chat_upstream_model(provider, &mut mapped_body);
+            if outbound_model_override.is_none() {
+                super::providers::apply_codex_chat_upstream_model(provider, &mut mapped_body);
+            }
             let reasoning_config =
                 super::providers::resolve_codex_chat_reasoning_config(provider, &mapped_body);
             let mut chat_body = super::providers::transform_codex_chat::responses_to_chat_completions_with_reasoning(
@@ -1444,7 +1942,9 @@ impl RequestForwarder {
             chat_body
         } else if codex_responses_to_anthropic {
             let mut mapped_body = mapped_body;
-            super::providers::apply_codex_upstream_model(provider, &mut mapped_body);
+            if outbound_model_override.is_none() {
+                super::providers::apply_codex_upstream_model(provider, &mut mapped_body);
+            }
             // Per-provider output ceiling override. Codex does not forward its
             // `model_max_output_tokens` in the request body, so honor the value
             // configured on the provider here — it takes precedence over any
@@ -1518,6 +2018,17 @@ impl RequestForwarder {
             mapped_body
         };
 
+        let outbound_model_override_for_wire = outbound_model_override.map(|model| {
+            if matches!(app_type, AppType::Codex | AppType::GrokBuild) {
+                super::model_mapper::strip_one_m_suffix_for_upstream(model).to_string()
+            } else {
+                model.clone()
+            }
+        });
+        if let Some(model) = outbound_model_override_for_wire.as_ref() {
+            request_body["model"] = Value::String(model.clone());
+        }
+
         if matches!(app_type, AppType::Codex | AppType::GrokBuild) {
             self.apply_media_prevention(&mut request_body, provider);
         }
@@ -1535,6 +2046,9 @@ impl RequestForwarder {
                     filtered_body = prepare_upstream_request_body(filtered_body);
                 }
             }
+        }
+        if let Some(model) = outbound_model_override_for_wire.as_ref() {
+            filtered_body["model"] = Value::String(model.clone());
         }
         // 出站 body 定稿后刷新真值（覆盖 Codex chat 上游模型覆写、转换层模型改写）
         if let Some(m) = filtered_body
@@ -1819,6 +2333,10 @@ impl RequestForwarder {
 
         for (key, value) in headers {
             let key_str = key.as_str();
+
+            if is_codex_role_control_header(key_str) {
+                continue;
+            }
 
             // --- host — 原位替换为上游 host（保持客户端原始位置） ---
             if key_str.eq_ignore_ascii_case("host") {
@@ -2291,6 +2809,37 @@ impl RequestForwarder {
         &self,
         response: ProxyResponse,
     ) -> Result<ProxyResponse, ProxyError> {
+        self.validate_responses_success_response_if(response, |_| true)
+            .await
+    }
+
+    async fn validate_provider_retry_success_response(
+        &self,
+        response: ProxyResponse,
+        request_is_streaming: bool,
+        policy: &super::provider_retry::ResolvedRetryPolicy,
+    ) -> Result<ProxyResponse, ProxyError> {
+        if !request_is_streaming || response.is_json() {
+            self.validate_responses_success_response_if(response, |error| {
+                policy.match_error(error).is_some()
+            })
+            .await
+        } else {
+            self.validate_responses_stream_start_if(response, |error| {
+                policy.match_error(error).is_some()
+            })
+            .await
+        }
+    }
+
+    async fn validate_responses_success_response_if<F>(
+        &self,
+        response: ProxyResponse,
+        should_reject: F,
+    ) -> Result<ProxyResponse, ProxyError>
+    where
+        F: Fn(&ProxyError) -> bool,
+    {
         let status = response.status();
         let headers = response.headers().clone();
         let encoding = get_content_encoding(&headers);
@@ -2304,9 +2853,12 @@ impl RequestForwarder {
         };
 
         if let Some(message) = responses_error_envelope_message(&decoded) {
-            return Err(ProxyError::TransformError(format!(
+            let error = ProxyError::TransformError(format!(
                 "Responses upstream returned a 2xx failure: {message}"
-            )));
+            ));
+            if should_reject(&error) {
+                return Err(error);
+            }
         }
 
         Ok(ProxyResponse::buffered(status, headers, raw))
@@ -2316,6 +2868,18 @@ impl RequestForwarder {
         &self,
         response: ProxyResponse,
     ) -> Result<ProxyResponse, ProxyError> {
+        self.validate_responses_stream_start_if(response, |_| true)
+            .await
+    }
+
+    async fn validate_responses_stream_start_if<F>(
+        &self,
+        response: ProxyResponse,
+        should_reject: F,
+    ) -> Result<ProxyResponse, ProxyError>
+    where
+        F: Fn(&ProxyError) -> bool,
+    {
         const MAX_PRIME_BYTES: usize = 256 * 1024;
 
         let status = response.status();
@@ -2324,44 +2888,70 @@ impl RequestForwarder {
         let mut replay_chunks: Vec<Bytes> = Vec::new();
         let mut parse_buffer = String::new();
         let mut utf8_remainder = Vec::new();
+        let filter_outcome = |outcome: Result<(), ProxyError>| match outcome {
+            Err(error) if should_reject(&error) => Err(error),
+            _ => Ok(()),
+        };
 
         loop {
             let next = if self.streaming_first_byte_timeout.is_zero() {
                 stream.next().await
             } else {
-                tokio::time::timeout(self.streaming_first_byte_timeout, stream.next())
-                    .await
-                    .map_err(|_| {
-                        ProxyError::Timeout(format!(
+                match tokio::time::timeout(self.streaming_first_byte_timeout, stream.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        let error = ProxyError::Timeout(format!(
                             "Responses stream produced no semantic output within {}s",
                             self.streaming_first_byte_timeout.as_secs()
-                        ))
-                    })?
+                        ));
+                        if should_reject(&error) {
+                            return Err(error);
+                        }
+                        let replay =
+                            futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
+                        return Ok(ProxyResponse::streamed(status, headers, replay));
+                    }
+                }
             };
 
             let Some(chunk) = next else {
                 if let Some(outcome) = inspect_responses_json_document(&parse_buffer) {
-                    outcome?;
+                    filter_outcome(outcome)?;
                     let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok));
                     return Ok(ProxyResponse::streamed(status, headers, replay));
                 }
                 if !parse_buffer.trim().is_empty() {
                     if let Some(outcome) = inspect_responses_start_event(parse_buffer.trim()) {
-                        outcome?;
+                        filter_outcome(outcome)?;
                         let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok));
                         return Ok(ProxyResponse::streamed(status, headers, replay));
                     }
                 }
-                return Err(ProxyError::ForwardFailed(
+                let error = ProxyError::ForwardFailed(
                     "Responses stream ended before producing output or a terminal event"
                         .to_string(),
-                ));
+                );
+                if should_reject(&error) {
+                    return Err(error);
+                }
+                let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok));
+                return Ok(ProxyResponse::streamed(status, headers, replay));
             };
-            let chunk = chunk.map_err(|error| {
-                ProxyError::ForwardFailed(format!(
-                    "Failed while validating Responses stream start: {error}"
-                ))
-            })?;
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(source) => {
+                    let error = ProxyError::ForwardFailed(format!(
+                        "Failed while validating Responses stream start: {source}"
+                    ));
+                    if should_reject(&error) {
+                        return Err(error);
+                    }
+                    let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok))
+                        .chain(futures::stream::once(async move { Err(source) }))
+                        .chain(stream);
+                    return Ok(ProxyResponse::streamed(status, headers, replay));
+                }
+            };
             crate::proxy::sse::append_utf8_safe(&mut parse_buffer, &mut utf8_remainder, &chunk);
             replay_chunks.push(chunk);
 
@@ -2370,14 +2960,14 @@ impl RequestForwarder {
             // shape before looking for SSE delimiters; pretty-printed JSON may itself
             // contain blank lines and must stay intact.
             if let Some(outcome) = inspect_responses_json_document(&parse_buffer) {
-                outcome?;
+                filter_outcome(outcome)?;
                 let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
                 return Ok(ProxyResponse::streamed(status, headers, replay));
             }
 
             while let Some(block) = crate::proxy::sse::take_sse_block(&mut parse_buffer) {
                 if let Some(outcome) = inspect_responses_start_event(&block) {
-                    outcome?;
+                    filter_outcome(outcome)?;
                     let replay =
                         futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
                     return Ok(ProxyResponse::streamed(status, headers, replay));
@@ -2386,7 +2976,7 @@ impl RequestForwarder {
 
             if replay_chunks.iter().map(Bytes::len).sum::<usize>() >= MAX_PRIME_BYTES {
                 log::warn!(
-                    "[Claude/Responses] semantic stream priming exceeded {MAX_PRIME_BYTES} bytes; committing buffered stream"
+                    "[Responses] semantic stream priming exceeded {MAX_PRIME_BYTES} bytes; committing buffered stream"
                 );
                 let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
                 return Ok(ProxyResponse::streamed(status, headers, replay));
@@ -2839,17 +3429,30 @@ fn codex_anthropic_error_envelope_message(body: &[u8]) -> Option<String> {
 
 fn responses_error_envelope_message(body: &[u8]) -> Option<String> {
     let value: Value = serde_json::from_slice(body).ok()?;
-    let status = value.get("status").and_then(Value::as_str);
-    let has_error = value.get("error").is_some_and(|error| !error.is_null());
-    if !matches!(status, Some("failed" | "cancelled")) && !has_error {
+    let response = value.get("response").unwrap_or(&value);
+    let status = response.get("status").and_then(Value::as_str);
+    let event_type = value.get("type").and_then(Value::as_str);
+    let has_error = response
+        .get("error")
+        .or_else(|| value.get("error"))
+        .is_some_and(|error| !error.is_null());
+    if !matches!(status, Some("failed" | "cancelled"))
+        && !matches!(event_type, Some("error" | "response.failed"))
+        && !has_error
+    {
         return None;
     }
 
-    let error = value.get("error").unwrap_or(&value);
+    let error = response
+        .get("error")
+        .or_else(|| value.get("error"))
+        .unwrap_or(response);
     let error_type = error
         .get("type")
         .and_then(Value::as_str)
         .or_else(|| error.get("code").and_then(Value::as_str))
+        .or_else(|| error.get("status").and_then(Value::as_str))
+        .or(event_type)
         .unwrap_or_else(|| status.unwrap_or("error"));
     let message = error
         .get("message")
@@ -2909,7 +3512,11 @@ fn inspect_responses_start_event(block: &str) -> Option<Result<(), ProxyError>> 
     if data_lines.is_empty() {
         return None;
     }
-    let value: Value = match serde_json::from_str(&data_lines.join("\n")) {
+    let data = data_lines.join("\n");
+    if data.trim() == "[DONE]" {
+        return Some(Ok(()));
+    }
+    let value: Value = match serde_json::from_str(&data) {
         Ok(value) => value,
         Err(_) => return None,
     };
@@ -2919,31 +3526,15 @@ fn inspect_responses_start_event(block: &str) -> Option<Result<(), ProxyError>> 
         .or_else(|| value.get("type").and_then(Value::as_str))
         .unwrap_or("");
 
-    let response = value.get("response").unwrap_or(&value);
-    if matches!(
-        response.get("status").and_then(Value::as_str),
-        Some("failed" | "cancelled")
-    ) || response.get("error").is_some_and(|error| !error.is_null())
-    {
-        let error = response.get("error").unwrap_or(response);
-        let message = error
-            .get("message")
-            .and_then(Value::as_str)
-            .or_else(|| error.as_str())
-            .unwrap_or("Responses upstream failed before output");
-        let error_type = error
-            .get("type")
-            .and_then(Value::as_str)
-            .or_else(|| error.get("code").and_then(Value::as_str))
-            .or_else(|| response.get("status").and_then(Value::as_str))
-            .unwrap_or("upstream_error");
+    if let Some(message) = responses_error_envelope_message(data.as_bytes()) {
         return Some(Err(ProxyError::TransformError(format!(
-            "Responses upstream {error_type}: {message}"
+            "Responses upstream returned a 2xx failure: {message}"
         ))));
     }
 
     match event {
         "response.failed" | "error" => {
+            let response = value.get("response").unwrap_or(&value);
             let error = response.get("error").unwrap_or(response);
             let message = error
                 .get("message")
@@ -2959,13 +3550,183 @@ fn inspect_responses_start_event(block: &str) -> Option<Result<(), ProxyError>> 
                 "Responses upstream {error_type}: {message}"
             ))))
         }
-        "response.created" | "response.in_progress" | "response.queued" => None,
-        "" => None,
-        // Productive output, incomplete, and completed terminals are all safe to
-        // expose. Mid-stream failures after this point are surfaced by the converter
-        // but intentionally do not switch providers.
-        _ => Some(Ok(())),
+        "response.created"
+        | "response.in_progress"
+        | "response.queued"
+        | "message_start"
+        | "ping" => None,
+        "content_block_start" => {
+            let block = value.get("content_block").unwrap_or(&Value::Null);
+            let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
+            let has_text = block
+                .get("text")
+                .or_else(|| block.get("thinking"))
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty());
+            if has_text
+                || matches!(
+                    block_type,
+                    "tool_use" | "server_tool_use" | "web_search_tool_result"
+                )
+            {
+                Some(Ok(()))
+            } else {
+                None
+            }
+        }
+        "content_block_delta" => {
+            let delta = value.get("delta").unwrap_or(&Value::Null);
+            let has_output = ["text", "thinking", "partial_json", "signature"]
+                .iter()
+                .any(|key| {
+                    delta
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|output| !output.is_empty())
+                });
+            has_output.then_some(Ok(()))
+        }
+        "response.output_item.added"
+        | "response.output_item.done"
+        | "response.content_part.added"
+        | "response.content_part.done"
+        | "response.reasoning_summary_part.added"
+        | "response.reasoning_summary_part.done"
+        | "response.output_text.done"
+        | "response.refusal.done"
+        | "response.reasoning_summary_text.done"
+        | "response.reasoning_text.done" => {
+            responses_event_has_productive_output(&value).then_some(Ok(()))
+        }
+        "" => sse_json_has_productive_output(&value).then_some(Ok(())),
+        "response.completed" | "response.incomplete" | "message_stop" => Some(Ok(())),
+        "response.output_text.delta"
+        | "response.refusal.delta"
+        | "response.reasoning_summary_text.delta"
+        | "response.reasoning_text.delta"
+        | "response.function_call_arguments.delta"
+        | "response.custom_tool_call_input.delta" => {
+            responses_event_has_productive_output(&value).then_some(Ok(()))
+        }
+        // Unknown and lifecycle-only events stay buffered so a following failure can
+        // still trigger same-provider retry before semantic output is exposed.
+        _ => None,
     }
+}
+
+fn responses_event_has_productive_output(value: &Value) -> bool {
+    fn inspect(value: &Value) -> bool {
+        match value {
+            Value::Array(values) => values.iter().any(inspect),
+            Value::Object(object) => {
+                if object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| {
+                        matches!(
+                            kind,
+                            "function_call"
+                                | "custom_tool_call"
+                                | "computer_call"
+                                | "web_search_call"
+                                | "file_search_call"
+                                | "code_interpreter_call"
+                                | "image_generation_call"
+                                | "local_shell_call"
+                                | "mcp_call"
+                        )
+                    })
+                {
+                    return true;
+                }
+
+                for key in [
+                    "text",
+                    "delta",
+                    "refusal",
+                    "thinking",
+                    "summary_text",
+                    "arguments",
+                    "partial_json",
+                    "code",
+                    "encrypted_content",
+                ] {
+                    if object
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|output| !output.is_empty())
+                    {
+                        return true;
+                    }
+                }
+
+                ["item", "part", "content", "summary"]
+                    .iter()
+                    .any(|key| object.get(*key).is_some_and(inspect))
+            }
+            _ => false,
+        }
+    }
+
+    inspect(value)
+}
+
+fn sse_json_has_productive_output(value: &Value) -> bool {
+    if matches!(
+        value.get("status").and_then(Value::as_str),
+        Some("completed" | "incomplete")
+    ) {
+        return true;
+    }
+
+    if value
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| {
+            choices.iter().any(|choice| {
+                let delta = choice
+                    .get("delta")
+                    .or_else(|| choice.get("message"))
+                    .unwrap_or(&Value::Null);
+                let has_text = ["content", "refusal", "reasoning_content"]
+                    .iter()
+                    .any(|key| {
+                        delta
+                            .get(*key)
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.is_empty())
+                    });
+                has_text
+                    || delta
+                        .get("tool_calls")
+                        .is_some_and(|calls| !calls.is_null())
+                    || delta
+                        .get("function_call")
+                        .is_some_and(|call| !call.is_null())
+                    || choice
+                        .get("finish_reason")
+                        .is_some_and(|reason| !reason.is_null())
+            })
+        })
+    {
+        return true;
+    }
+
+    value
+        .get("candidates")
+        .and_then(Value::as_array)
+        .is_some_and(|candidates| {
+            candidates.iter().any(|candidate| {
+                candidate
+                    .get("content")
+                    .and_then(|content| content.get("parts"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| !parts.is_empty())
+                    || candidate
+                        .get("finishReason")
+                        .is_some_and(|reason| !reason.is_null())
+            })
+        })
 }
 
 /// Rewrite Codex's `/responses` (and variants) to Anthropic's `/v1/messages`, preserving the query.
@@ -3171,8 +3932,26 @@ fn is_streaming_request(endpoint: &str, body: &Value, headers: &axum::http::Head
     headers
         .get(axum::http::header::ACCEPT)
         .and_then(|value| value.to_str().ok())
-        .map(|accept| accept.contains("text/event-stream"))
+        .map(|accept| accept.to_ascii_lowercase().contains("text/event-stream"))
         .unwrap_or(false)
+}
+
+fn retry_log_model<'a>(app_type: &AppType, endpoint: &'a str, body: &'a Value) -> &'a str {
+    if let Some(model) = body.get("model").and_then(Value::as_str) {
+        return model;
+    }
+    if matches!(app_type, AppType::Gemini) {
+        let path = endpoint.split('?').next().unwrap_or(endpoint);
+        if let Some(after_models) = path.rsplit_once("/models/").map(|(_, model)| model) {
+            if let Some(model) = after_models
+                .strip_suffix(":streamGenerateContent")
+                .or_else(|| after_models.strip_suffix(":generateContent"))
+            {
+                return model;
+            }
+        }
+    }
+    "unknown"
 }
 
 #[cfg(test)]
@@ -3327,6 +4106,9 @@ fn is_protected_local_proxy_override_header(name: &http::HeaderName) -> bool {
             | "session_id"
             | "x-client-request-id"
             | "x-codex-window-id"
+            | "x-cc-switch-role-route"
+            | "x-cc-switch-role-owner"
+            | "x-cc-switch-role-token"
             | "x-forwarded-host"
             | "x-forwarded-port"
             | "x-forwarded-proto"
@@ -3353,6 +4135,12 @@ fn is_protected_local_proxy_override_header(name: &http::HeaderName) -> bool {
             | "traceparent"
             | "tracestate"
     )
+}
+
+fn is_codex_role_control_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case(crate::services::codex_agent_roles::ROLE_ROUTE_HEADER)
+        || name.eq_ignore_ascii_case(crate::services::codex_agent_roles::ROLE_OWNER_HEADER)
+        || name.eq_ignore_ascii_case(crate::services::codex_agent_roles::ROLE_TOKEN_HEADER)
 }
 
 fn prepare_upstream_request_body(request_body: Value) -> Value {
@@ -3460,9 +4248,13 @@ fn value_for_log(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::database::Database;
-    use crate::provider::LocalProxyRequestOverrides;
+    use crate::provider::{
+        LocalProxyRequestOverrides, LocalProxyRetryErrorType, LocalProxyRetryPolicy, ProviderMeta,
+        DEFAULT_LOCAL_PROXY_RETRY_MESSAGE,
+    };
     use axum::http::header::{HeaderValue, ACCEPT};
     use axum::http::HeaderMap;
+    use axum::{routing::post, Json, Router};
     use bytes::Bytes;
     use http::StatusCode;
     use serde_json::json;
@@ -3512,7 +4304,182 @@ mod tests {
             non_streaming_timeout,
             streaming_first_byte_timeout,
             max_attempts: 1,
+            sync_logical_target: true,
+            bypass_single_provider_circuit_breaker: true,
+            outbound_model_overrides: HashMap::new(),
+            role_route_owner_id: None,
+            role_route_capability_model: None,
         }
+    }
+
+    fn retry_provider(
+        id: &str,
+        base_url: String,
+        max_retries: u32,
+        custom_messages: Vec<String>,
+        error_types: Vec<LocalProxyRetryErrorType>,
+    ) -> Provider {
+        Provider {
+            id: id.to_string(),
+            name: id.to_string(),
+            settings_config: json!({
+                "base_url": base_url,
+                "auth": { "OPENAI_API_KEY": "test-key" }
+            }),
+            website_url: None,
+            category: None,
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: Some(ProviderMeta {
+                local_proxy_retry_policy: Some(LocalProxyRetryPolicy {
+                    max_retries,
+                    retry_delay_ms: 1,
+                    custom_messages,
+                    error_types,
+                }),
+                ..Default::default()
+            }),
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        }
+    }
+
+    async fn spawn_counting_responses_server(
+        status: StatusCode,
+        body: Value,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_handler = attempts.clone();
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(_body): Json<Value>| {
+                let attempts = attempts_for_handler.clone();
+                let body = body.clone();
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (status, Json(body))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind counting responses server");
+        let address = listener
+            .local_addr()
+            .expect("counting responses server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve counting responses requests");
+        });
+        tokio::task::yield_now().await;
+
+        (format!("http://{address}"), attempts, server)
+    }
+
+    async fn spawn_recording_server(
+        path: &'static str,
+        responses: Vec<(StatusCode, Value)>,
+    ) -> (
+        String,
+        Arc<tokio::sync::Mutex<Vec<(HeaderMap, Value)>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured_for_handler = captured.clone();
+        let responses = Arc::new(responses);
+        let app = Router::new().route(
+            path,
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let captured = captured_for_handler.clone();
+                let responses = responses.clone();
+                async move {
+                    let attempt = {
+                        let mut captured = captured.lock().await;
+                        let attempt = captured.len();
+                        captured.push((headers, body));
+                        attempt
+                    };
+                    let (status, response_body) = responses
+                        .get(attempt)
+                        .or_else(|| responses.last())
+                        .cloned()
+                        .expect("recording server response fixture");
+                    (status, Json(response_body))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind recording responses server");
+        let address = listener
+            .local_addr()
+            .expect("recording responses server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve recording responses requests");
+        });
+        tokio::task::yield_now().await;
+
+        (format!("http://{address}"), captured, server)
+    }
+
+    async fn spawn_two_attempt_sse_server(
+        path: &'static str,
+        first_chunks: Vec<Bytes>,
+        success_body: String,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_handler = attempts.clone();
+        let app = Router::new().route(
+            path,
+            post(move |Json(_body): Json<Value>| {
+                let attempts = attempts_for_handler.clone();
+                let first_chunks = first_chunks.clone();
+                let success_body = success_body.clone();
+                async move {
+                    let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let chunks = if attempt == 0 {
+                        first_chunks
+                    } else {
+                        vec![Bytes::from(success_body)]
+                    };
+                    let stream = futures::stream::iter(
+                        chunks.into_iter().map(Ok::<_, std::convert::Infallible>),
+                    );
+                    http::Response::builder()
+                        .status(StatusCode::OK)
+                        .header(http::header::CONTENT_TYPE, "text/event-stream")
+                        .body(axum::body::Body::from_stream(stream))
+                        .expect("build SSE response")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind two-attempt SSE server");
+        let address = listener
+            .local_addr()
+            .expect("two-attempt SSE server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve two-attempt SSE requests");
+        });
+        tokio::task::yield_now().await;
+
+        (format!("http://{address}"), attempts, server)
     }
 
     #[test]
@@ -3716,6 +4683,11 @@ mod tests {
                 ("X-Test".to_string(), "ok".to_string()),
                 ("Authorization".to_string(), "Bearer bad".to_string()),
                 ("Content-Type".to_string(), "text/plain".to_string()),
+                ("X-CC-Switch-Role-Route".to_string(), "frontend".to_string()),
+                (
+                    "X-CC-Switch-Role-Owner".to_string(),
+                    "provider-a".to_string(),
+                ),
                 ("X-Bad".to_string(), "bad\nvalue".to_string()),
             ]),
             body: None,
@@ -3746,6 +4718,17 @@ mod tests {
             Some("ok")
         );
         assert!(headers.get("x-bad").is_none());
+        assert!(headers.get("x-cc-switch-role-route").is_none());
+        assert!(headers.get("x-cc-switch-role-owner").is_none());
+        assert!(headers.get("x-cc-switch-role-token").is_none());
+    }
+
+    #[test]
+    fn codex_role_control_headers_are_always_private() {
+        assert!(is_codex_role_control_header("x-cc-switch-role-route"));
+        assert!(is_codex_role_control_header("X-CC-SWITCH-ROLE-OWNER"));
+        assert!(is_codex_role_control_header("X-CC-SWITCH-ROLE-TOKEN"));
+        assert!(!is_codex_role_control_header("x-openai-subagent"));
     }
 
     #[test]
@@ -3858,6 +4841,1568 @@ mod tests {
         };
 
         assert!(matches!(err, ProxyError::ForwardFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn auto_review_fallback_retries_model_unavailable_on_same_provider() {
+        let requested_models = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let requested_models_for_handler = requested_models.clone();
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let requested_models = requested_models_for_handler.clone();
+                async move {
+                    let model = body
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let attempt = {
+                        let mut models = requested_models.lock().expect("request model lock");
+                        let attempt = models.len();
+                        models.push(model);
+                        attempt
+                    };
+
+                    if attempt == 0 {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({
+                                "error": {
+                                    "message": "No available channel for model codex-auto-review"
+                                }
+                            })),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "id": "resp-test",
+                                "object": "response",
+                                "status": "completed",
+                                "model": "gpt-5.6-sol",
+                                "output": []
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind retry test server");
+        let address = listener.local_addr().expect("retry test server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve retry test requests");
+        });
+
+        let forwarder = test_forwarder(Duration::from_secs(2), Duration::from_secs(2));
+        let provider = Provider {
+            id: "review-provider".to_string(),
+            name: "Review Provider".to_string(),
+            settings_config: json!({
+                "base_url": format!("http://{address}"),
+                "auth": { "OPENAI_API_KEY": "test-key" }
+            }),
+            website_url: None,
+            category: None,
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: Some(crate::provider::ProviderMeta {
+                codex_auto_review_mode: Some(crate::provider::CodexAutoReviewMode::Auto),
+                codex_auto_review_fallback_model: Some("gpt-5.6-sol".to_string()),
+                ..Default::default()
+            }),
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                http::Method::POST,
+                "/v1/responses",
+                json!({
+                    "model": "codex-auto-review",
+                    "input": "review this command",
+                    "stream": false
+                }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![provider],
+            )
+            .await
+            .unwrap_or_else(|_| panic!("fallback retry should recover"));
+        let response_body = result.response.bytes().await.expect("response bytes");
+        server.abort();
+
+        assert!(String::from_utf8_lossy(&response_body).contains("resp-test"));
+        assert_eq!(
+            *requested_models.lock().expect("request model lock"),
+            vec!["codex-auto-review", "gpt-5.6-sol"]
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_codex_retries_matching_provider_error_on_same_provider() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_handler = attempts.clone();
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(_body): Json<Value>| {
+                let attempts = attempts_for_handler.clone();
+                async move {
+                    if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({
+                                "error": {
+                                    "type": "server_error",
+                                    "message": crate::provider::DEFAULT_LOCAL_PROXY_RETRY_MESSAGE
+                                }
+                            })),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "id": "resp-test",
+                                "status": "completed",
+                                "model": "gpt-5.6-sol",
+                                "output": []
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind provider retry test server");
+        let address = listener
+            .local_addr()
+            .expect("provider retry test server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve provider retry test requests");
+        });
+
+        let forwarder = test_forwarder(Duration::from_secs(2), Duration::from_secs(2));
+        let provider = Provider {
+            id: "normal-provider".to_string(),
+            name: "Normal Provider".to_string(),
+            settings_config: json!({
+                "base_url": format!("http://{address}"),
+                "auth": { "OPENAI_API_KEY": "test-key" }
+            }),
+            website_url: None,
+            category: None,
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: Some(crate::provider::ProviderMeta {
+                local_proxy_retry_policy: Some(crate::provider::LocalProxyRetryPolicy {
+                    max_retries: 1,
+                    retry_delay_ms: 1,
+                    custom_messages: vec![
+                        crate::provider::DEFAULT_LOCAL_PROXY_RETRY_MESSAGE.to_string()
+                    ],
+                    error_types: vec![],
+                }),
+                ..Default::default()
+            }),
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                http::Method::POST,
+                "/v1/responses",
+                json!({
+                    "model": "gpt-5.6-sol",
+                    "input": "continue the conversation",
+                    "stream": false
+                }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![provider],
+            )
+            .await;
+        server.abort();
+
+        assert!(result.is_ok(), "matching provider error should be retried");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn normal_codex_retries_matching_200_failed_sse_on_same_provider() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_handler = attempts.clone();
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(_body): Json<Value>| {
+                let attempts = attempts_for_handler.clone();
+                async move {
+                    let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let body = if attempt == 0 {
+                        format!(
+                            "event: response.failed\ndata: {}\n\n",
+                            json!({
+                                "type": "response.failed",
+                                "response": {
+                                    "status": "failed",
+                                    "error": {
+                                        "type": "server_error",
+                                        "message": crate::provider::DEFAULT_LOCAL_PROXY_RETRY_MESSAGE
+                                    }
+                                }
+                            })
+                        )
+                    } else {
+                        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-test\",\"status\":\"completed\",\"model\":\"gpt-5.6-sol\",\"output\":[]}}\n\n".to_string()
+                    };
+                    (
+                        StatusCode::OK,
+                        [("content-type", "text/event-stream")],
+                        body,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind provider retry SSE test server");
+        let address = listener
+            .local_addr()
+            .expect("provider retry SSE test server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve provider retry SSE test requests");
+        });
+
+        let forwarder = test_forwarder(Duration::from_secs(2), Duration::from_secs(2));
+        let provider = Provider {
+            id: "normal-provider".to_string(),
+            name: "Normal Provider".to_string(),
+            settings_config: json!({
+                "base_url": format!("http://{address}"),
+                "auth": { "OPENAI_API_KEY": "test-key" }
+            }),
+            website_url: None,
+            category: None,
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: Some(crate::provider::ProviderMeta {
+                local_proxy_retry_policy: Some(crate::provider::LocalProxyRetryPolicy {
+                    max_retries: 1,
+                    retry_delay_ms: 1,
+                    custom_messages: vec![
+                        crate::provider::DEFAULT_LOCAL_PROXY_RETRY_MESSAGE.to_string()
+                    ],
+                    error_types: vec![],
+                }),
+                ..Default::default()
+            }),
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                http::Method::POST,
+                "/v1/responses",
+                json!({
+                    "model": "gpt-5.6-sol",
+                    "input": "continue the conversation",
+                    "stream": true
+                }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![provider],
+            )
+            .await
+            .unwrap_or_else(|_| panic!("matching failed SSE should be retried"));
+        let body = result.response.bytes().await.expect("response bytes");
+        server.abort();
+
+        assert!(String::from_utf8_lossy(&body).contains("response.completed"));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn unknown_lifecycle_before_fragmented_target_sse_retries_same_provider() {
+        let lifecycle = Bytes::from_static(
+            b"event: response.vendor_heartbeat\ndata: {\"type\":\"response.vendor_heartbeat\",\"status\":\"in_progress\"}\n\n",
+        );
+        let failed = format!(
+            "event: response.failed\ndata: {}\n\n",
+            json!({
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {
+                        "type": "server_error",
+                        "message": DEFAULT_LOCAL_PROXY_RETRY_MESSAGE
+                    }
+                }
+            })
+        );
+        let split = failed.len() / 2;
+        let (base_url, attempts, server) = spawn_two_attempt_sse_server(
+            "/v1/responses",
+            vec![
+                lifecycle,
+                Bytes::copy_from_slice(&failed.as_bytes()[..split]),
+                Bytes::copy_from_slice(&failed.as_bytes()[split..]),
+            ],
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-lifecycle-success\",\"status\":\"completed\",\"output\":[]}}\n\n".to_string(),
+        )
+        .await;
+
+        let forwarder = test_forwarder(Duration::from_secs(2), Duration::from_secs(2));
+        let provider = retry_provider(
+            "unknown-lifecycle-provider",
+            base_url,
+            1,
+            vec![DEFAULT_LOCAL_PROXY_RETRY_MESSAGE.to_string()],
+            vec![],
+        );
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                http::Method::POST,
+                "/v1/responses",
+                json!({ "model": "gpt-5.6-sol", "input": "continue", "stream": true }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![provider],
+            )
+            .await
+            .unwrap_or_else(|_| panic!("fragmented failure after lifecycle should retry"));
+        let body = result.response.bytes().await.expect("response bytes");
+        server.abort();
+
+        assert!(String::from_utf8_lossy(&body).contains("resp-lifecycle-success"));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn claude_event_error_retries_same_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let error_body = format!(
+            "event: error\ndata: {}\n\n",
+            json!({
+                "type": "error",
+                "error": {
+                    "type": "overloaded_error",
+                    "message": DEFAULT_LOCAL_PROXY_RETRY_MESSAGE
+                }
+            })
+        );
+        let (base_url, attempts, server) = spawn_two_attempt_sse_server(
+            "/v1/messages",
+            vec![Bytes::from(error_body)],
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
+        )
+        .await;
+
+        let forwarder = test_forwarder(Duration::from_secs(2), Duration::from_secs(2));
+        let mut provider = retry_provider(
+            "claude-event-error-provider",
+            base_url.clone(),
+            1,
+            vec![DEFAULT_LOCAL_PROXY_RETRY_MESSAGE.to_string()],
+            vec![],
+        );
+        provider.settings_config = json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": base_url,
+                "ANTHROPIC_API_KEY": "test-key"
+            }
+        });
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Claude,
+                http::Method::POST,
+                "/v1/messages",
+                json!({
+                    "model": "claude-sonnet-4-5",
+                    "max_tokens": 128,
+                    "messages": [{ "role": "user", "content": "continue" }],
+                    "stream": true
+                }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![provider],
+            )
+            .await
+            .unwrap_or_else(|_| panic!("Claude event:error should retry"));
+        let body = result.response.bytes().await.expect("response bytes");
+        server.abort();
+
+        assert!(String::from_utf8_lossy(&body).contains("message_stop"));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn grok_build_response_failed_retries_same_provider() {
+        let error_body = format!(
+            "event: response.failed\ndata: {}\n\n",
+            json!({
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {
+                        "type": "server_error",
+                        "message": DEFAULT_LOCAL_PROXY_RETRY_MESSAGE
+                    }
+                }
+            })
+        );
+        let (base_url, attempts, server) = spawn_two_attempt_sse_server(
+            "/v1/responses",
+            vec![Bytes::from(error_body)],
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"grok-retry-success\",\"status\":\"completed\",\"output\":[]}}\n\n".to_string(),
+        )
+        .await;
+
+        let forwarder = test_forwarder(Duration::from_secs(2), Duration::from_secs(2));
+        let provider = retry_provider(
+            "grok-build-provider",
+            base_url,
+            1,
+            vec![DEFAULT_LOCAL_PROXY_RETRY_MESSAGE.to_string()],
+            vec![],
+        );
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::GrokBuild,
+                http::Method::POST,
+                "/v1/responses",
+                json!({ "model": "grok-code-fast-1", "input": "continue", "stream": true }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![provider],
+            )
+            .await
+            .unwrap_or_else(|_| panic!("Grok Build response.failed should retry"));
+        let body = result.response.bytes().await.expect("response bytes");
+        server.abort();
+
+        assert!(String::from_utf8_lossy(&body).contains("grok-retry-success"));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn gemini_root_error_retries_same_provider() {
+        const ENDPOINT: &str = "/v1beta/models/gemini-2.5-pro:generateContent";
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_handler = attempts.clone();
+        let app = Router::new().route(
+            ENDPOINT,
+            post(move |Json(_body): Json<Value>| {
+                let attempts = attempts_for_handler.clone();
+                async move {
+                    if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        Json(json!({
+                            "error": {
+                                "code": 503,
+                                "status": "UNAVAILABLE",
+                                "message": DEFAULT_LOCAL_PROXY_RETRY_MESSAGE
+                            }
+                        }))
+                    } else {
+                        Json(json!({
+                            "candidates": [{
+                                "content": {
+                                    "role": "model",
+                                    "parts": [{ "text": "recovered" }]
+                                },
+                                "finishReason": "STOP"
+                            }]
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Gemini retry server");
+        let address = listener.local_addr().expect("Gemini retry server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Gemini retry requests");
+        });
+        tokio::task::yield_now().await;
+
+        let forwarder = test_forwarder(Duration::from_secs(2), Duration::from_secs(2));
+        let mut provider = retry_provider(
+            "gemini-root-error-provider",
+            format!("http://{address}"),
+            1,
+            vec![DEFAULT_LOCAL_PROXY_RETRY_MESSAGE.to_string()],
+            vec![],
+        );
+        provider.settings_config = json!({
+            "env": {
+                "GOOGLE_GEMINI_BASE_URL": format!("http://{address}"),
+                "GEMINI_API_KEY": "test-key"
+            }
+        });
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Gemini,
+                http::Method::POST,
+                ENDPOINT,
+                json!({
+                    "contents": [{
+                        "role": "user",
+                        "parts": [{ "text": "continue" }]
+                    }]
+                }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![provider],
+            )
+            .await
+            .unwrap_or_else(|_| panic!("Gemini root error should retry"));
+        let body = result.response.bytes().await.expect("response bytes");
+        server.abort();
+
+        assert!(String::from_utf8_lossy(&body).contains("recovered"));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn normal_codex_retries_matching_200_json_failure_on_same_provider() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_handler = attempts.clone();
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(_body): Json<Value>| {
+                let attempts = attempts_for_handler.clone();
+                async move {
+                    if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        Json(json!({
+                            "status": "failed",
+                            "error": {
+                                "type": "server_error",
+                                "message": DEFAULT_LOCAL_PROXY_RETRY_MESSAGE
+                            }
+                        }))
+                    } else {
+                        Json(json!({
+                            "id": "resp-json-success",
+                            "status": "completed",
+                            "model": "gpt-5.6-sol",
+                            "output": []
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind JSON retry server");
+        let address = listener.local_addr().expect("JSON retry server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve JSON retry requests");
+        });
+
+        let forwarder = test_forwarder(Duration::from_secs(2), Duration::from_secs(2));
+        let provider = retry_provider(
+            "json-provider",
+            format!("http://{address}"),
+            1,
+            vec![DEFAULT_LOCAL_PROXY_RETRY_MESSAGE.to_string()],
+            vec![],
+        );
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                http::Method::POST,
+                "/v1/responses",
+                json!({
+                    "model": "gpt-5.6-sol",
+                    "input": "continue",
+                    "stream": false
+                }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![provider],
+            )
+            .await
+            .unwrap_or_else(|_| panic!("matching JSON failure should be retried"));
+        let body = result.response.bytes().await.expect("response bytes");
+        server.abort();
+
+        assert!(String::from_utf8_lossy(&body).contains("resp-json-success"));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_message_in_successful_model_output_does_not_retry() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_handler = attempts.clone();
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(_body): Json<Value>| {
+                let attempts = attempts_for_handler.clone();
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Json(json!({
+                        "id": "resp-output",
+                        "status": "completed",
+                        "output": [{
+                            "type": "message",
+                            "content": [{
+                                "type": "output_text",
+                                "text": DEFAULT_LOCAL_PROXY_RETRY_MESSAGE
+                            }]
+                        }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind output safety server");
+        let address = listener.local_addr().expect("output safety server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve output safety request");
+        });
+
+        let forwarder = test_forwarder(Duration::from_secs(2), Duration::from_secs(2));
+        let provider = retry_provider(
+            "output-provider",
+            format!("http://{address}"),
+            2,
+            vec![DEFAULT_LOCAL_PROXY_RETRY_MESSAGE.to_string()],
+            vec![],
+        );
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                http::Method::POST,
+                "/v1/responses",
+                json!({ "model": "gpt-5.6-sol", "input": "quote it", "stream": false }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![provider],
+            )
+            .await;
+        server.abort();
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_message_after_stream_output_does_not_replay_request() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_handler = attempts.clone();
+        let raw = format!(
+            "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"visible\"}}\n\nevent: response.failed\ndata: {}\n\n",
+            json!({
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {
+                        "type": "server_error",
+                        "message": DEFAULT_LOCAL_PROXY_RETRY_MESSAGE
+                    }
+                }
+            })
+        );
+        let raw_for_handler = raw.clone();
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(_body): Json<Value>| {
+                let attempts = attempts_for_handler.clone();
+                let raw = raw_for_handler.clone();
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (StatusCode::OK, [("content-type", "text/event-stream")], raw)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind post-output server");
+        let address = listener.local_addr().expect("post-output server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve post-output request");
+        });
+
+        let provider = retry_provider(
+            "post-output-provider",
+            format!("http://{address}"),
+            2,
+            vec![DEFAULT_LOCAL_PROXY_RETRY_MESSAGE.to_string()],
+            vec![],
+        );
+        let route_plan = crate::proxy::provider_router::ProviderRoutePlan {
+            attempts: vec![crate::proxy::provider_router::ProviderRouteAttempt {
+                provider: provider.clone(),
+                outbound_model_override: None,
+            }],
+            use_failover_timeouts: true,
+            sync_logical_target: false,
+            bypass_single_provider_circuit_breaker: false,
+        };
+        let forwarder = test_forwarder(Duration::from_secs(2), Duration::from_secs(2))
+            .with_route_plan(&route_plan);
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                http::Method::POST,
+                "/v1/responses",
+                json!({ "model": "gpt-5.6-sol", "input": "continue", "stream": true }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![provider],
+            )
+            .await
+            .unwrap_or_else(|_| panic!("output commits the original stream"));
+        let replayed = result.response.bytes().await.expect("response bytes");
+        server.abort();
+
+        assert_eq!(replayed, Bytes::from(raw));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let breaker = forwarder
+            .router
+            .get_circuit_breaker_stats("post-output-provider", AppType::Codex.as_str())
+            .await
+            .expect("post-output provider breaker stats");
+        assert_eq!(breaker.total_requests, 1);
+        assert_eq!(breaker.failed_requests, 1);
+        let status = forwarder.status.read().await;
+        assert_eq!(status.success_requests, 0);
+        assert_eq!(status.failed_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn provider_retry_policy_does_not_apply_to_auto_review_model() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_handler = attempts.clone();
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(_body): Json<Value>| {
+                let attempts = attempts_for_handler.clone();
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({
+                            "error": {
+                                "type": "server_error",
+                                "message": DEFAULT_LOCAL_PROXY_RETRY_MESSAGE
+                            }
+                        })),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind approval exclusion server");
+        let address = listener
+            .local_addr()
+            .expect("approval exclusion server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve approval exclusion request");
+        });
+        tokio::task::yield_now().await;
+
+        let forwarder = test_forwarder(Duration::from_secs(2), Duration::from_secs(2));
+        let provider = retry_provider(
+            "approval-provider",
+            format!("http://{address}"),
+            3,
+            vec![DEFAULT_LOCAL_PROXY_RETRY_MESSAGE.to_string()],
+            vec![],
+        );
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                http::Method::POST,
+                "/v1/responses",
+                json!({
+                    "model": "codex-auto-review",
+                    "input": "review this command",
+                    "stream": false
+                }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![provider],
+            )
+            .await;
+        server.abort();
+
+        assert!(result.is_err());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn each_provider_uses_its_own_retry_budget_before_failover() {
+        let first_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_attempts_for_handler = first_attempts.clone();
+        let first_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(_body): Json<Value>| {
+                let attempts = first_attempts_for_handler.clone();
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({
+                            "error": {
+                                "message": DEFAULT_LOCAL_PROXY_RETRY_MESSAGE
+                            }
+                        })),
+                    )
+                }
+            }),
+        );
+        let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind first failover server");
+        let first_address = first_listener
+            .local_addr()
+            .expect("first failover server address");
+        let first_server = tokio::spawn(async move {
+            axum::serve(first_listener, first_app)
+                .await
+                .expect("serve first provider requests");
+        });
+
+        let second_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let second_attempts_for_handler = second_attempts.clone();
+        let second_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(_body): Json<Value>| {
+                let attempts = second_attempts_for_handler.clone();
+                async move {
+                    if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            Json(json!({
+                                "error": {
+                                    "code": "rate_limit",
+                                    "message": "try again"
+                                }
+                            })),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "id": "second-provider-success",
+                                "status": "completed",
+                                "output": []
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind second failover server");
+        let second_address = second_listener
+            .local_addr()
+            .expect("second failover server address");
+        let second_server = tokio::spawn(async move {
+            axum::serve(second_listener, second_app)
+                .await
+                .expect("serve second provider requests");
+        });
+
+        let mut forwarder = test_forwarder(Duration::from_secs(2), Duration::from_secs(2));
+        forwarder.max_attempts = 2;
+        let first_provider = retry_provider(
+            "first-provider",
+            format!("http://{first_address}"),
+            1,
+            vec![DEFAULT_LOCAL_PROXY_RETRY_MESSAGE.to_string()],
+            vec![],
+        );
+        let second_provider = retry_provider(
+            "second-provider",
+            format!("http://{second_address}"),
+            1,
+            vec![],
+            vec![LocalProxyRetryErrorType::RateLimit],
+        );
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                http::Method::POST,
+                "/v1/responses",
+                json!({ "model": "gpt-5.6-sol", "input": "continue", "stream": false }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![first_provider, second_provider],
+            )
+            .await
+            .unwrap_or_else(|_| panic!("second provider should recover"));
+        let body = result.response.bytes().await.expect("response bytes");
+        first_server.abort();
+        second_server.abort();
+
+        assert!(String::from_utf8_lossy(&body).contains("second-provider-success"));
+        assert_eq!(first_attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(second_attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn matching_bad_request_fails_over_after_provider_retry_budget_is_exhausted() {
+        let first_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_attempts_for_handler = first_attempts.clone();
+        let first_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(_body): Json<Value>| {
+                let attempts = first_attempts_for_handler.clone();
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "message": DEFAULT_LOCAL_PROXY_RETRY_MESSAGE
+                        })),
+                    )
+                }
+            }),
+        );
+        let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind first bad request failover server");
+        let first_address = first_listener
+            .local_addr()
+            .expect("first bad request failover server address");
+        let first_server = tokio::spawn(async move {
+            axum::serve(first_listener, first_app)
+                .await
+                .expect("serve first bad request provider requests");
+        });
+        tokio::task::yield_now().await;
+
+        let second_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let second_attempts_for_handler = second_attempts.clone();
+        let second_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(_body): Json<Value>| {
+                let attempts = second_attempts_for_handler.clone();
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": "bad-request-failover-success",
+                            "status": "completed",
+                            "output": []
+                        })),
+                    )
+                }
+            }),
+        );
+        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind second bad request failover server");
+        let second_address = second_listener
+            .local_addr()
+            .expect("second bad request failover server address");
+        let second_server = tokio::spawn(async move {
+            axum::serve(second_listener, second_app)
+                .await
+                .expect("serve second bad request provider requests");
+        });
+        tokio::task::yield_now().await;
+
+        let mut forwarder = test_forwarder(Duration::from_secs(2), Duration::from_secs(2));
+        forwarder.max_attempts = 2;
+        let first_provider = retry_provider(
+            "first-bad-request-provider",
+            format!("http://{first_address}"),
+            1,
+            vec![DEFAULT_LOCAL_PROXY_RETRY_MESSAGE.to_string()],
+            vec![],
+        );
+        let second_provider = retry_provider(
+            "second-success-provider",
+            format!("http://{second_address}"),
+            0,
+            vec![],
+            vec![],
+        );
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                http::Method::POST,
+                "/v1/responses",
+                json!({ "model": "gpt-5.6-sol", "input": "continue", "stream": false }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![first_provider, second_provider],
+            )
+            .await
+            .unwrap_or_else(|_| panic!("matching 400 should fail over after retry exhaustion"));
+        let body = result.response.bytes().await.expect("response bytes");
+        first_server.abort();
+        second_server.abort();
+
+        assert!(String::from_utf8_lossy(&body).contains("bad-request-failover-success"));
+        assert_eq!(first_attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(second_attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn matching_unsupported_media_type_fails_over_after_retry_exhaustion() {
+        let (first_url, first_attempts, first_server) = spawn_counting_responses_server(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            json!({
+                "error": {
+                    "message": DEFAULT_LOCAL_PROXY_RETRY_MESSAGE
+                }
+            }),
+        )
+        .await;
+        let (second_url, second_attempts, second_server) = spawn_counting_responses_server(
+            StatusCode::OK,
+            json!({
+                "id": "unsupported-media-type-failover-success",
+                "status": "completed",
+                "output": []
+            }),
+        )
+        .await;
+
+        let mut forwarder = test_forwarder(Duration::from_secs(2), Duration::from_secs(2));
+        forwarder.max_attempts = 2;
+        let first_provider = retry_provider(
+            "first-unsupported-media-type-provider",
+            first_url,
+            1,
+            vec![DEFAULT_LOCAL_PROXY_RETRY_MESSAGE.to_string()],
+            vec![],
+        );
+        let second_provider = retry_provider(
+            "second-unsupported-media-type-provider",
+            second_url,
+            0,
+            vec![],
+            vec![],
+        );
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                http::Method::POST,
+                "/v1/responses",
+                json!({ "model": "gpt-5.6-sol", "input": "continue", "stream": false }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![first_provider, second_provider],
+            )
+            .await
+            .unwrap_or_else(|_| panic!("matching 415 should fail over after retry exhaustion"));
+        let body = result.response.bytes().await.expect("response bytes");
+        first_server.abort();
+        second_server.abort();
+
+        assert!(String::from_utf8_lossy(&body).contains("unsupported-media-type-failover-success"));
+        assert_eq!(first_attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(second_attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn matching_unprocessable_entity_fails_over_and_records_one_breaker_failure() {
+        let (first_url, first_attempts, first_server) = spawn_counting_responses_server(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({
+                "error": {
+                    "message": DEFAULT_LOCAL_PROXY_RETRY_MESSAGE
+                }
+            }),
+        )
+        .await;
+        let (second_url, second_attempts, second_server) = spawn_counting_responses_server(
+            StatusCode::OK,
+            json!({
+                "id": "unprocessable-failover-success",
+                "status": "completed",
+                "output": []
+            }),
+        )
+        .await;
+
+        let mut forwarder = test_forwarder(Duration::from_secs(2), Duration::from_secs(2));
+        forwarder.max_attempts = 2;
+        let first_provider = retry_provider(
+            "first-unprocessable-provider",
+            first_url,
+            2,
+            vec![DEFAULT_LOCAL_PROXY_RETRY_MESSAGE.to_string()],
+            vec![],
+        );
+        let second_provider = retry_provider(
+            "second-unprocessable-provider",
+            second_url,
+            0,
+            vec![],
+            vec![],
+        );
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                http::Method::POST,
+                "/v1/responses",
+                json!({ "model": "gpt-5.6-sol", "input": "continue", "stream": false }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![first_provider, second_provider],
+            )
+            .await
+            .unwrap_or_else(|_| panic!("matching 422 should fail over after retry exhaustion"));
+        let body = result.response.bytes().await.expect("response bytes");
+        let breaker = forwarder
+            .router
+            .get_circuit_breaker_stats("first-unprocessable-provider", AppType::Codex.as_str())
+            .await
+            .expect("first provider breaker stats");
+        first_server.abort();
+        second_server.abort();
+
+        assert!(String::from_utf8_lossy(&body).contains("unprocessable-failover-success"));
+        assert_eq!(first_attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(second_attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(breaker.total_requests, 1);
+        assert_eq!(breaker.failed_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn non_matching_bad_request_does_not_retry_or_fail_over() {
+        let (first_url, first_attempts, first_server) = spawn_counting_responses_server(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": {
+                    "message": "invalid request payload"
+                }
+            }),
+        )
+        .await;
+        let (second_url, second_attempts, second_server) = spawn_counting_responses_server(
+            StatusCode::OK,
+            json!({
+                "id": "unexpected-second-provider-success",
+                "status": "completed",
+                "output": []
+            }),
+        )
+        .await;
+
+        let mut forwarder = test_forwarder(Duration::from_secs(2), Duration::from_secs(2));
+        forwarder.max_attempts = 2;
+        let first_provider = retry_provider(
+            "first-non-matching-provider",
+            first_url,
+            2,
+            vec![DEFAULT_LOCAL_PROXY_RETRY_MESSAGE.to_string()],
+            vec![],
+        );
+        let second_provider =
+            retry_provider("second-unused-provider", second_url, 0, vec![], vec![]);
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                http::Method::POST,
+                "/v1/responses",
+                json!({ "model": "gpt-5.6-sol", "input": "continue", "stream": false }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![first_provider, second_provider],
+            )
+            .await;
+        let breaker = forwarder
+            .router
+            .get_circuit_breaker_stats("first-non-matching-provider", AppType::Codex.as_str())
+            .await
+            .expect("first provider breaker stats");
+        first_server.abort();
+        second_server.abort();
+
+        assert!(matches!(
+            result,
+            Err(ForwardError {
+                error: ProxyError::UpstreamError { status: 400, .. },
+                ..
+            })
+        ));
+        assert_eq!(first_attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(second_attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(breaker.total_requests, 0);
+        assert_eq!(breaker.failed_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn codex_role_route_uses_independent_retry_budgets_without_logical_switch() {
+        let overloaded = json!({
+            "error": {
+                "type": "server_error",
+                "message": "temporarily unavailable"
+            }
+        });
+        let success = json!({
+            "id": "role-route-success",
+            "status": "completed",
+            "output": []
+        });
+        let (provider_b_url, provider_b_requests, provider_b_server) = spawn_recording_server(
+            "/v1/responses",
+            vec![
+                (StatusCode::SERVICE_UNAVAILABLE, overloaded.clone()),
+                (StatusCode::SERVICE_UNAVAILABLE, overloaded.clone()),
+            ],
+        )
+        .await;
+        let (provider_a_url, provider_a_requests, provider_a_server) = spawn_recording_server(
+            "/v1/responses",
+            vec![
+                (StatusCode::SERVICE_UNAVAILABLE, overloaded),
+                (StatusCode::OK, success),
+            ],
+        )
+        .await;
+
+        let mut provider_b = retry_provider(
+            "provider-b",
+            provider_b_url,
+            1,
+            vec![],
+            vec![LocalProxyRetryErrorType::ServerError],
+        );
+        let mut provider_a = retry_provider(
+            "provider-a",
+            provider_a_url,
+            1,
+            vec![],
+            vec![LocalProxyRetryErrorType::ServerError],
+        );
+        for provider in [&mut provider_b, &mut provider_a] {
+            provider
+                .meta
+                .as_mut()
+                .expect("retry meta")
+                .local_proxy_request_overrides = Some(LocalProxyRequestOverrides {
+                headers: HashMap::from([
+                    (
+                        "x-cc-switch-role-route".to_string(),
+                        "must-not-return".to_string(),
+                    ),
+                    (
+                        "x-cc-switch-role-owner".to_string(),
+                        "must-not-return".to_string(),
+                    ),
+                    (
+                        "x-cc-switch-role-token".to_string(),
+                        "must-not-return".to_string(),
+                    ),
+                ]),
+                body: Some(json!({ "model": "body-override-must-not-win" })),
+            });
+        }
+
+        let route_plan = crate::proxy::provider_router::ProviderRoutePlan {
+            attempts: vec![
+                crate::proxy::provider_router::ProviderRouteAttempt {
+                    provider: provider_b.clone(),
+                    outbound_model_override: Some("frontend-upstream".to_string()),
+                },
+                crate::proxy::provider_router::ProviderRouteAttempt {
+                    provider: provider_a.clone(),
+                    outbound_model_override: Some("owner-default".to_string()),
+                },
+            ],
+            use_failover_timeouts: true,
+            sync_logical_target: false,
+            bypass_single_provider_circuit_breaker: false,
+        };
+        let mut forwarder = test_forwarder(Duration::from_secs(2), Duration::from_secs(2));
+        forwarder.current_provider_id_at_start = "provider-a".to_string();
+        forwarder.current_providers.write().await.insert(
+            "codex".to_string(),
+            ("provider-a".to_string(), "provider-a".to_string()),
+        );
+        {
+            let mut status = forwarder.status.write().await;
+            status.current_provider = Some("provider-a".to_string());
+            status.current_provider_id = Some("provider-a".to_string());
+            status.failover_count = 7;
+        }
+        let forwarder = forwarder.with_route_plan(&route_plan);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-cc-switch-role-route",
+            HeaderValue::from_static("frontend"),
+        );
+        headers.insert(
+            "x-cc-switch-role-owner",
+            HeaderValue::from_static("provider-a"),
+        );
+        headers.insert(
+            "x-cc-switch-role-token",
+            HeaderValue::from_static("test-role-token"),
+        );
+        headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer native-codex-login"),
+        );
+
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                http::Method::POST,
+                "/v1/responses",
+                json!({ "model": "capability-model", "input": "continue", "stream": false }),
+                headers,
+                Extensions::new(),
+                route_plan.providers(),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "B retry exhaustion should fall back to A and use A retry budget: {}",
+                    error.error
+                )
+            });
+        assert_eq!(result.provider.id, "provider-a");
+        let provider_b_breaker = forwarder
+            .router
+            .get_circuit_breaker_stats("provider-b", AppType::Codex.as_str())
+            .await
+            .expect("provider B breaker stats");
+        assert_eq!(provider_b_breaker.total_requests, 1);
+        assert_eq!(provider_b_breaker.failed_requests, 1);
+
+        let provider_b_requests = provider_b_requests.lock().await;
+        let provider_a_requests = provider_a_requests.lock().await;
+        assert_eq!(provider_b_requests.len(), 2);
+        assert_eq!(provider_a_requests.len(), 2);
+        for (headers, body) in provider_b_requests.iter() {
+            assert_eq!(body["model"], "frontend-upstream");
+            assert!(headers.get("x-cc-switch-role-route").is_none());
+            assert!(headers.get("x-cc-switch-role-owner").is_none());
+            assert!(headers.get("x-cc-switch-role-token").is_none());
+            assert_eq!(
+                headers
+                    .get(http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer test-key")
+            );
+        }
+        for (headers, body) in provider_a_requests.iter() {
+            assert_eq!(body["model"], "owner-default");
+            assert!(headers.get("x-cc-switch-role-route").is_none());
+            assert!(headers.get("x-cc-switch-role-owner").is_none());
+            assert!(headers.get("x-cc-switch-role-token").is_none());
+            assert_eq!(
+                headers
+                    .get(http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer test-key")
+            );
+        }
+        drop(provider_b_requests);
+        drop(provider_a_requests);
+        provider_b_server.abort();
+        provider_a_server.abort();
+
+        assert_eq!(
+            forwarder.current_providers.read().await.get("codex"),
+            Some(&("provider-a".to_string(), "provider-a".to_string()))
+        );
+        let status = forwarder.status.read().await;
+        assert_eq!(status.current_provider.as_deref(), Some("provider-a"));
+        assert_eq!(status.current_provider_id.as_deref(), Some("provider-a"));
+        assert_eq!(status.failover_count, 7);
+    }
+
+    #[tokio::test]
+    async fn codex_role_model_override_survives_chat_and_anthropic_transforms() {
+        let cases = [
+            (
+                "openai_chat",
+                "/v1/chat/completions",
+                json!({ "id": "chat", "choices": [] }),
+            ),
+            (
+                "anthropic",
+                "/v1/messages",
+                json!({
+                    "id": "msg",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "stop_reason": "end_turn",
+                    "usage": { "input_tokens": 1, "output_tokens": 1 }
+                }),
+            ),
+        ];
+
+        for (api_format, upstream_path, response_body) in cases {
+            let (base_url, captured, server) =
+                spawn_recording_server(upstream_path, vec![(StatusCode::OK, response_body)]).await;
+            let mut provider = retry_provider(
+                &format!("provider-{api_format}"),
+                base_url,
+                0,
+                vec![],
+                vec![],
+            );
+            let meta = provider.meta.as_mut().expect("provider meta");
+            meta.api_format = Some(api_format.to_string());
+            meta.local_proxy_request_overrides = Some(LocalProxyRequestOverrides {
+                headers: HashMap::new(),
+                body: Some(json!({ "model": "body-override-must-not-win" })),
+            });
+            let route_plan = crate::proxy::provider_router::ProviderRoutePlan {
+                attempts: vec![crate::proxy::provider_router::ProviderRouteAttempt {
+                    provider: provider.clone(),
+                    outbound_model_override: Some("frontend-upstream".to_string()),
+                }],
+                use_failover_timeouts: true,
+                sync_logical_target: false,
+                bypass_single_provider_circuit_breaker: false,
+            };
+            let forwarder = test_forwarder(Duration::from_secs(2), Duration::from_secs(2))
+                .with_route_plan(&route_plan);
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-cc-switch-role-route",
+                HeaderValue::from_static("frontend"),
+            );
+            headers.insert(
+                "x-cc-switch-role-owner",
+                HeaderValue::from_static("provider-a"),
+            );
+            headers.insert(
+                "x-cc-switch-role-token",
+                HeaderValue::from_static("test-role-token"),
+            );
+
+            forwarder
+                .forward_with_retry(
+                    &AppType::Codex,
+                    http::Method::POST,
+                    "/v1/responses",
+                    json!({ "model": "capability-model", "input": "hello", "stream": false }),
+                    headers,
+                    Extensions::new(),
+                    route_plan.providers(),
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{api_format} role request failed: {}", error.error)
+                });
+
+            let captured = captured.lock().await;
+            assert_eq!(captured.len(), 1, "api format {api_format}");
+            assert_eq!(captured[0].1["model"], "frontend-upstream");
+            assert!(captured[0].0.get("x-cc-switch-role-route").is_none());
+            assert!(captured[0].0.get("x-cc-switch-role-owner").is_none());
+            assert!(captured[0].0.get("x-cc-switch-role-token").is_none());
+            drop(captured);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn fragmented_target_sse_retries_and_non_target_sse_replays_exact_bytes() {
+        let forwarder = test_forwarder(Duration::from_secs(1), Duration::from_secs(1));
+        let provider = retry_provider(
+            "stream-policy-provider",
+            "http://unused.example".to_string(),
+            1,
+            vec![DEFAULT_LOCAL_PROXY_RETRY_MESSAGE.to_string()],
+            vec![],
+        );
+        let policy = super::super::provider_retry::resolve_retry_policy(
+            &AppType::Codex,
+            &json!({ "model": "gpt-5.6-sol" }),
+            &provider,
+        )
+        .expect("policy");
+        let headers = HeaderMap::from_iter([(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        )]);
+
+        let target = format!(
+            "event: response.failed\ndata: {}\n\n",
+            json!({
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {
+                        "type": "server_error",
+                        "message": DEFAULT_LOCAL_PROXY_RETRY_MESSAGE
+                    }
+                }
+            })
+        );
+        let split = target.len() / 2;
+        let target_response = ProxyResponse::streamed(
+            StatusCode::OK,
+            headers.clone(),
+            futures::stream::iter(vec![
+                Ok::<_, std::io::Error>(Bytes::copy_from_slice(&target.as_bytes()[..split])),
+                Ok(Bytes::copy_from_slice(&target.as_bytes()[split..])),
+            ]),
+        );
+        let target_result = forwarder
+            .validate_provider_retry_success_response(target_response, true, &policy)
+            .await;
+        assert!(matches!(target_result, Err(ProxyError::TransformError(_))));
+
+        let non_target = concat!(
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"invalid_request\",\"message\":\"different failure\"}}}\n\n"
+        );
+        let non_target_response = ProxyResponse::streamed(
+            StatusCode::OK,
+            headers,
+            futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
+                non_target.as_bytes(),
+            ))]),
+        );
+        let replay = forwarder
+            .validate_provider_retry_success_response(non_target_response, true, &policy)
+            .await
+            .expect("non-target SSE should be replayed")
+            .bytes()
+            .await
+            .expect("replayed bytes");
+        assert_eq!(replay, Bytes::from_static(non_target.as_bytes()));
     }
 
     #[test]
@@ -4179,6 +6724,20 @@ mod tests {
             responses_error_envelope_message(br#"{"status":"cancelled","output":[]}"#).as_deref(),
             Some("cancelled: response generation was cancelled")
         );
+        assert_eq!(
+            responses_error_envelope_message(
+                br#"{"type":"response.failed","response":{"status":"failed","error":{"code":"too_many_requests","message":"quota exhausted"}}}"#
+            )
+            .as_deref(),
+            Some("too_many_requests: quota exhausted")
+        );
+        assert_eq!(
+            responses_error_envelope_message(
+                br#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"quota exhausted"}}"#
+            )
+            .as_deref(),
+            Some("RESOURCE_EXHAUSTED: quota exhausted")
+        );
         assert!(responses_error_envelope_message(
             br#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}"#
         )
@@ -4206,11 +6765,53 @@ mod tests {
             Some(Err(ProxyError::TransformError(message))) if message.contains("boom")
         ));
 
+        let anthropic_error = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"capacity unavailable\"}}"
+        );
+        assert!(matches!(
+            inspect_responses_start_event(anthropic_error),
+            Some(Err(ProxyError::TransformError(message))) if message.contains("capacity unavailable")
+        ));
+
         let delta = concat!(
             "event: response.output_text.delta\n",
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}"
         );
         assert!(matches!(inspect_responses_start_event(delta), Some(Ok(()))));
+
+        let empty_item_added = concat!(
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"content\":[]}}"
+        );
+        assert!(inspect_responses_start_event(empty_item_added).is_none());
+
+        let empty_part_added = concat!(
+            "event: response.content_part.added\n",
+            "data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}"
+        );
+        assert!(inspect_responses_start_event(empty_part_added).is_none());
+
+        let tool_item_added = concat!(
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"name\":\"lookup\",\"arguments\":\"{}\"}}"
+        );
+        assert!(matches!(
+            inspect_responses_start_event(tool_item_added),
+            Some(Ok(()))
+        ));
+
+        let unknown_lifecycle = concat!(
+            "event: response.vendor_heartbeat\n",
+            "data: {\"type\":\"response.vendor_heartbeat\",\"status\":\"in_progress\"}"
+        );
+        assert!(inspect_responses_start_event(unknown_lifecycle).is_none());
+
+        let content_block_stop = concat!(
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}"
+        );
+        assert!(inspect_responses_start_event(content_block_stop).is_none());
     }
 
     #[test]
@@ -4297,6 +6898,23 @@ mod tests {
         let error = validate_codex_official_authorization(&headers)
             .expect_err("stale placeholder must be rejected");
         assert!(matches!(error, ProxyError::AuthError(message) if message.contains("重启 Codex")));
+    }
+
+    #[test]
+    fn official_codex_requires_and_accepts_native_authorization() {
+        let missing = HeaderMap::new();
+        assert!(matches!(
+            validate_codex_official_authorization(&missing),
+            Err(ProxyError::AuthError(_))
+        ));
+
+        let mut native = HeaderMap::new();
+        native.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer native-codex-login"),
+        );
+        validate_codex_official_authorization(&native)
+            .expect("native Codex authorization should be accepted");
     }
 
     #[test]
@@ -4459,10 +7077,39 @@ mod tests {
     }
 
     #[test]
+    fn retry_log_model_reads_gemini_native_endpoint() {
+        assert_eq!(
+            retry_log_model(
+                &AppType::Gemini,
+                "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+                &json!({})
+            ),
+            "gemini-2.5-pro"
+        );
+    }
+
+    #[test]
     fn force_identity_for_sse_accept_header() {
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
 
+        assert!(should_force_identity_encoding(
+            "/v1/responses",
+            &json!({ "model": "gpt-5" }),
+            &headers
+        ));
+    }
+
+    #[test]
+    fn force_identity_for_mixed_case_sse_accept_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("Text/Event-Stream"));
+
+        assert!(is_streaming_request(
+            "/v1/responses",
+            &json!({ "model": "gpt-5" }),
+            &headers
+        ));
         assert!(should_force_identity_encoding(
             "/v1/responses",
             &json!({ "model": "gpt-5" }),

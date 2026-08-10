@@ -168,6 +168,47 @@ export interface LocalProxyRequestOverrides {
   body?: Record<string, unknown>;
 }
 
+export type CodexAutoReviewMode = "native" | "auto" | "fallback";
+
+export type LocalProxyRetryErrorType =
+  | "rate_limit"
+  | "overloaded"
+  | "server_error"
+  | "network";
+
+export interface LocalProxyRetryPolicy {
+  maxRetries: number;
+  retryDelayMs: number;
+  customMessages: string[];
+  errorTypes: LocalProxyRetryErrorType[];
+}
+
+export type CodexAgentReasoningEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max"
+  | "ultra";
+
+export interface CodexAgentRoleOverride {
+  model?: string;
+  reasoningEffort?: CodexAgentReasoningEffort;
+}
+
+export interface CodexFrontendAgentRoleOverride extends CodexAgentRoleOverride {
+  providerId?: string;
+  upstreamModel?: string;
+}
+
+export interface CodexAgentRoleRouting {
+  enabled?: boolean;
+  frontend?: CodexFrontendAgentRoleOverride;
+  backend?: CodexAgentRoleOverride;
+}
+
 // 供应商元数据（字段名与后端一致，保持 snake_case）
 export interface ProviderMeta {
   // 自定义端点：以 URL 为键，值为端点信息
@@ -227,6 +268,14 @@ export interface ProviderMeta {
   customUserAgent?: string;
   // Local proxy request overrides. Only applied by the local proxy after route transforms.
   localProxyRequestOverrides?: LocalProxyRequestOverrides;
+  // Routing policy for Codex's internal approval reviewer model.
+  codexAutoReviewMode?: CodexAutoReviewMode;
+  // Explicit fallback; the provider default model is used when omitted.
+  codexAutoReviewFallbackModel?: string;
+  // Same-provider retries for ordinary local-proxy model requests.
+  localProxyRetryPolicy?: LocalProxyRetryPolicy;
+  // Provider and model overrides for CC Switch-managed Codex agent roles.
+  codexAgentRoleRouting?: CodexAgentRoleRouting;
   // 供应商类型（用于识别 Copilot 等特殊供应商）
   providerType?: string;
   // GitHub Copilot 关联账号 ID（旧字段，保留兼容读取）
@@ -354,6 +403,8 @@ export interface Settings {
   skipClaudeOnboarding?: boolean;
   // 是否开机自启
   launchOnStartup?: boolean;
+  // 是否启用 Codex Desktop 健康检测
+  codexRepairDetectionEnabled?: boolean;
   // 静默启动（程序启动时不显示主窗口）
   silentStartup?: boolean;
   // 是否启用主页面本地代理功能（默认关闭）

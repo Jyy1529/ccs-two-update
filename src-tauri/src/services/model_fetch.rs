@@ -7,7 +7,11 @@
 use reqwest::header::{HeaderValue, USER_AGENT};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Duration;
+use url::Url;
 
 /// 获取到的模型信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,6 +19,8 @@ use std::time::Duration;
 pub struct FetchedModel {
     pub id: String,
     pub owned_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }
 
 /// OpenAI 兼容的 /v1/models 响应格式
@@ -27,6 +33,141 @@ struct ModelsResponse {
 struct ModelEntry {
     id: String,
     owned_by: Option<String>,
+    #[serde(flatten)]
+    fields: Map<String, Value>,
+}
+
+impl ModelEntry {
+    fn context_window(&self) -> Option<u64> {
+        extract_context_window(&Value::Object(self.fields.clone()))
+    }
+}
+
+const CONTEXT_WINDOW_KEYS: &[&str] = &[
+    "context_window",
+    "contextWindow",
+    "context_length",
+    "contextLength",
+    "max_context_window",
+    "maxContextWindow",
+    "max_context_length",
+    "maxContextLength",
+    "max_model_len",
+    "maxModelLen",
+];
+
+const CONTEXT_WINDOW_CONTAINER_KEYS: &[&str] = &[
+    "capabilities",
+    "limits",
+    "metadata",
+    "meta",
+    "model_info",
+    "modelInfo",
+];
+
+fn parse_positive_u64(value: &Value) -> Option<u64> {
+    if let Some(number) = value.as_u64() {
+        return (number > 0).then_some(number);
+    }
+
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .and_then(|text| text.parse::<u64>().ok())
+        .filter(|number| *number > 0)
+}
+
+pub fn extract_context_window(value: &Value) -> Option<u64> {
+    let object = value.as_object()?;
+
+    for key in CONTEXT_WINDOW_KEYS {
+        if let Some(context_window) = object.get(*key).and_then(parse_positive_u64) {
+            return Some(context_window);
+        }
+    }
+
+    for container_key in CONTEXT_WINDOW_CONTAINER_KEYS {
+        let Some(container) = object.get(*container_key).and_then(Value::as_object) else {
+            continue;
+        };
+        for key in CONTEXT_WINDOW_KEYS {
+            if let Some(context_window) = container.get(*key).and_then(parse_positive_u64) {
+                return Some(context_window);
+            }
+        }
+    }
+
+    None
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbeddedContextCatalog {
+    providers: Vec<EmbeddedContextProvider>,
+    #[serde(rename = "uniqueModels")]
+    unique_models: HashMap<String, u64>,
+    #[serde(rename = "presetModels")]
+    preset_models: HashMap<String, u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbeddedContextProvider {
+    api: String,
+    models: HashMap<String, u64>,
+}
+
+static EMBEDDED_CONTEXT_CATALOG: OnceLock<EmbeddedContextCatalog> = OnceLock::new();
+
+fn embedded_context_catalog() -> &'static EmbeddedContextCatalog {
+    EMBEDDED_CONTEXT_CATALOG.get_or_init(|| {
+        serde_json::from_str(include_str!("../../resources/model_context_windows.json"))
+            .expect("embedded model context catalog must be valid JSON")
+    })
+}
+
+fn provider_match_score(base_url: &str, catalog_api: &str) -> Option<usize> {
+    let base = Url::parse(base_url.trim().trim_end_matches('/')).ok()?;
+    let api = Url::parse(catalog_api.trim().trim_end_matches('/')).ok()?;
+    if base.scheme() != api.scheme()
+        || base.host_str() != api.host_str()
+        || base.port_or_known_default() != api.port_or_known_default()
+    {
+        return None;
+    }
+
+    let base_path = base.path().trim_end_matches('/');
+    let api_path = api.path().trim_end_matches('/');
+    if base_path == api_path {
+        return Some(100_000 + api_path.len());
+    }
+    if base_path.starts_with(&format!("{api_path}/")) {
+        return Some(10_000 + api_path.len());
+    }
+    if api_path.starts_with(&format!("{base_path}/")) {
+        return Some(api_path.len());
+    }
+    None
+}
+
+fn embedded_context_window(base_url: &str, model_id: &str) -> Option<u64> {
+    let catalog = embedded_context_catalog();
+    let mut best: Option<(usize, u64)> = None;
+
+    for provider in &catalog.providers {
+        let Some(score) = provider_match_score(base_url, &provider.api) else {
+            continue;
+        };
+        let Some(context_window) = provider.models.get(model_id).copied() else {
+            continue;
+        };
+        if best.is_none_or(|(best_score, _)| score > best_score) {
+            best = Some((score, context_window));
+        }
+    }
+
+    best.map(|(_, context_window)| context_window)
+        .or_else(|| catalog.preset_models.get(model_id).copied())
+        .or_else(|| catalog.unique_models.get(model_id).copied())
 }
 
 const FETCH_TIMEOUT_SECS: u64 = 15;
@@ -97,6 +238,9 @@ pub async fn fetch_models(
                 .unwrap_or_default()
                 .into_iter()
                 .map(|m| FetchedModel {
+                    context_window: m
+                        .context_window()
+                        .or_else(|| embedded_context_window(&url, &m.id)),
                     id: m.id,
                     owned_by: m.owned_by,
                 })
@@ -466,6 +610,86 @@ mod tests {
         let data = resp.data.unwrap();
         assert_eq!(data[0].id, "my-model");
         assert!(data[0].owned_by.is_none());
+    }
+
+    #[test]
+    fn test_parse_context_window_variants() {
+        let json = r#"{
+            "data": [
+                {"id":"native","context_window":131072},
+                {"id":"openrouter","context_length":"200000"},
+                {"id":"camel","capabilities":{"contextWindow":1048576}},
+                {"id":"vllm","max_model_len":262144}
+            ]
+        }"#;
+        let resp: ModelsResponse = serde_json::from_str(json).unwrap();
+        let data = resp.data.unwrap();
+
+        assert_eq!(data[0].context_window(), Some(131072));
+        assert_eq!(data[1].context_window(), Some(200000));
+        assert_eq!(data[2].context_window(), Some(1048576));
+        assert_eq!(data[3].context_window(), Some(262144));
+    }
+
+    #[test]
+    fn test_embedded_context_window_prefers_matching_provider() {
+        assert_eq!(
+            embedded_context_window("https://api.deepseek.com/v1", "deepseek-chat"),
+            Some(1_000_000)
+        );
+    }
+
+    #[test]
+    fn test_embedded_context_window_uses_unambiguous_preset_only_model() {
+        assert_eq!(
+            embedded_context_window("https://unmatched.example.com/v1", "gpt-5.6-sol"),
+            Some(1_050_000)
+        );
+    }
+
+    #[test]
+    fn test_embedded_context_window_prefers_current_preset_for_unmatched_provider() {
+        let cases = [
+            ("glm-5-turbo", 200_000, 204_800),
+            ("step-3.5-flash", 256_000, 262_144),
+            ("step-3.5-flash-2603", 256_000, 262_144),
+        ];
+        let catalog = embedded_context_catalog();
+
+        for (model_id, provider_catalog_value, preset_value) in cases {
+            assert_eq!(
+                catalog.unique_models.get(model_id).copied(),
+                Some(provider_catalog_value)
+            );
+            assert_eq!(
+                catalog.preset_models.get(model_id).copied(),
+                Some(preset_value)
+            );
+            assert_eq!(
+                embedded_context_window("https://unmatched.example.com/v1", model_id),
+                Some(preset_value)
+            );
+        }
+    }
+
+    #[test]
+    fn test_embedded_context_window_skips_conflicting_global_model() {
+        let catalog = embedded_context_catalog();
+        assert!(!catalog.unique_models.contains_key("gpt-5-mini"));
+        assert!(!catalog.preset_models.contains_key("gpt-5-mini"));
+        assert_eq!(
+            embedded_context_window("https://unmatched.example.com/v1", "gpt-5-mini"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_context_window_does_not_treat_output_limit_as_context() {
+        let json = r#"{"data":[{"id":"output-only","max_tokens":8192}]}"#;
+        let resp: ModelsResponse = serde_json::from_str(json).unwrap();
+        let data = resp.data.unwrap();
+
+        assert_eq!(data[0].context_window(), None);
     }
 
     #[test]

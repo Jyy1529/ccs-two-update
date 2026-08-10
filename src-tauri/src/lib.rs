@@ -159,13 +159,7 @@ fn handle_deeplink_url(
 
             if focus_main_window {
                 if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.unminimize();
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                    #[cfg(target_os = "linux")]
-                    {
-                        linux_fix::nudge_main_window(window.clone());
-                    }
+                    show_main_window(&window);
                     log::info!("✓ Window shown and focused");
                 }
             }
@@ -223,6 +217,21 @@ fn macos_tray_icon() -> Option<Image<'static>> {
     }
 }
 
+pub(crate) fn show_main_window(window: &tauri::WebviewWindow) {
+    let _ = window.unminimize();
+    let _ = window.show();
+    #[cfg(target_os = "windows")]
+    if let Err(err) = window.set_skip_taskbar(false) {
+        log::warn!("恢复主窗口任务栏入口失败: {err}");
+    }
+    let _ = window.set_focus();
+
+    #[cfg(target_os = "linux")]
+    linux_fix::nudge_main_window(window.clone());
+    #[cfg(target_os = "macos")]
+    tray::apply_tray_policy(window.app_handle(), true);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // 设置 panic hook，在应用崩溃时记录日志到 <app_config_dir>/crash.log（默认 ~/.cc-switch/crash.log）
@@ -260,13 +269,7 @@ pub fn run() {
 
             // Show and focus window regardless
             if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
-                #[cfg(target_os = "linux")]
-                {
-                    linux_fix::nudge_main_window(window.clone());
-                }
+                show_main_window(&window);
             }
         }));
     }
@@ -291,6 +294,7 @@ pub fn run() {
 
                 if settings.minimize_to_tray_on_close {
                     api.prevent_close();
+                    tray::ensure_tray_visible(window.app_handle());
                     let _ = window.hide();
                     #[cfg(target_os = "windows")]
                     {
@@ -438,8 +442,7 @@ pub fn run() {
                     });
                     // 主窗口默认 visible:false，恢复界面必须强制显示
                     if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.set_focus();
+                        show_main_window(&window);
                     }
                     return Ok(());
                 }
@@ -953,7 +956,8 @@ pub fn run() {
                 }
             }
 
-            let _tray = tray_builder.build(app)?;
+            let tray_icon = tray_builder.build(app)?;
+            tray_icon.set_visible(true)?;
             crate::services::webdav_auto_sync::start_worker(
                 app_state.db.clone(),
                 app.handle().clone(),
@@ -1067,6 +1071,24 @@ pub fn run() {
                 // 检查 settings 表中的代理状态，自动恢复代理服务
                 restore_proxy_state_on_startup(&state).await;
 
+                // Codex Agent Role 依赖本地代理。启动恢复完成、动态端口已经
+                // 确定后再投影，避免角色文件指向 :0 或上一次运行的旧端口。
+                if let Err(error) =
+                    crate::services::codex_agent_roles::reconcile_current_codex_agent_roles(
+                        &state,
+                    )
+                    .await
+                {
+                    log::error!("启动时同步 Codex Agent Role 失败: {error}");
+                    if let Err(disable_error) =
+                        crate::services::codex_agent_roles::disable_codex_agent_roles().await
+                    {
+                        log::error!(
+                            "启动同步失败后禁用 Codex Agent Role 也失败: {disable_error}"
+                        );
+                    }
+                }
+
                 // Periodic backup check (on startup)
                 if let Err(e) = state.db.periodic_backup_if_needed() {
                     log::warn!("Periodic backup failed on startup: {e}");
@@ -1165,8 +1187,28 @@ pub fn run() {
                 }
             }
 
-            // 静默启动：根据设置决定是否显示主窗口
+            // 启动时校准开机自启注册项。设置文件可能仍为 true，但 Windows Run 项
+            // 会被升级、清理工具或用户手动操作删除；此处用当前可执行文件路径修复。
             let settings = crate::settings::get_settings();
+            #[cfg(target_os = "windows")]
+            if settings.codex_repair_detection_enabled {
+                tauri::async_runtime::spawn_blocking(|| {
+                    let status = crate::services::codex_repair::detect();
+                    log::info!(
+                        "Codex Desktop repair detection: state={:?}, warnings={}",
+                        status.state,
+                        status.warnings.len()
+                    );
+                });
+            }
+            #[cfg(target_os = "windows")]
+            if settings.launch_on_startup {
+                if let Err(error) = crate::auto_launch::reconcile_auto_launch(true) {
+                    log::warn!("启动时修复开机自启失败: {error}");
+                }
+            }
+
+            // 静默启动：根据设置决定是否显示主窗口
             if let Some(window) = app.get_webview_window("main") {
                 // 在窗口首次显示前同步装饰状态，避免前端加载后再切换导致标题栏闪烁
                 // 仅 Linux 生效：解决 Wayland 下系统窗口按钮不可用的问题
@@ -1174,6 +1216,7 @@ pub fn run() {
                 let _ = window.set_decorations(!settings.use_app_window_controls);
                 if settings.silent_startup {
                     // 静默启动模式：保持窗口隐藏
+                    tray::ensure_tray_visible(app.handle());
                     let _ = window.hide();
                     #[cfg(target_os = "windows")]
                     let _ = window.set_skip_taskbar(true);
@@ -1182,16 +1225,8 @@ pub fn run() {
                     log::info!("静默启动模式：主窗口已隐藏");
                 } else {
                     // 正常启动模式：显示窗口
-                    let _ = window.show();
+                    show_main_window(&window);
                     log::info!("正常启动模式：主窗口已显示");
-
-                    // Linux: 解决首次启动 UI 无响应问题（Tauri #10746 + wry #637）。
-                    // 启动时 webview 未获取焦点 + surface 尺寸协商失败，导致点击无效。
-                    // 这里做 set_focus + 伪 resize，等价于无视觉版本的"最大化-还原"。
-                    #[cfg(target_os = "linux")]
-                    {
-                        linux_fix::nudge_main_window(window.clone());
-                    }
                 }
             }
 
@@ -1201,6 +1236,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_providers,
             commands::get_current_provider,
+            commands::get_provider_transfer_preview,
+            commands::transfer_provider_to_apps,
             commands::add_provider,
             commands::update_provider,
             commands::delete_provider,
@@ -1233,6 +1270,8 @@ pub fn run() {
             commands::read_live_provider_settings,
             commands::get_settings,
             commands::save_settings,
+            commands::get_codex_repair_status,
+            commands::launch_codex_repair,
             commands::has_codex_unify_history_backup,
             commands::restore_codex_unified_history,
             commands::get_rectifier_config,
@@ -1593,14 +1632,7 @@ pub fn run() {
                 // macOS 在 Dock 图标被点击并重新激活应用时会触发 Reopen 事件，这里手动恢复主窗口
                 RunEvent::Reopen { .. } => {
                     if let Some(window) = app_handle.get_webview_window("main") {
-                        #[cfg(target_os = "windows")]
-                        {
-                            let _ = window.set_skip_taskbar(false);
-                        }
-                        let _ = window.unminimize();
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                        tray::apply_tray_policy(app_handle, true);
+                        show_main_window(&window);
                     } else if crate::lightweight::is_lightweight_mode() {
                         if let Err(e) = crate::lightweight::exit_lightweight_mode(app_handle) {
                             log::error!("退出轻量模式重建窗口失败: {e}");
@@ -1659,9 +1691,7 @@ pub fn run() {
 
                             // 确保主窗口可见
                             if let Some(window) = app_handle.get_webview_window("main") {
-                                let _ = window.unminimize();
-                                let _ = window.show();
-                                let _ = window.set_focus();
+                                show_main_window(&window);
                             }
                         }
                     }
@@ -1689,6 +1719,12 @@ pub fn run() {
 pub async fn cleanup_before_exit(app_handle: &tauri::AppHandle) {
     if let Some(state) = app_handle.try_state::<store::AppState>() {
         let proxy_service = &state.proxy_service;
+
+        // 退出后本地代理会停止；先将 CC Switch 自有角色移出 Codex 自动
+        // 发现范围，避免随后创建的子代理继续连接已停止的端口。
+        if let Err(error) = crate::services::codex_agent_roles::disable_codex_agent_roles().await {
+            log::error!("退出时禁用 Codex Agent Role 失败: {error}");
+        }
 
         // 退出时也需要兜底：代理可能已崩溃/未运行，但 Live 接管残留仍在（占位符/备份）。
         let has_backups = match state.db.has_any_live_backup().await {
@@ -2093,6 +2129,32 @@ mod tests {
     #[test]
     fn no_code_keeps_app_alive_in_tray() {
         assert_eq!(classify_exit_request(None), ExitRequestAction::StayInTray);
+    }
+
+    #[test]
+    fn single_instance_restore_readds_windows_taskbar_entry_after_show() {
+        let source = include_str!("lib.rs");
+        let helper = source
+            .split_once("pub(crate) fn show_main_window")
+            .expect("show helper exists")
+            .1
+            .split_once("#[cfg_attr(mobile, tauri::mobile_entry_point)]")
+            .expect("show helper has a bounded body")
+            .0;
+        let show_position = helper.find("window.show()").expect("window is shown");
+        let taskbar_position = helper
+            .find("window.set_skip_taskbar(false)")
+            .expect("Windows taskbar entry is restored");
+        assert!(show_position < taskbar_position);
+
+        let single_instance_restore = source
+            .split_once("// Show and focus window regardless")
+            .expect("single-instance restore block exists")
+            .1
+            .split_once("}));")
+            .expect("single-instance restore block is bounded")
+            .0;
+        assert!(single_instance_restore.contains("show_main_window(&window)"));
     }
 
     #[test]

@@ -440,14 +440,17 @@ fn chat_tool_to_anthropic_tool(chat_tool: &Value) -> Option<Value> {
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
-    let mut tool = json!({
-        "name": name,
-        "input_schema": function
-            .get("parameters")
-            .cloned()
-            .filter(|value| value.as_object().is_some_and(|object| !object.is_empty()))
-            .unwrap_or_else(|| json!({ "type": "object", "properties": {} }))
-    });
+    let mut input_schema = function
+        .get("parameters")
+        .cloned()
+        .filter(|value| value.as_object().is_some_and(|object| !object.is_empty()))
+        .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+    if let Some(schema) = input_schema.as_object_mut() {
+        if schema.get("type").and_then(Value::as_str) != Some("object") {
+            schema.insert("type".to_string(), json!("object"));
+        }
+    }
+    let mut tool = json!({ "name": name, "input_schema": input_schema });
     if let Some(description) = function.get("description").and_then(|value| value.as_str()) {
         tool["description"] = json!(description);
     }
@@ -2594,6 +2597,27 @@ mod tests {
         // Do not emit an explicit null description; input_schema falls back to a valid object schema.
         assert!(tool.get("description").is_none());
         assert_eq!(tool["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn test_request_tool_schema_type_is_normalized_to_object() {
+        let input = json!({
+            "model": "c",
+            "max_output_tokens": 100,
+            "input": [{ "role": "user", "content": "hi" }],
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "parameters": { "type": null, "properties": { "id": { "type": "string" } } }
+            }]
+        });
+
+        let result = responses_request_to_anthropic(input, 4096).unwrap();
+        assert_eq!(result["tools"][0]["input_schema"]["type"], "object");
+        assert_eq!(
+            result["tools"][0]["input_schema"]["properties"]["id"]["type"],
+            "string"
+        );
     }
 
     #[test]

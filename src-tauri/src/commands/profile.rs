@@ -1,11 +1,16 @@
 //! 项目 Profile 管理命令
 
 use serde::Serialize;
-use tauri::{Emitter, Manager, State};
+use std::sync::Arc;
+use tauri::{Emitter, State};
 
 use crate::database::Profile;
 use crate::services::profile::{ProfilePayload, ProfileScope, ProfileService};
 use crate::store::AppState;
+
+fn owned_state(state: &AppState) -> Arc<AppState> {
+    state.owned_clone()
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -116,19 +121,20 @@ pub fn list_profiles(state: State<'_, AppState>) -> Result<ProfilesResponse, Str
 }
 
 #[tauri::command]
-pub fn create_profile(
+pub async fn create_profile(
     state: State<'_, AppState>,
     name: String,
     scope: String,
 ) -> Result<ProfileDto, String> {
     let scope = ProfileScope::parse(&scope).map_err(|e| e.to_string())?;
-    ProfileService::create(&state, &name, scope)
+    ProfileService::create_async(owned_state(&state), name, scope)
+        .await
         .map(ProfileDto::from)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn update_profile(
+pub async fn update_profile(
     state: State<'_, AppState>,
     id: String,
     name: Option<String>,
@@ -139,57 +145,52 @@ pub fn update_profile(
         .map(|s| ProfileScope::parse(&s))
         .transpose()
         .map_err(|e| e.to_string())?;
-    ProfileService::update(&state, &id, name, resnapshot.unwrap_or(false), scope)
-        .map(ProfileDto::from)
+    ProfileService::update_async(
+        owned_state(&state),
+        id,
+        name,
+        resnapshot.unwrap_or(false),
+        scope,
+    )
+    .await
+    .map(ProfileDto::from)
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_profile(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    ProfileService::delete_async(owned_state(&state), id)
+        .await
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn delete_profile(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    ProfileService::delete(&state, &id).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn clear_current_profile(state: State<'_, AppState>, scope: String) -> Result<(), String> {
+pub async fn clear_current_profile(
+    state: State<'_, AppState>,
+    scope: String,
+) -> Result<(), String> {
     let scope = ProfileScope::parse(&scope).map_err(|e| e.to_string())?;
-    state
-        .db
-        .set_current_profile_id(scope.as_str(), None)
+    ProfileService::clear_current_async(owned_state(&state), scope)
+        .await
         .map_err(|e| e.to_string())
 }
 
 /// 应用项目快照（只作用于发起页所属分组内的应用）。
 ///
-/// 注意：必须保持同步命令（跑在 Tauri 线程池）——`ProviderService::switch`
-/// 内部使用 block_on 获取切换锁，放进 async 命令会在运行时线程上 panic。
+/// 同步 Provider/MCP/Skill/Prompt 工作由 `ProfileService::apply_async`
+/// 投递到 blocking 线程；Codex Agent Role 与代理生命周期直接在 async runtime 协调。
 #[tauri::command]
-pub fn apply_profile(
+pub async fn apply_profile(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     id: String,
     scope: String,
 ) -> Result<Vec<String>, String> {
     let scope = ProfileScope::parse(&scope).map_err(|e| e.to_string())?;
-    let (warnings, should_stop_proxy) =
-        ProfileService::apply(&state, &id, scope).map_err(|e| e.to_string())?;
-
-    if should_stop_proxy {
-        // sync 命令线程没有 Tokio runtime，无法直接 await stop()；
-        // 把停止服务放到 Tauri async runtime，停止后再补发事件刷新 UI。
-        let app_handle = app.clone();
-        let profile_id = id.clone();
-        let proxy_service = state.proxy_service.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Err(e) = proxy_service.stop().await {
-                log::warn!("切换项目后停止代理服务失败: {e}");
-            }
-            if let Some(app_state) = app_handle.try_state::<AppState>() {
-                emit_profile_apply_events(&app_handle, app_state.inner(), &profile_id, scope);
-            }
-        });
-    } else {
-        emit_profile_apply_events(&app, &state, &id, scope);
-    }
+    let (warnings, _) = ProfileService::apply_async(owned_state(&state), id.clone(), scope)
+        .await
+        .map_err(|e| e.to_string())?;
+    emit_profile_apply_events(&app, &state, &id, scope);
 
     Ok(warnings)
 }

@@ -24,10 +24,18 @@ use axum::{
     Router,
 };
 use hyper_util::rt::TokioIo;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::task::JoinHandle;
+
+fn parse_listen_socket_addr(address: &str, port: u16) -> Result<SocketAddr, ProxyError> {
+    let ip = address
+        .trim()
+        .parse::<IpAddr>()
+        .map_err(|e| ProxyError::BindFailed(format!("无效的地址: {e}")))?;
+    Ok(SocketAddr::new(ip, port))
+}
 
 /// 代理服务器状态（共享）
 #[derive(Clone)]
@@ -57,6 +65,7 @@ pub struct ProxyServer {
     shutdown_tx: Arc<RwLock<Option<oneshot::Sender<()>>>>,
     /// 服务器任务句柄，用于等待服务器实际关闭
     server_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
+    lifecycle_lock: Arc<Mutex<()>>,
 }
 
 impl ProxyServer {
@@ -88,19 +97,18 @@ impl ProxyServer {
             state,
             shutdown_tx: Arc::new(RwLock::new(None)),
             server_handle: Arc::new(RwLock::new(None)),
+            lifecycle_lock: Arc::new(Mutex::new(())),
         }
     }
 
     pub async fn start(&self) -> Result<ProxyServerInfo, ProxyError> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
         // 检查是否已在运行
         if self.shutdown_tx.read().await.is_some() {
             return Err(ProxyError::AlreadyRunning);
         }
 
-        let addr: SocketAddr =
-            format!("{}:{}", self.config.listen_address, self.config.listen_port)
-                .parse()
-                .map_err(|e| ProxyError::BindFailed(format!("无效的地址: {e}")))?;
+        let addr = parse_listen_socket_addr(&self.config.listen_address, self.config.listen_port)?;
 
         // 创建关闭通道
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -143,7 +151,7 @@ impl ProxyServer {
             loop {
                 tokio::select! {
                     result = listener.accept() => {
-                        let (stream, _remote_addr) = match result {
+                        let (stream, remote_addr) = match result {
                             Ok(v) => v,
                             Err(e) => {
                                 log::error!("[{SRV}] accept 失败: {e}", SRV = log_srv::ACCEPT_ERR);
@@ -184,6 +192,7 @@ impl ProxyServer {
 
                                     // Insert our own header case map alongside hyper's internal one
                                     parts.extensions.insert(cases);
+                                    parts.extensions.insert(remote_addr);
 
                                     let body = axum::body::Body::new(body);
                                     let axum_req = http::Request::from_parts(parts, body);
@@ -223,6 +232,7 @@ impl ProxyServer {
     }
 
     pub async fn stop(&self) -> Result<(), ProxyError> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
         // 1. 发送关闭信号
         if let Some(tx) = self.shutdown_tx.write().await.take() {
             let _ = tx.send(());
@@ -231,17 +241,21 @@ impl ProxyServer {
         }
 
         // 2. 等待服务器任务结束（带 5 秒超时保护）
-        if let Some(handle) = self.server_handle.write().await.take() {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+        if let Some(mut handle) = self.server_handle.write().await.take() {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle).await {
                 Ok(Ok(())) => {
                     log::info!("[{}] 代理服务器已完全停止", log_srv::STOPPED);
                     Ok(())
                 }
                 Ok(Err(e)) => {
+                    self.mark_stopped().await;
                     log::warn!("[{}] 代理服务器任务异常终止: {e}", log_srv::TASK_ERROR);
                     Err(ProxyError::StopFailed(e.to_string()))
                 }
                 Err(_) => {
+                    handle.abort();
+                    let _ = handle.await;
+                    self.mark_stopped().await;
                     log::warn!(
                         "[{}] 代理服务器停止超时（5秒），强制继续",
                         log_srv::STOP_TIMEOUT
@@ -250,8 +264,14 @@ impl ProxyServer {
                 }
             }
         } else {
+            self.mark_stopped().await;
             Ok(())
         }
+    }
+
+    async fn mark_stopped(&self) {
+        self.state.status.write().await.running = false;
+        *self.state.start_time.write().await = None;
     }
 
     pub async fn get_status(&self) -> ProxyStatus {
@@ -401,5 +421,66 @@ impl ProxyServer {
             .provider_router
             .reset_provider_breaker(provider_id, app_type)
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_listen_socket_addr, ProxyServer};
+    use crate::database::Database;
+    use crate::proxy::types::ProxyConfig;
+    use std::sync::Arc;
+
+    #[test]
+    fn parses_raw_ipv4_and_ipv6_listen_addresses() {
+        for (address, expected) in [
+            ("127.0.0.1", "127.0.0.1:15721"),
+            ("0.0.0.0", "0.0.0.0:15721"),
+            ("::1", "[::1]:15721"),
+            ("::", "[::]:15721"),
+        ] {
+            assert_eq!(
+                parse_listen_socket_addr(address, 15721)
+                    .expect("raw IP address must parse")
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_stop_clears_handles_and_running_status() {
+        let db = Arc::new(Database::memory().expect("in-memory database"));
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        server.start().await.expect("start proxy server");
+
+        let original = server
+            .server_handle
+            .write()
+            .await
+            .take()
+            .expect("running server handle");
+        original.abort();
+        let _ = original.await;
+        let failed_handle = tokio::spawn(std::future::pending::<()>());
+        failed_handle.abort();
+        *server.server_handle.write().await = Some(failed_handle);
+
+        server
+            .stop()
+            .await
+            .expect_err("forced task failure must be reported");
+
+        assert!(!server.get_status().await.running);
+        assert!(server.shutdown_tx.read().await.is_none());
+        assert!(server.server_handle.read().await.is_none());
     }
 }

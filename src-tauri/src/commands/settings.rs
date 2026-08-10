@@ -1,5 +1,6 @@
 #![allow(non_snake_case)]
 
+use std::{fs, path::PathBuf};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_updater::UpdaterExt;
 
@@ -51,6 +52,196 @@ fn merge_settings_for_save(
     incoming
 }
 
+fn codex_config_dir_for_settings(settings: &crate::settings::AppSettings) -> PathBuf {
+    let raw = settings
+        .codex_config_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match raw {
+        Some("~") => dirs::home_dir().unwrap_or_else(crate::config::get_home_dir),
+        Some(value) if value.starts_with("~/") || value.starts_with("~\\") => {
+            let suffix = &value[2..];
+            dirs::home_dir()
+                .unwrap_or_else(crate::config::get_home_dir)
+                .join(suffix)
+        }
+        Some(value) => PathBuf::from(value),
+        None => crate::config::get_home_dir().join(".codex"),
+    }
+}
+
+#[derive(Clone)]
+struct CodexSettingsFileSnapshot {
+    path: PathBuf,
+    content: Option<Vec<u8>>,
+}
+
+fn snapshot_codex_settings_files(
+    config_dir: &std::path::Path,
+) -> Result<Vec<CodexSettingsFileSnapshot>, String> {
+    [
+        config_dir.join("config.toml"),
+        config_dir.join("auth.json"),
+        config_dir.join(crate::codex_config::CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME),
+    ]
+    .into_iter()
+    .map(|path| {
+        let content = if path.exists() {
+            Some(fs::read(&path).map_err(|error| {
+                format!("读取 Codex 设置事务文件 '{}' 失败: {error}", path.display())
+            })?)
+        } else {
+            None
+        };
+        Ok(CodexSettingsFileSnapshot { path, content })
+    })
+    .collect()
+}
+
+fn restore_codex_settings_files(snapshots: &[CodexSettingsFileSnapshot]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for snapshot in snapshots {
+        let result = match snapshot.content.as_deref() {
+            Some(content) => crate::config::atomic_write(&snapshot.path, content),
+            None => match fs::remove_file(&snapshot.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(crate::error::AppError::io(&snapshot.path, error)),
+            },
+        };
+        if let Err(error) = result {
+            errors.push(format!(
+                "恢复 Codex 设置事务文件 '{}' 失败: {error}",
+                snapshot.path.display()
+            ));
+        }
+    }
+    errors
+}
+
+fn with_settings_rollback_errors(primary_error: String, rollback_errors: Vec<String>) -> String {
+    if rollback_errors.is_empty() {
+        primary_error
+    } else {
+        format!(
+            "{primary_error}; Codex 设置事务回滚遇到错误: {}",
+            rollback_errors.join("; ")
+        )
+    }
+}
+
+async fn apply_codex_sensitive_settings(
+    state: &crate::store::AppState,
+    existing: &crate::settings::AppSettings,
+    merged: crate::settings::AppSettings,
+    previous_codex_dir: &std::path::Path,
+    next_codex_dir: &std::path::Path,
+    codex_dir_changed: bool,
+    unify_codex_changed: bool,
+) -> Result<(), String> {
+    let owned_state = state.owned_clone();
+    let existing = existing.clone();
+    let previous_codex_dir = previous_codex_dir.to_path_buf();
+    let next_codex_dir = next_codex_dir.to_path_buf();
+    tauri::async_runtime::spawn(apply_codex_sensitive_settings_transaction(
+        owned_state,
+        existing,
+        merged,
+        previous_codex_dir,
+        next_codex_dir,
+        codex_dir_changed,
+        unify_codex_changed,
+    ))
+    .await
+    .map_err(|error| format!("Codex 设置 supervisor 任务执行失败: {error}"))?
+}
+
+async fn apply_codex_sensitive_settings_transaction(
+    owned_state: std::sync::Arc<crate::store::AppState>,
+    existing: crate::settings::AppSettings,
+    merged: crate::settings::AppSettings,
+    previous_codex_dir: PathBuf,
+    next_codex_dir: PathBuf,
+    codex_dir_changed: bool,
+    unify_codex_changed: bool,
+) -> Result<(), String> {
+    let _provider_lifecycle_guard = owned_state.lock_codex_provider_lifecycle().await;
+    let _proxy_transaction_guard = owned_state.proxy_service.lock_transaction().await;
+    let proxy_snapshot = owned_state
+        .proxy_service
+        .snapshot_transaction_state()
+        .await?;
+    let next_file_snapshots = if codex_dir_changed {
+        snapshot_codex_settings_files(&next_codex_dir)?
+    } else {
+        Vec::new()
+    };
+
+    crate::settings::update_settings(merged).map_err(|error| error.to_string())?;
+
+    let operation_result = async {
+        if unify_codex_changed {
+            crate::services::provider::reapply_current_codex_official_live(owned_state.as_ref())
+                .map_err(|error| {
+                    format!("统一 Codex 会话历史开关未生效（live 配置重写失败）: {error}")
+                })?;
+        }
+
+        crate::services::codex_agent_roles::reconcile_current_codex_agent_roles_under_proxy_transaction(
+            owned_state.as_ref(),
+        )
+        .await
+        .map_err(|error| format!("同步 Codex Agent Role 失败: {error}"))?;
+
+        if codex_dir_changed {
+            crate::services::codex_agent_roles::disable_codex_agent_roles_at(
+                previous_codex_dir.join("agents"),
+            )
+            .map_err(|error| format!("清理旧 Codex Agent Role 失败: {error}"))?;
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+
+    if let Err(primary_error) = operation_result {
+        let mut rollback_errors = Vec::new();
+        if codex_dir_changed {
+            if let Err(error) = crate::services::codex_agent_roles::disable_codex_agent_roles_at(
+                next_codex_dir.join("agents"),
+            ) {
+                rollback_errors.push(format!("禁用新目录 Codex Agent Role 失败: {error}"));
+            }
+        }
+        if let Err(error) = crate::settings::update_settings(existing.clone()) {
+            rollback_errors.push(format!("恢复旧设置失败: {error}"));
+        }
+        rollback_errors.extend(
+            owned_state
+                .proxy_service
+                .restore_transaction_state(&proxy_snapshot)
+                .await
+                .into_iter()
+                .map(|error| format!("恢复代理事务状态失败: {error}")),
+        );
+        rollback_errors.extend(restore_codex_settings_files(&next_file_snapshots));
+        if let Err(error) =
+            crate::services::codex_agent_roles::reconcile_current_codex_agent_roles_under_proxy_transaction(
+                owned_state.as_ref(),
+            )
+            .await
+        {
+            rollback_errors.push(format!("恢复旧 Codex Agent Role 投影失败: {error}"));
+        }
+        return Err(with_settings_rollback_errors(
+            primary_error,
+            rollback_errors,
+        ));
+    }
+
+    Ok(())
+}
+
 /// 获取设置
 #[tauri::command]
 pub async fn get_settings() -> Result<crate::settings::AppSettings, String> {
@@ -68,28 +259,25 @@ pub async fn save_settings(
     let unify_codex_changed =
         merged.unify_codex_session_history != existing.unify_codex_session_history;
     let unify_codex_enabled = merged.unify_codex_session_history;
-    crate::settings::update_settings(merged).map_err(|e| e.to_string())?;
+    let previous_codex_dir = codex_config_dir_for_settings(&existing);
+    let next_codex_dir = codex_config_dir_for_settings(&merged);
+    let codex_dir_changed = previous_codex_dir != next_codex_dir;
+    if codex_dir_changed || unify_codex_changed {
+        apply_codex_sensitive_settings(
+            state.inner(),
+            &existing,
+            merged,
+            &previous_codex_dir,
+            &next_codex_dir,
+            codex_dir_changed,
+            unify_codex_changed,
+        )
+        .await?;
+    } else {
+        crate::settings::update_settings(merged).map_err(|e| e.to_string())?;
+    }
 
-    // 统一会话开关变更时立即重写当前官方 Codex 供应商的 live 配置，
-    // 不必等下一次切换才生效。
     if unify_codex_changed {
-        // live 重写失败时回滚设置并把保存整体报失败：若设置保持已切换状态，
-        // live 仍跑旧桶，后续的历史迁移/还原会让会话再次分裂（开启=历史
-        // 迁走而新会话仍写 openai 桶；关闭=会话还原而 live 仍写 custom）。
-        // 报错让前端 saved=false 短路还原；回滚是整次保存的事务语义
-        // （本开关的保存只携带开关相关字段）。
-        if let Err(err) =
-            crate::services::provider::reapply_current_codex_official_live(state.inner())
-        {
-            log::warn!("统一 Codex 会话历史开关变更后重写 live 配置失败，回滚设置: {err}");
-            if let Err(rollback_err) = crate::settings::update_settings(existing) {
-                log::error!("回滚统一会话开关设置失败: {rollback_err}");
-            }
-            return Err(format!(
-                "统一 Codex 会话历史开关未生效（live 配置重写失败）: {err}"
-            ));
-        }
-
         if unify_codex_enabled {
             // 后台执行存量迁移（openai 桶 → custom 桶；仅当用户勾选了迁入既有
             // 会话，函数内部自门控）。大会话目录可能要读数秒，不能阻塞设置保存；
@@ -314,12 +502,109 @@ pub async fn set_auto_launch(enabled: bool) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::merge_settings_for_save;
+    use super::{apply_codex_sensitive_settings, merge_settings_for_save};
+    use crate::database::Database;
     use crate::settings::{
         AppSettings, CodexOfficialHistoryUnifyMigration, CodexProviderTemplateMigration,
         CodexThirdPartyHistoryProviderBucketMigration, LocalMigrations, S3SyncSettings,
         WebDavSyncSettings,
     };
+    use crate::store::AppState;
+    use serial_test::serial;
+    use std::ffi::OsString;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    struct TestHome {
+        _dir: TempDir,
+        old_home: Option<OsString>,
+        old_test_home: Option<OsString>,
+    }
+
+    impl TestHome {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let old_home = std::env::var_os("HOME");
+            let old_test_home = std::env::var_os("CC_SWITCH_TEST_HOME");
+            std::env::set_var("HOME", dir.path());
+            std::env::set_var("CC_SWITCH_TEST_HOME", dir.path());
+            crate::settings::reload_settings().expect("reload isolated settings");
+            Self {
+                _dir: dir,
+                old_home,
+                old_test_home,
+            }
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            match self.old_home.take() {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match self.old_test_home.take() {
+                Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
+                None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
+            }
+            let _ = crate::settings::reload_settings();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn cancelled_caller_does_not_cancel_codex_settings_transaction() {
+        let home = TestHome::new();
+        let previous_dir = home._dir.path().join("codex-old");
+        let next_dir = home._dir.path().join("codex-new");
+        let existing = AppSettings {
+            codex_config_dir: Some(previous_dir.to_string_lossy().to_string()),
+            ..AppSettings::default()
+        };
+        let merged = AppSettings {
+            codex_config_dir: Some(next_dir.to_string_lossy().to_string()),
+            ..existing.clone()
+        };
+        crate::settings::update_settings(existing.clone()).expect("seed existing settings");
+        let state = Arc::new(AppState::new(Arc::new(
+            Database::memory().expect("in-memory database"),
+        )));
+        let lifecycle_guard = state.lock_codex_provider_lifecycle().await;
+
+        let operation_state = Arc::clone(&state);
+        let operation_previous_dir = previous_dir.clone();
+        let operation_next_dir = next_dir.clone();
+        let caller = tokio::spawn(async move {
+            apply_codex_sensitive_settings(
+                operation_state.as_ref(),
+                &existing,
+                merged,
+                &operation_previous_dir,
+                &operation_next_dir,
+                true,
+                false,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        caller.abort();
+        let _ = caller.await;
+        drop(lifecycle_guard);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if crate::settings::get_settings().codex_config_dir.as_deref()
+                    == Some(next_dir.to_string_lossy().as_ref())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("supervised settings transaction should finish after caller cancellation");
+    }
 
     #[test]
     fn save_settings_should_preserve_existing_webdav_when_payload_omits_it() {

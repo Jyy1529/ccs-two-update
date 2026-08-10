@@ -59,6 +59,17 @@ fn optional_non_empty_string(table: &toml::value::Table, key: &str) -> Option<St
         .map(ToString::to_string)
 }
 
+fn is_local_no_auth_endpoint(base_url: &str) -> bool {
+    url::Url::parse(base_url).ok().is_some_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host().is_some_and(|host| match host {
+                url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+                url::Host::Ipv4(address) => address.is_loopback(),
+                url::Host::Ipv6(address) => address.is_loopback(),
+            })
+    })
+}
+
 /// Validate the provider-owned Grok Build TOML document.
 pub fn validate_config_toml(config_toml: &str) -> Result<(), AppError> {
     let document = config_toml.parse::<toml::Value>().map_err(|error| {
@@ -111,9 +122,13 @@ pub fn validate_config_toml(config_toml: &str) -> Result<(), AppError> {
     required_non_empty_string(selected_model, "model")?;
     required_non_empty_string(selected_model, "base_url")?;
     required_non_empty_string(selected_model, "name")?;
-    if optional_non_empty_string(selected_model, "api_key").is_none()
-        && optional_non_empty_string(selected_model, "env_key").is_none()
-    {
+    let has_credentials = optional_non_empty_string(selected_model, "api_key").is_some()
+        || optional_non_empty_string(selected_model, "env_key").is_some();
+    let permits_local_no_auth = selected_model
+        .get("base_url")
+        .and_then(toml::Value::as_str)
+        .is_some_and(is_local_no_auth_endpoint);
+    if !has_credentials && !permits_local_no_auth {
         return Err(AppError::localized(
             "provider.grokbuild.credentials.missing",
             "Grok Build 配置缺少有效的 api_key 或 env_key 字段",
@@ -410,6 +425,23 @@ context_window = 500000
         let error = validate_config_toml(&config).expect_err("credentials should be required");
         assert!(error.to_string().contains("api_key"));
         assert!(error.to_string().contains("env_key"));
+    }
+
+    #[test]
+    fn allows_empty_credentials_for_loopback_endpoint() {
+        let config = valid_config()
+            .replace("https://example.com/v1", "http://127.0.0.1:11434/v1")
+            .replace("api_key = \"secret\"\n", "api_key = \"\"\n");
+
+        validate_config_toml(&config).expect("loopback endpoint may omit authentication");
+    }
+
+    #[test]
+    fn rejects_empty_credentials_for_remote_endpoint() {
+        let config = valid_config().replace("api_key = \"secret\"\n", "api_key = \"\"\n");
+
+        let error = validate_config_toml(&config).expect_err("remote endpoint needs credentials");
+        assert!(error.to_string().contains("api_key"));
     }
 
     #[test]

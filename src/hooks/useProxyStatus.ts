@@ -11,7 +11,10 @@ import type {
   ProxyServerInfo,
   ProxyTakeoverStatus,
 } from "@/types/proxy";
-import { extractErrorMessage } from "@/utils/errorUtils";
+import {
+  extractErrorMessage,
+  translateCodexAgentRoleProxyError,
+} from "@/utils/errorUtils";
 
 /**
  * 代理服务状态管理
@@ -19,6 +22,10 @@ import { extractErrorMessage } from "@/utils/errorUtils";
 export function useProxyStatus() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
+  const getRoleRouteProxyError = (error: unknown) => {
+    const detail = extractErrorMessage(error);
+    return translateCodexAgentRoleProxyError(detail, t);
+  };
 
   // 查询状态（自动轮询）
   const { data: status, isLoading } = useQuery({
@@ -52,6 +59,11 @@ export function useProxyStatus() {
       queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
     },
     onError: (error: Error) => {
+      const roleRouteError = getRoleRouteProxyError(error);
+      if (roleRouteError) {
+        toast.error(roleRouteError);
+        return;
+      }
       const detail =
         extractErrorMessage(error) ||
         t("common.unknown", { defaultValue: "未知错误" });
@@ -77,6 +89,11 @@ export function useProxyStatus() {
       queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
     },
     onError: (error: Error) => {
+      const roleRouteError = getRoleRouteProxyError(error);
+      if (roleRouteError) {
+        toast.error(roleRouteError);
+        return;
+      }
       const detail =
         extractErrorMessage(error) ||
         t("common.unknown", { defaultValue: "未知错误" });
@@ -108,6 +125,11 @@ export function useProxyStatus() {
       // 注意：故障转移队列和开关状态会保留，不需要刷新
     },
     onError: (error: Error) => {
+      const roleRouteError = getRoleRouteProxyError(error);
+      if (roleRouteError) {
+        toast.error(roleRouteError);
+        return;
+      }
       const detail =
         extractErrorMessage(error) ||
         t("common.unknown", { defaultValue: "未知错误" });
@@ -152,7 +174,13 @@ export function useProxyStatus() {
       queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
       queryClient.invalidateQueries({ queryKey: ["proxyTakeoverStatus"] });
     },
-    onError: (error: Error) => {
+    onError: (error: Error, variables) => {
+      const roleRouteError =
+        variables.appType === "codex" ? getRoleRouteProxyError(error) : null;
+      if (roleRouteError) {
+        toast.error(roleRouteError);
+        return;
+      }
       const detail =
         extractErrorMessage(error) ||
         t("common.unknown", { defaultValue: "未知错误" });

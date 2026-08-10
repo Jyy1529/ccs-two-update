@@ -256,6 +256,19 @@ pub fn codex_provider_upstream_model(provider: &Provider) -> Option<String> {
                         .or_else(|| extract_codex_model_from_toml(config))
                 })
         })
+        .or_else(|| {
+            provider
+                .settings_config
+                .get("modelCatalog")
+                .and_then(|catalog| catalog.get("models"))
+                .and_then(|models| models.as_array())
+                .and_then(|models| models.first())
+                .and_then(|model| model.get("model"))
+                .and_then(|model| model.as_str())
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(ToString::to_string)
+        })
 }
 
 fn codex_provider_catalog_model_ids(provider: &Provider) -> HashSet<String> {
@@ -1162,6 +1175,24 @@ wire_api = "anthropic"
         assert_eq!(
             body.get("model").and_then(|v| v.as_str()),
             Some("claude-opus-4-1[1m]")
+        );
+    }
+
+    #[test]
+    fn test_codex_provider_upstream_model_falls_back_to_first_catalog_model() {
+        let provider = create_provider(json!({
+            "config": "model_provider = \"custom\"\n",
+            "modelCatalog": {
+                "models": [
+                    { "model": "catalog-first" },
+                    { "model": "catalog-second" }
+                ]
+            }
+        }));
+
+        assert_eq!(
+            codex_provider_upstream_model(&provider).as_deref(),
+            Some("catalog-first")
         );
     }
 

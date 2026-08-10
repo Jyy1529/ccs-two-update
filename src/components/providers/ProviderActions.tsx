@@ -1,5 +1,6 @@
 import {
   Activity,
+  ArrowRightLeft,
   BarChart3,
   Check,
   Copy,
@@ -27,6 +28,7 @@ interface ProviderActionsProps {
   onSwitch: () => void;
   onEdit: () => void;
   onDuplicate: () => void;
+  onTransfer: () => void;
   onTest?: () => void;
   onConfigureUsage?: () => void;
   onDelete: () => void;
@@ -66,6 +68,7 @@ export function ProviderActions({
   onSwitch,
   onEdit,
   onDuplicate,
+  onTransfer,
   onTest,
   onConfigureUsage,
   onDelete,
@@ -303,6 +306,18 @@ export function ProviderActions({
           className={iconButtonClass}
         >
           <Copy className="h-4 w-4" />
+        </Button>
+
+        <Button
+          size="icon"
+          variant="ghost"
+          onClick={onTransfer}
+          title={t("providerTransfer.action", {
+            defaultValue: "导入到其他 Agent",
+          })}
+          className={iconButtonClass}
+        >
+          <ArrowRightLeft className="h-4 w-4" />
         </Button>
 
         <Button

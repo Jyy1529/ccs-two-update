@@ -4,7 +4,8 @@ use serde_json::{json, Value};
 use tauri::State;
 
 use crate::commands::sync_support::{
-    attach_warning, post_sync_warning_from_result, run_post_import_sync,
+    attach_warning, post_sync_warning_from_result, run_post_import_sync_under_proxy_transaction,
+    with_codex_provider_transaction,
 };
 use crate::error::AppError;
 use crate::services::s3_sync as s3_sync_service;
@@ -106,28 +107,29 @@ pub async fn s3_sync_upload(state: State<'_, AppState>) -> Result<Value, String>
 
 #[tauri::command]
 pub async fn s3_sync_download(state: State<'_, AppState>) -> Result<Value, String> {
-    let db = state.db.clone();
-    let db_for_sync = db.clone();
+    let app_state = state.inner().owned_clone();
     let mut settings = require_enabled_s3_settings()?;
     let _auto_sync_suppression = crate::services::s3_auto_sync::AutoSyncSuppressionGuard::new();
 
-    let sync_result = run_with_s3_lock(s3_sync_service::download(&db, &mut settings)).await;
-    let mut result = map_sync_result(sync_result, |error| {
-        persist_sync_error(&mut settings, error, "manual")
-    })?;
+    with_codex_provider_transaction(app_state, move |app_state| async move {
+        let sync_result =
+            run_with_s3_lock(s3_sync_service::download(&app_state.db, &mut settings)).await;
+        let mut result = map_sync_result(sync_result, |error| {
+            persist_sync_error(&mut settings, error, "manual")
+        })?;
 
-    // Post-download sync is best-effort: snapshot restore has already succeeded.
-    let warning = post_sync_warning_from_result(
-        tauri::async_runtime::spawn_blocking(move || run_post_import_sync(db_for_sync))
-            .await
-            .map_err(|e| e.to_string()),
-    );
-    if let Some(msg) = warning.as_ref() {
-        log::warn!("[S3] post-download sync warning: {msg}");
-    }
-    result = attach_warning(result, warning);
+        // Post-download sync is best-effort: snapshot restore has already succeeded.
+        let warning = post_sync_warning_from_result(Ok(
+            run_post_import_sync_under_proxy_transaction(app_state).await,
+        ));
+        if let Some(msg) = warning.as_ref() {
+            log::warn!("[S3] post-download sync warning: {msg}");
+        }
+        result = attach_warning(result, warning);
 
-    Ok(result)
+        Ok(result)
+    })
+    .await
 }
 
 #[tauri::command]

@@ -33,6 +33,12 @@ import { BasicFormFields } from "./BasicFormFields";
 import { CodexFormFields } from "./CodexFormFields";
 import { ProviderPresetSelector } from "./ProviderPresetSelector";
 import {
+  defaultLocalProxyRetryPolicy,
+  normalizeLocalProxyRetryPolicy,
+  ProviderRetryPolicyConfig,
+  validateLocalProxyRetryPolicy,
+} from "./ProviderRetryPolicyConfig";
+import {
   codexProviderPresets,
   type CodexProviderPreset,
 } from "@/config/codexProviderPresets";
@@ -153,6 +159,11 @@ export function GrokBuildProviderForm({
   const [presetEndpoints, setPresetEndpoints] = useState<string[]>([]);
   const [draftCustomEndpoints, setDraftCustomEndpoints] = useState<string[]>(
     [],
+  );
+  const [localProxyRetryPolicy, setLocalProxyRetryPolicy] = useState(() =>
+    initialData?.meta?.localProxyRetryPolicy
+      ? normalizeLocalProxyRetryPolicy(initialData.meta.localProxyRetryPolicy)
+      : defaultLocalProxyRetryPolicy(),
   );
 
   const form = useForm<ProviderFormData>({
@@ -291,6 +302,23 @@ export function GrokBuildProviderForm({
   };
 
   const handleSubmit = async (values: ProviderFormData) => {
+    const retryPolicyError = validateLocalProxyRetryPolicy(
+      localProxyRetryPolicy,
+    );
+    if (retryPolicyError) {
+      toast.error(
+        t(`providerAdvanced.retryValidation.${retryPolicyError}`, {
+          defaultValue:
+            retryPolicyError === "maxRetries"
+              ? "Additional retries must be an integer from 0 to 50."
+              : retryPolicyError === "retryDelayMs"
+                ? "Retry interval must be an integer from 1 to 60000 ms."
+                : "Choose at least one error type or enter an error message when retries are enabled.",
+        }),
+      );
+      return;
+    }
+
     const name = values.name.trim();
     const parsedContextWindow = Number.parseInt(contextWindow, 10);
     const envKey = parseGrokBuildConfig(rawConfig).envKey?.trim();
@@ -367,6 +395,9 @@ export function GrokBuildProviderForm({
       codexChatReasoning,
       customUserAgent: customUserAgent.trim() || undefined,
       localProxyRequestOverrides: requestOverrides.overrides,
+      localProxyRetryPolicy: normalizeLocalProxyRetryPolicy(
+        localProxyRetryPolicy,
+      ),
       maxOutputTokens:
         Number.isInteger(parsedMaxOutputTokens) && parsedMaxOutputTokens > 0
           ? parsedMaxOutputTokens
@@ -522,6 +553,12 @@ export function GrokBuildProviderForm({
           onLocalProxyHeadersOverrideChange={setHeadersOverride}
           localProxyBodyOverride={bodyOverride}
           onLocalProxyBodyOverrideChange={setBodyOverride}
+        />
+
+        <ProviderRetryPolicyConfig
+          idPrefix="grokbuild-provider-retry"
+          value={localProxyRetryPolicy}
+          onChange={setLocalProxyRetryPolicy}
         />
 
         <div className="space-y-2">

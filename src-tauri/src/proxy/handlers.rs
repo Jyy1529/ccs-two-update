@@ -698,6 +698,7 @@ pub async fn handle_chat_completions(
     let uri = parts.uri;
     let mut headers = parts.headers;
     let extensions = parts.extensions;
+    let peer_addr = extensions.get::<std::net::SocketAddr>().copied();
     let body_bytes = req_body
         .collect()
         .await
@@ -707,8 +708,16 @@ pub async fn handle_chat_completions(
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
+    let mut ctx = RequestContext::new_with_peer_addr(
+        &state,
+        &body,
+        &headers,
+        AppType::Codex,
+        "Codex",
+        "codex",
+        peer_addr,
+    )
+    .await?;
     let endpoint = endpoint_with_query(&uri, "/chat/completions");
 
     let is_stream = body
@@ -788,6 +797,7 @@ async fn handle_responses_for_app(
     let uri = parts.uri;
     let mut headers = parts.headers;
     let extensions = parts.extensions;
+    let peer_addr = extensions.get::<std::net::SocketAddr>().copied();
     let body_bytes = req_body
         .collect()
         .await
@@ -797,8 +807,16 @@ async fn handle_responses_for_app(
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
+    let mut ctx = RequestContext::new_with_peer_addr(
+        &state,
+        &body,
+        &headers,
+        app_type.clone(),
+        tag,
+        app_type_str,
+        peer_addr,
+    )
+    .await?;
     let endpoint = endpoint_with_query(&uri, "/responses");
 
     let is_stream = body
@@ -903,6 +921,7 @@ async fn handle_responses_compact_for_app(
     let uri = parts.uri;
     let mut headers = parts.headers;
     let extensions = parts.extensions;
+    let peer_addr = extensions.get::<std::net::SocketAddr>().copied();
     let body_bytes = req_body
         .collect()
         .await
@@ -912,8 +931,16 @@ async fn handle_responses_compact_for_app(
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
+    let mut ctx = RequestContext::new_with_peer_addr(
+        &state,
+        &body,
+        &headers,
+        app_type.clone(),
+        tag,
+        app_type_str,
+        peer_addr,
+    )
+    .await?;
     let endpoint = endpoint_with_query(&uri, "/responses/compact");
 
     let is_stream = body

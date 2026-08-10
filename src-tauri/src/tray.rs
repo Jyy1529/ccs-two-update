@@ -494,39 +494,49 @@ fn handle_auto_click(app: &tauri::AppHandle, app_type: &AppType) -> Result<(), A
 
         // 真正启用 failover：启动代理服务 + 执行接管 + 开启 auto_failover
         let proxy_service = &app_state.proxy_service;
-
-        // 1) 确保代理服务运行（会自动设置 proxy_enabled = true）
-        let is_running = futures::executor::block_on(proxy_service.is_running());
-        if !is_running {
-            log::info!("[Tray] Auto 模式：启动代理服务");
-            if let Err(e) = futures::executor::block_on(proxy_service.start()) {
-                log::error!("[Tray] 启动代理服务失败: {e}");
-                return Err(AppError::Message(format!("启动代理服务失败: {e}")));
+        if matches!(app_type, AppType::Codex) {
+            tauri::async_runtime::block_on(
+                crate::commands::enable_codex_auto_failover_to_provider(
+                    app_state.inner().owned_clone(),
+                    p1_provider_id.clone(),
+                    true,
+                ),
+            )
+            .map_err(AppError::Message)?;
+        } else {
+            // 1) 确保代理服务运行（会自动设置 proxy_enabled = true）
+            let is_running = futures::executor::block_on(proxy_service.is_running());
+            if !is_running {
+                log::info!("[Tray] Auto 模式：启动代理服务");
+                if let Err(e) = futures::executor::block_on(proxy_service.start()) {
+                    log::error!("[Tray] 启动代理服务失败: {e}");
+                    return Err(AppError::Message(format!("启动代理服务失败: {e}")));
+                }
             }
-        }
 
-        // 2) 执行 Live 配置接管（确保该 app 被代理接管）
-        log::info!("[Tray] Auto 模式：对 {app_type_str} 执行接管");
-        if let Err(e) =
-            futures::executor::block_on(proxy_service.set_takeover_for_app(app_type_str, true))
-        {
-            log::error!("[Tray] 执行接管失败: {e}");
-            return Err(AppError::Message(format!("执行接管失败: {e}")));
-        }
+            // 2) 执行 Live 配置接管（确保该 app 被代理接管）
+            log::info!("[Tray] Auto 模式：对 {app_type_str} 执行接管");
+            if let Err(e) =
+                futures::executor::block_on(proxy_service.set_takeover_for_app(app_type_str, true))
+            {
+                log::error!("[Tray] 执行接管失败: {e}");
+                return Err(AppError::Message(format!("执行接管失败: {e}")));
+            }
 
-        // 3) 设置 auto_failover_enabled = true
-        app_state
-            .db
-            .set_proxy_flags_sync(app_type_str, true, true)?;
+            // 3) 设置 auto_failover_enabled = true
+            app_state
+                .db
+                .set_proxy_flags_sync(app_type_str, true, true)?;
 
-        // 3.1) 立即切到队列 P1（热切换：不写 Live，仅更新 DB/settings/备份）
-        if let Err(e) = futures::executor::block_on(
-            proxy_service.switch_proxy_target(app_type_str, &p1_provider_id),
-        ) {
-            log::error!("[Tray] Auto 模式切换到队列 P1 失败: {e}");
-            return Err(AppError::Message(format!(
-                "Auto 模式切换到队列 P1 失败: {e}"
-            )));
+            // 3.1) 立即切到队列 P1（热切换：不写 Live，仅更新 DB/settings/备份）
+            if let Err(e) = futures::executor::block_on(
+                proxy_service.switch_proxy_target(app_type_str, &p1_provider_id),
+            ) {
+                log::error!("[Tray] Auto 模式切换到队列 P1 失败: {e}");
+                return Err(AppError::Message(format!(
+                    "Auto 模式切换到队列 P1 失败: {e}"
+                )));
+            }
         }
 
         // 4) 更新托盘菜单
@@ -569,9 +579,20 @@ fn handle_provider_click(
             .db
             .set_proxy_flags_sync(app_type_str, proxy_enabled, false)?;
 
-        // 切换供应商。需要本地路由的供应商也不在这里自动启动代理，
-        // 由用户在页面/设置中手动开启。
-        crate::services::ProviderService::switch(app_state.inner(), app_type.clone(), provider_id)?;
+        if matches!(app_type, AppType::Codex) {
+            tauri::async_runtime::block_on(crate::switch_provider(
+                app.clone(),
+                app_type_str.to_string(),
+                provider_id.to_string(),
+            ))
+            .map_err(AppError::Message)?;
+        } else {
+            crate::services::ProviderService::switch(
+                app_state.inner(),
+                app_type.clone(),
+                provider_id,
+            )?;
+        }
 
         // 更新托盘菜单
         if let Ok(new_menu) = create_tray_menu(app, app_state.inner()) {
@@ -878,6 +899,16 @@ pub fn refresh_tray_menu(app: &tauri::AppHandle) {
     }
 }
 
+pub fn ensure_tray_visible(app: &tauri::AppHandle) {
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        if let Err(err) = tray.set_visible(true) {
+            log::warn!("恢复托盘图标失败: {err}");
+        }
+    } else {
+        log::warn!("恢复托盘图标失败: 托盘实例不存在");
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub fn apply_tray_policy(app: &tauri::AppHandle, dock_visible: bool) {
     use tauri::ActivationPolicy;
@@ -904,21 +935,7 @@ pub fn handle_tray_menu_event(app: &tauri::AppHandle, event_id: &str) {
     match event_id {
         "show_main" => {
             if let Some(window) = app.get_webview_window("main") {
-                #[cfg(target_os = "windows")]
-                {
-                    let _ = window.set_skip_taskbar(false);
-                }
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
-                #[cfg(target_os = "linux")]
-                {
-                    crate::linux_fix::nudge_main_window(window.clone());
-                }
-                #[cfg(target_os = "macos")]
-                {
-                    apply_tray_policy(app, true);
-                }
+                crate::show_main_window(&window);
             } else if crate::lightweight::is_lightweight_mode() {
                 if let Err(e) = crate::lightweight::exit_lightweight_mode(app) {
                     log::error!("退出轻量模式重建窗口失败: {e}");

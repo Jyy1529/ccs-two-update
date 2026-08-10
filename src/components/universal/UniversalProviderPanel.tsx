@@ -8,6 +8,10 @@ import { UniversalProviderFormModal } from "./UniversalProviderFormModal";
 import { universalProvidersApi } from "@/lib/api";
 import type { UniversalProvider, UniversalProvidersMap } from "@/types";
 import { deepClone } from "@/utils/deepClone";
+import {
+  extractErrorMessage,
+  translateCodexAgentRoleDeleteError,
+} from "@/utils/errorUtils";
 
 export function UniversalProviderPanel() {
   const { t } = useTranslation();
@@ -75,10 +79,15 @@ export function UniversalProviderPanel() {
         setEditingProvider(null);
       } catch (error) {
         console.error("Failed to save universal provider:", error);
+        const roleRoutingError = translateCodexAgentRoleDeleteError(
+          extractErrorMessage(error),
+          t,
+        );
         toast.error(
-          t("universalProvider.saveError", {
-            defaultValue: "保存统一供应商失败",
-          }),
+          roleRoutingError ??
+            t("universalProvider.saveError", {
+              defaultValue: "保存统一供应商失败",
+            }),
         );
       }
     },
@@ -100,10 +109,15 @@ export function UniversalProviderPanel() {
         setEditingProvider(null);
       } catch (error) {
         console.error("Failed to save and sync universal provider:", error);
+        const roleRoutingError = translateCodexAgentRoleDeleteError(
+          extractErrorMessage(error),
+          t,
+        );
         toast.error(
-          t("universalProvider.saveAndSyncError", {
-            defaultValue: "保存并同步失败",
-          }),
+          roleRoutingError ??
+            t("universalProvider.saveAndSyncError", {
+              defaultValue: "保存并同步失败",
+            }),
         );
       }
     },
@@ -122,10 +136,15 @@ export function UniversalProviderPanel() {
       loadProviders();
     } catch (error) {
       console.error("Failed to delete universal provider:", error);
+      const roleRoutingError = translateCodexAgentRoleDeleteError(
+        extractErrorMessage(error),
+        t,
+      );
       toast.error(
-        t("universalProvider.deleteError", {
-          defaultValue: "删除统一供应商失败",
-        }),
+        roleRoutingError ??
+          t("universalProvider.deleteError", {
+            defaultValue: "删除统一供应商失败",
+          }),
       );
     } finally {
       setDeleteConfirm({ open: false, id: "", name: "" });

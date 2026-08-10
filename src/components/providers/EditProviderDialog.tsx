@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Save } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { FullScreenPanel } from "@/components/common/FullScreenPanel";
 import type { Provider } from "@/types";
@@ -9,6 +10,10 @@ import {
   type ProviderFormValues,
 } from "@/components/providers/forms/ProviderForm";
 import { openclawApi, providersApi, vscodeApi, type AppId } from "@/lib/api";
+import {
+  AddProviderDialog,
+  type AddProviderInput,
+} from "@/components/providers/AddProviderDialog";
 
 interface EditProviderDialogProps {
   open: boolean;
@@ -20,6 +25,9 @@ interface EditProviderDialogProps {
   }) => Promise<void> | void;
   appId: AppId;
   isProxyTakeover?: boolean; // 代理接管模式下不读取 live（避免显示被接管后的代理配置）
+  onAddProvider?: (
+    provider: AddProviderInput,
+  ) => Promise<Provider | void> | Provider | void;
 }
 
 export function EditProviderDialog({
@@ -29,9 +37,23 @@ export function EditProviderDialog({
   onSubmit,
   appId,
   isProxyTakeover = false,
+  onAddProvider,
 }: EditProviderDialogProps) {
   const { t } = useTranslation();
   const [isFormSubmitting, setIsFormSubmitting] = useState(false);
+  const [agentRoleProviderDialogOpen, setAgentRoleProviderDialogOpen] =
+    useState(false);
+  const [agentRoleProviderCreated, setAgentRoleProviderCreated] = useState<
+    ((providerId: string) => void) | null
+  >(null);
+
+  const handleRequestAddCodexProvider = useCallback(
+    (onCreated: (providerId: string) => void) => {
+      setAgentRoleProviderCreated(() => onCreated);
+      setAgentRoleProviderDialogOpen(true);
+    },
+    [],
+  );
 
   // 默认使用传入的 provider.settingsConfig，若当前编辑对象是"当前生效供应商"，则尝试读取实时配置替换初始值
   const [liveSettings, setLiveSettings] = useState<Record<
@@ -212,9 +234,28 @@ export function EditProviderDialog({
         provider: updatedProvider,
         originalId: provider.id,
       });
+      if (
+        appId === "codex" &&
+        values.meta?.codexAgentRoleRouting?.enabled === true
+      ) {
+        try {
+          const currentProviderId = await providersApi.getCurrent("codex");
+          if (currentProviderId === updatedProvider.id) {
+            toast.success(t("providerAdvanced.agentRoleProxyAutoEnabled"));
+            toast.info(t("providerAdvanced.agentRoleRestartRequired"));
+          } else {
+            toast.info(t("providerAdvanced.agentRoleSavedSwitchRequired"));
+          }
+        } catch (error) {
+          console.error(
+            "[EditProviderDialog] Failed to resolve current Codex provider after save",
+            error,
+          );
+        }
+      }
       onOpenChange(false);
     },
-    [appId, onSubmit, onOpenChange, provider],
+    [appId, onSubmit, onOpenChange, provider, t],
   );
 
   if (!provider || !initialData) {
@@ -222,33 +263,56 @@ export function EditProviderDialog({
   }
 
   return (
-    <FullScreenPanel
-      isOpen={open}
-      title={t("provider.editProvider")}
-      onClose={() => onOpenChange(false)}
-      footer={
-        <Button
-          type="submit"
-          form="provider-form"
-          disabled={isFormSubmitting}
-          className="bg-primary text-primary-foreground hover:bg-primary/90"
-        >
-          <Save className="h-4 w-4 mr-2" />
-          {t("common.save")}
-        </Button>
-      }
-    >
-      <ProviderForm
-        appId={appId}
-        providerId={provider.id}
-        submitLabel={t("common.save")}
-        onSubmit={handleSubmit}
-        onCancel={() => onOpenChange(false)}
-        onSubmittingChange={setIsFormSubmitting}
-        initialData={initialData}
-        showButtons={false}
-        isProxyTakeover={isProxyTakeover}
-      />
-    </FullScreenPanel>
+    <>
+      <FullScreenPanel
+        isOpen={open}
+        title={t("provider.editProvider")}
+        onClose={() => onOpenChange(false)}
+        footer={
+          <Button
+            type="submit"
+            form="provider-form"
+            disabled={isFormSubmitting}
+            className="bg-primary text-primary-foreground hover:bg-primary/90"
+          >
+            <Save className="h-4 w-4 mr-2" />
+            {t("common.save")}
+          </Button>
+        }
+      >
+        <ProviderForm
+          appId={appId}
+          providerId={provider.id}
+          submitLabel={t("common.save")}
+          onSubmit={handleSubmit}
+          onCancel={() => onOpenChange(false)}
+          onSubmittingChange={setIsFormSubmitting}
+          initialData={initialData}
+          showButtons={false}
+          isProxyTakeover={isProxyTakeover}
+          onRequestAddCodexProvider={
+            appId === "codex" && onAddProvider
+              ? handleRequestAddCodexProvider
+              : undefined
+          }
+        />
+      </FullScreenPanel>
+
+      {onAddProvider && (
+        <AddProviderDialog
+          open={agentRoleProviderDialogOpen}
+          onOpenChange={(nextOpen) => {
+            setAgentRoleProviderDialogOpen(nextOpen);
+            if (!nextOpen) setAgentRoleProviderCreated(null);
+          }}
+          appId="codex"
+          onSubmit={onAddProvider}
+          allowAgentRoleProviderCreate={false}
+          onProviderCreated={(createdProvider) => {
+            agentRoleProviderCreated?.(createdProvider.id);
+          }}
+        />
+      )}
+    </>
   );
 }

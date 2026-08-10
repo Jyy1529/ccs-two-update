@@ -62,6 +62,7 @@ import { ProfileSwitcher } from "@/components/profiles/ProfileSwitcher";
 import { ProviderList } from "@/components/providers/ProviderList";
 import { AddProviderDialog } from "@/components/providers/AddProviderDialog";
 import { EditProviderDialog } from "@/components/providers/EditProviderDialog";
+import { ProviderTransferDialog } from "@/components/providers/ProviderTransferDialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { SettingsPage } from "@/components/settings/SettingsPage";
 import { UpdateBadge } from "@/components/UpdateBadge";
@@ -236,6 +237,9 @@ function App() {
   }, [sharedFeatureApp, currentView]);
 
   const [editingProvider, setEditingProvider] = useState<Provider | null>(null);
+  const [transferProvider, setTransferProvider] = useState<Provider | null>(
+    null,
+  );
   const [usageProvider, setUsageProvider] = useState<Provider | null>(null);
   const [confirmAction, setConfirmAction] = useState<{
     provider: Provider;
@@ -1014,6 +1018,7 @@ function App() {
                           : undefined
                       }
                       onDuplicate={handleDuplicateProvider}
+                      onTransfer={setTransferProvider}
                       onConfigureUsage={setUsageProvider}
                       onOpenWebsite={handleOpenWebsite}
                       onOpenTerminal={
@@ -1601,9 +1606,21 @@ function App() {
           }
         }}
         onSubmit={handleEditProvider}
+        onAddProvider={addProvider}
         appId={activeApp}
         isProxyTakeover={isCurrentAppTakeoverActive}
       />
+
+      {transferProvider && (
+        <ProviderTransferDialog
+          open
+          sourceApp={activeApp}
+          sourceProvider={transferProvider}
+          onOpenChange={(open) => {
+            if (!open) setTransferProvider(null);
+          }}
+        />
+      )}
 
       {effectiveUsageProvider && (
         <UsageScriptModal

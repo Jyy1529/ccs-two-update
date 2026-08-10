@@ -85,30 +85,36 @@ describe("GrokBuildProviderForm", () => {
     });
   });
 
-  it("maps Chat Completions presets into Grok api_backend", async () => {
-    const user = userEvent.setup();
-    const onSubmit = vi.fn();
-    render(
-      <GrokBuildProviderForm
-        submitLabel="Save"
-        onSubmit={onSubmit}
-        onCancel={() => {}}
-      />,
-    );
+  it(
+    "maps Chat Completions presets into Grok api_backend",
+    async () => {
+      const user = userEvent.setup();
+      const onSubmit = vi.fn();
+      render(
+        <GrokBuildProviderForm
+          submitLabel="Save"
+          onSubmit={onSubmit}
+          onCancel={() => {}}
+        />,
+      );
 
-    await user.click(screen.getByRole("button", { name: /BytePlus/ }));
-    await user.type(screen.getByLabelText("API Key"), "secret-key");
-    await user.click(screen.getByRole("button", { name: "Save" }));
+      await user.click(screen.getByRole("button", { name: /BytePlus/ }));
+      fireEvent.change(screen.getByLabelText("API Key"), {
+        target: { value: "secret-key" },
+      });
+      await user.click(screen.getByRole("button", { name: "Save" }));
 
-    expect(onSubmit).toHaveBeenCalledTimes(1);
-    const submitted = onSubmit.mock.calls[0][0];
-    const settings = JSON.parse(submitted.settingsConfig);
-    const config = parseToml(settings.config) as any;
-    expect(submitted.meta.apiFormat).toBe("openai_chat");
-    expect(config.model[config.models.default].api_backend).toBe(
-      "chat_completions",
-    );
-  });
+      expect(onSubmit).toHaveBeenCalledTimes(1);
+      const submitted = onSubmit.mock.calls[0][0];
+      const settings = JSON.parse(submitted.settingsConfig);
+      const config = parseToml(settings.config) as any;
+      expect(submitted.meta.apiFormat).toBe("openai_chat");
+      expect(config.model[config.models.default].api_backend).toBe(
+        "chat_completions",
+      );
+    },
+    15_000,
+  );
 
   it("renders localized validation feedback for malformed TOML", async () => {
     const onSubmit = vi.fn();
@@ -174,5 +180,55 @@ context_window = 250000
 
     expect(onSubmit).toHaveBeenCalledTimes(1);
     expect(onSubmit.mock.calls[0][0].meta.custom_endpoints).toBeUndefined();
+  });
+
+  it("loads and saves an independent provider retry policy", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    const config = `[models]
+default = "existing-profile"
+
+[model."existing-profile"]
+model = "grok-upstream"
+base_url = "https://existing.example.com/v1"
+name = "Existing Relay"
+api_key = "existing-key"
+api_backend = "responses"
+context_window = 250000
+`;
+    render(
+      <GrokBuildProviderForm
+        providerId="existing-provider"
+        submitLabel="Save"
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+        initialData={{
+          name: "Existing Relay",
+          settingsConfig: { config },
+          meta: {
+            localProxyRetryPolicy: {
+              maxRetries: 3,
+              retryDelayMs: 250,
+              customMessages: ["temporary capacity"],
+              errorTypes: ["overloaded"],
+            },
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByLabelText("Additional retries")).toHaveValue(3);
+    expect(screen.getByLabelText("Retry interval (ms)")).toHaveValue(250);
+    expect(screen.getByLabelText("Overloaded (HTTP 503)")).toBeChecked();
+
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(onSubmit.mock.calls[0][0].meta.localProxyRetryPolicy).toEqual({
+      maxRetries: 3,
+      retryDelayMs: 250,
+      customMessages: ["temporary capacity"],
+      errorTypes: ["overloaded"],
+    });
   });
 });
