@@ -207,6 +207,11 @@ impl Provider {
                 str_at(settings.get("baseUrl")),
                 str_at(settings.get("apiKey")),
             ),
+            // DeepSeek / Pi flatten credentials at the top level, camelCase（与 OpenClaw 一致）
+            AppType::DeepSeek | AppType::Pi => (
+                str_at(settings.get("baseUrl")),
+                str_at(settings.get("apiKey")),
+            ),
             // OpenCode (OMO) nests credentials under `options` (the SDK options object).
             AppType::OpenCode => {
                 let options = settings.get("options");

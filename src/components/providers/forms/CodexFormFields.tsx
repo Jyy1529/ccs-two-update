@@ -44,6 +44,10 @@ import {
 import { CustomUserAgentField } from "./CustomUserAgentField";
 import { LocalProxyRequestOverridesField } from "./LocalProxyRequestOverridesField";
 import { cn } from "@/lib/utils";
+import {
+  featureScopeAllows,
+  useProviderFeatureScopes,
+} from "@/lib/featureScopes";
 import type {
   ClaudeApiKeyField,
   CodexApiFormat,
@@ -249,6 +253,11 @@ export function CodexFormFields({
   advancedOptionsContent,
 }: CodexFormFieldsProps) {
   const { t } = useTranslation();
+  const featureScopes = useProviderFeatureScopes();
+  // 审批模型路由按「功能生效范围」设置显示（Codex 专属实现）
+  const supportsAutoReviewRouting =
+    appId === "codex" &&
+    featureScopeAllows(featureScopes.autoReviewRouting, appId);
 
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
@@ -1149,7 +1158,7 @@ export function CodexFormFields({
                       "border-t border-border-default pt-3",
                   )}
                 >
-                  {appId === "codex" && (
+                  {supportsAutoReviewRouting && (
                     <div className="space-y-3 border-b border-border-default pb-3">
                       <div className="space-y-1.5">
                         <FormLabel>

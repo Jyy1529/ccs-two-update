@@ -140,7 +140,17 @@ const renderProviderForm = (
 };
 
 beforeEach(() => {
-  setSettings({ commonConfigConfirmed: true });
+  setSettings({
+    commonConfigConfirmed: true,
+    providerFeatureScopes: {
+      localProxyRetry: {
+        enabled: true,
+        apps: ["claude", "codex", "gemini"],
+      },
+      agentRoleRouting: { enabled: true, apps: ["codex"] },
+      autoReviewRouting: { enabled: true, apps: ["codex"] },
+    },
+  });
   server.use(
     http.post("http://tauri.local/get_common_config_snippet", () =>
       HttpResponse.json(null),
@@ -166,6 +176,18 @@ beforeEach(() => {
 });
 
 describe("ProviderForm provider retry policy", () => {
+  it("hides the retry policy for Gemini when feature scopes are absent", async () => {
+    setSettings({ providerFeatureScopes: undefined });
+    renderProviderForm("gemini", createRetryInitialData("gemini"));
+
+    await screen.findByRole("button", { name: "Save" });
+    expect(
+      screen.queryByRole("button", {
+        name: "Local proxy automatic retry",
+      }),
+    ).not.toBeInTheDocument();
+  });
+
   it("forwards the role add-provider callback through advanced config", async () => {
     const user = userEvent.setup();
     const onRequestAddProvider = vi.fn();
@@ -188,11 +210,11 @@ describe("ProviderForm provider retry policy", () => {
 
   it.each<RetryAppId>(["claude", "codex", "gemini"])(
     "shows the default retry policy for a custom %s provider",
-    (appId) => {
+    async (appId) => {
       renderProviderForm(appId, createRetryInitialData(appId));
 
       expect(
-        screen.getByRole("switch", {
+        await screen.findByRole("switch", {
           name: "Enable retries for this Provider",
         }),
       ).not.toBeChecked();
@@ -235,11 +257,11 @@ describe("ProviderForm provider retry policy", () => {
 
   it.each<RetryAppId>(["claude", "codex", "gemini"])(
     "shows the retry policy for an official %s provider",
-    (appId) => {
+    async (appId) => {
       renderProviderForm(appId, createRetryInitialData(appId, "official"));
 
       expect(
-        screen.getByRole("button", {
+        await screen.findByRole("button", {
           name: "Local proxy automatic retry",
         }),
       ).toHaveAttribute("aria-expanded", "false");

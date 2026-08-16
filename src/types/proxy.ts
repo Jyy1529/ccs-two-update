@@ -50,6 +50,8 @@ export interface ProxyTakeoverStatus {
   opencode: boolean;
   openclaw: boolean;
   hermes: boolean;
+  deepseek: boolean;
+  pi: boolean;
 }
 
 export interface ProviderHealth {

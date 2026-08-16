@@ -336,6 +336,22 @@ export interface VisibleApps {
   opencode: boolean;
   openclaw: boolean;
   hermes: boolean;
+  deepseek: boolean;
+  pi: boolean;
+}
+
+// 单个 Provider 功能的生效范围：总开关 + 应用列表（AppId 字符串）
+export interface FeatureScope {
+  enabled: boolean;
+  apps: string[];
+}
+
+// Provider 功能的应用生效范围集合
+// 自动重试默认 Claude Code + Codex；角色路由与审批路由为 Codex 专属实现，默认仅 Codex
+export interface ProviderFeatureScopes {
+  localProxyRetry: FeatureScope;
+  agentRoleRouting: FeatureScope;
+  autoReviewRouting: FeatureScope;
 }
 
 // WebDAV 同步状态
@@ -414,6 +430,8 @@ export interface Settings {
   enableLocalProxy?: boolean;
   // 全局 Provider 自动重试开关；缺省按开启处理以兼容旧配置
   providerRetryEnabled?: boolean;
+  // Provider 功能的应用生效范围（自动重试 / 子代理角色路由 / 审批模型路由）
+  providerFeatureScopes?: ProviderFeatureScopes;
   // User has confirmed the local proxy first-run notice
   proxyConfirmed?: boolean;
   // User has confirmed the usage query first-run notice
@@ -459,6 +477,10 @@ export interface Settings {
   openclawConfigDir?: string;
   // 覆盖 Hermes 配置目录（可选）
   hermesConfigDir?: string;
+  // 覆盖 DeepSeek 配置目录（可选）
+  deepseekConfigDir?: string;
+  // 覆盖 Pi 配置目录（可选）
+  piConfigDir?: string;
 
   // ===== 当前供应商 ID（设备级）=====
   // 当前 Claude 供应商 ID（优先于数据库 is_current）
@@ -551,6 +573,8 @@ export interface McpApps {
   opencode: boolean;
   openclaw: boolean;
   hermes: boolean;
+  deepseek: boolean;
+  pi: boolean;
 }
 
 // MCP 服务器条目（v3.7.0 统一结构）

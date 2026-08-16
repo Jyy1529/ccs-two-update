@@ -72,6 +72,8 @@ describe("useDirectorySettings", () => {
       if (app === "grokbuild") return "/remote/grok";
       if (app === "opencode") return "/remote/opencode";
       if (app === "openclaw") return "/remote/openclaw";
+      if (app === "deepseek") return "/remote/deepseek";
+      if (app === "pi") return "/remote/pi";
       return "/remote/hermes";
     });
     selectConfigDirectoryMock.mockReset();
@@ -96,6 +98,8 @@ describe("useDirectorySettings", () => {
       opencode: "/remote/opencode",
       openclaw: "/remote/openclaw",
       hermes: "/remote/hermes",
+      deepseek: "/remote/deepseek",
+      pi: "/remote/pi",
     });
   });
 
@@ -239,6 +243,38 @@ describe("useDirectorySettings", () => {
       openclawConfigDir: "/picked/openclaw",
     });
     expect(result.current.resolvedDirs.openclaw).toBe("/picked/openclaw");
+  });
+
+  it("updates DeepSeek and Pi directories when browsing succeeds", async () => {
+    selectConfigDirectoryMock
+      .mockResolvedValueOnce("/picked/deepseek")
+      .mockResolvedValueOnce("/picked/pi");
+
+    const { result } = renderHook(() =>
+      useDirectorySettings({
+        settings: createSettings({
+          deepseekConfigDir: undefined,
+          piConfigDir: undefined,
+        }),
+        onUpdateSettings,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    await act(async () => {
+      await result.current.browseDirectory("deepseek");
+      await result.current.browseDirectory("pi");
+    });
+
+    expect(onUpdateSettings).toHaveBeenCalledWith({
+      deepseekConfigDir: "/picked/deepseek",
+    });
+    expect(onUpdateSettings).toHaveBeenCalledWith({
+      piConfigDir: "/picked/pi",
+    });
+    expect(result.current.resolvedDirs.deepseek).toBe("/picked/deepseek");
+    expect(result.current.resolvedDirs.pi).toBe("/picked/pi");
   });
 
   it("resetAllDirectories applies provided resolved values", async () => {

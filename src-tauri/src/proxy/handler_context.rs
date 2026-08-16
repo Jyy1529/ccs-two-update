@@ -74,6 +74,9 @@ fn codex_role_route_for_request(
     if !matches!(app_type, AppType::Codex) {
         return Ok(None);
     }
+    if !crate::settings::agent_role_routing_allowed() {
+        return Ok(None);
+    }
 
     use crate::services::codex_agent_roles::{
         ROLE_OWNER_HEADER, ROLE_ROUTE_HEADER, ROLE_TOKEN_HEADER,
@@ -253,7 +256,8 @@ impl RequestContext {
             .get_proxy_config_for_app(app_type_str)
             .await
             .map_err(|e| ProxyError::DatabaseError(e.to_string()))?;
-        let provider_retry_enabled = crate::settings::get_settings().is_provider_retry_enabled();
+        // 自动重试按功能范围判定：全局开关 + 该应用是否在生效应用列表内
+        let provider_retry_enabled = crate::settings::provider_retry_allowed_for(&app_type);
 
         // 从数据库读取整流器配置
         let rectifier_config = state.db.get_rectifier_config().unwrap_or_default();
@@ -698,7 +702,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn codex_role_routing_requires_a_loopback_peer() {
+        let _home = TestHome::new();
         let headers = valid_role_headers();
         let body = json!({ "model": "gpt-5.6-sol" });
         assert!(codex_role_route_for_request(
@@ -726,6 +732,33 @@ mod tests {
                 Err(ProxyError::InvalidRequest(message)) if message.contains("loopback")
             ));
         }
+    }
+
+    #[test]
+    #[serial]
+    fn disabled_agent_role_scope_ignores_existing_role_headers() {
+        let _home = TestHome::new();
+        let mut settings = crate::settings::get_settings();
+        let scopes = crate::settings::ProviderFeatureScopes {
+            agent_role_routing: crate::settings::FeatureScope {
+                enabled: false,
+                apps: vec!["codex".to_string()],
+            },
+            ..Default::default()
+        };
+        settings.provider_feature_scopes = Some(scopes);
+        crate::settings::update_settings(settings).expect("disable agent role routing scope");
+
+        let result = codex_role_route_for_request(
+            &AppType::Codex,
+            "/v1/responses",
+            &json!({ "model": "gpt-5.6-sol" }),
+            &valid_role_headers(),
+            Some("127.0.0.1:15721".parse().expect("loopback address")),
+        )
+        .expect("disabled role routing should ignore existing headers");
+
+        assert_eq!(result, None);
     }
 
     #[test]

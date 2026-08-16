@@ -46,6 +46,10 @@ pub struct VisibleApps {
     pub openclaw: bool,
     #[serde(default)]
     pub hermes: bool,
+    #[serde(default)]
+    pub deepseek: bool,
+    #[serde(default)]
+    pub pi: bool,
 }
 
 impl Default for VisibleApps {
@@ -58,7 +62,9 @@ impl Default for VisibleApps {
             grokbuild: true,
             opencode: true,
             openclaw: true,
-            hermes: false, // 默认不显示，需用户手动启用
+            hermes: false,   // 默认不显示，需用户手动启用
+            deepseek: false, // 默认不显示，需用户手动启用
+            pi: false,       // 默认不显示，需用户手动启用
         }
     }
 }
@@ -75,8 +81,106 @@ impl VisibleApps {
             AppType::OpenCode => self.opencode,
             AppType::OpenClaw => self.openclaw,
             AppType::Hermes => self.hermes,
+            AppType::DeepSeek => self.deepseek,
+            AppType::Pi => self.pi,
         }
     }
+}
+
+/// 单个 Provider 功能的生效范围：总开关 + 应用列表。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FeatureScope {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub apps: Vec<String>,
+}
+
+impl FeatureScope {
+    fn with_apps(apps: &[&str]) -> Self {
+        Self {
+            enabled: true,
+            apps: apps.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// 该功能对指定应用是否生效。
+    pub fn allows(&self, app: &AppType) -> bool {
+        self.enabled && self.apps.iter().any(|a| a == app.as_str())
+    }
+}
+
+/// Provider 功能的应用生效范围集合。
+///
+/// 缺省值即旧版行为的显式化：自动重试默认 Claude Code + Codex；
+/// 子代理角色路由与审批模型路由为 Codex 专属实现，默认仅 Codex。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderFeatureScopes {
+    #[serde(default = "default_local_proxy_retry_scope")]
+    pub local_proxy_retry: FeatureScope,
+    #[serde(default = "default_codex_only_scope")]
+    pub agent_role_routing: FeatureScope,
+    #[serde(default = "default_codex_only_scope")]
+    pub auto_review_routing: FeatureScope,
+}
+
+fn default_local_proxy_retry_scope() -> FeatureScope {
+    FeatureScope::with_apps(&["claude", "codex"])
+}
+
+fn default_codex_only_scope() -> FeatureScope {
+    FeatureScope::with_apps(&["codex"])
+}
+
+impl Default for ProviderFeatureScopes {
+    fn default() -> Self {
+        Self {
+            local_proxy_retry: default_local_proxy_retry_scope(),
+            agent_role_routing: default_codex_only_scope(),
+            auto_review_routing: default_codex_only_scope(),
+        }
+    }
+}
+
+/// 读取当前设置中的功能范围（未配置时返回默认范围）。
+pub fn get_provider_feature_scopes() -> ProviderFeatureScopes {
+    settings_store()
+        .read()
+        .ok()
+        .and_then(|s| s.provider_feature_scopes.clone())
+        .unwrap_or_default()
+}
+
+/// 「本地代理自动重试」对指定应用是否生效。
+///
+/// 兼容旧全局开关：providerRetryEnabled=false 时无论范围如何一律禁用。
+pub fn provider_retry_allowed_for(app: &AppType) -> bool {
+    let settings = get_settings();
+    if !settings.is_provider_retry_enabled() {
+        return false;
+    }
+    settings
+        .provider_feature_scopes
+        .clone()
+        .unwrap_or_default()
+        .local_proxy_retry
+        .allows(app)
+}
+
+/// 「前端/后端子代理角色路由」是否启用（Codex 专属实现）。
+pub fn agent_role_routing_allowed() -> bool {
+    get_provider_feature_scopes()
+        .agent_role_routing
+        .allows(&AppType::Codex)
+}
+
+/// 「审批模型路由」是否启用（Codex 专属实现）。
+pub fn auto_review_routing_allowed() -> bool {
+    get_provider_feature_scopes()
+        .auto_review_routing
+        .allows(&AppType::Codex)
 }
 
 /// WebDAV 同步状态（持久化同步进度信息）
@@ -369,6 +473,10 @@ pub struct AppSettings {
     /// 全局 Provider 自动重试开关；None 兼容旧 settings.json，按开启处理。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_retry_enabled: Option<bool>,
+    /// Provider 功能的应用生效范围（自动重试 / 子代理角色路由 / 审批模型路由）。
+    /// None 兼容旧 settings.json，按各功能默认范围处理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_feature_scopes: Option<ProviderFeatureScopes>,
     /// User has confirmed the local proxy first-run notice
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_confirmed: Option<bool>,
@@ -428,6 +536,12 @@ pub struct AppSettings {
     pub openclaw_config_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hermes_config_dir: Option<String>,
+    /// 覆盖 DeepSeek 配置目录（可选）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deepseek_config_dir: Option<String>,
+    /// 覆盖 Pi 配置目录（可选）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pi_config_dir: Option<String>,
 
     // ===== 当前供应商 ID（设备级）=====
     /// 当前 Claude 供应商 ID（本地存储，优先于数据库 is_current）
@@ -454,6 +568,12 @@ pub struct AppSettings {
     /// 当前 Hermes 供应商 ID（本地存储，保持结构一致）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_provider_hermes: Option<String>,
+    /// 当前 DeepSeek 供应商 ID（本地存储，保持结构一致）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_provider_deepseek: Option<String>,
+    /// 当前 Pi 供应商 ID（本地存储，保持结构一致）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_provider_pi: Option<String>,
 
     // ===== Skill 同步设置 =====
     /// Skill 同步方式：auto（默认，优先 symlink）、symlink、copy
@@ -521,6 +641,7 @@ impl Default for AppSettings {
             silent_startup: false,
             enable_local_proxy: false,
             provider_retry_enabled: None,
+            provider_feature_scopes: None,
             proxy_confirmed: None,
             usage_confirmed: None,
             usage_dashboard_refresh_interval_ms: None,
@@ -541,6 +662,8 @@ impl Default for AppSettings {
             opencode_config_dir: None,
             openclaw_config_dir: None,
             hermes_config_dir: None,
+            deepseek_config_dir: None,
+            pi_config_dir: None,
             current_provider_claude: None,
             current_provider_claude_desktop: None,
             current_provider_codex: None,
@@ -549,6 +672,8 @@ impl Default for AppSettings {
             current_provider_opencode: None,
             current_provider_openclaw: None,
             current_provider_hermes: None,
+            current_provider_deepseek: None,
+            current_provider_pi: None,
             skill_sync_method: SyncMethod::default(),
             skill_storage_location: SkillStorageLocation::default(),
             webdav_sync: None,
@@ -621,6 +746,20 @@ impl AppSettings {
 
         self.hermes_config_dir = self
             .hermes_config_dir
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        self.deepseek_config_dir = self
+            .deepseek_config_dir
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        self.pi_config_dir = self
+            .pi_config_dir
             .as_ref()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
@@ -945,6 +1084,22 @@ pub fn get_hermes_override_dir() -> Option<PathBuf> {
         .map(|p| resolve_override_path(p))
 }
 
+pub fn get_deepseek_override_dir() -> Option<PathBuf> {
+    let settings = settings_store().read().ok()?;
+    settings
+        .deepseek_config_dir
+        .as_ref()
+        .map(|p| resolve_override_path(p))
+}
+
+pub fn get_pi_override_dir() -> Option<PathBuf> {
+    let settings = settings_store().read().ok()?;
+    settings
+        .pi_config_dir
+        .as_ref()
+        .map(|p| resolve_override_path(p))
+}
+
 pub fn preserve_codex_official_auth_on_switch() -> bool {
     settings_store()
         .read()
@@ -982,6 +1137,8 @@ pub fn get_current_provider(app_type: &AppType) -> Option<String> {
         AppType::OpenCode => settings.current_provider_opencode.clone(),
         AppType::OpenClaw => settings.current_provider_openclaw.clone(),
         AppType::Hermes => settings.current_provider_hermes.clone(),
+        AppType::DeepSeek => settings.current_provider_deepseek.clone(),
+        AppType::Pi => settings.current_provider_pi.clone(),
     }
 }
 
@@ -1000,6 +1157,8 @@ pub fn set_current_provider(app_type: &AppType, id: Option<&str>) -> Result<(), 
         AppType::OpenCode => settings.current_provider_opencode = id_owned.clone(),
         AppType::OpenClaw => settings.current_provider_openclaw = id_owned.clone(),
         AppType::Hermes => settings.current_provider_hermes = id_owned.clone(),
+        AppType::DeepSeek => settings.current_provider_deepseek = id_owned.clone(),
+        AppType::Pi => settings.current_provider_pi = id_owned.clone(),
     })
 }
 
@@ -1185,6 +1344,53 @@ mod tests {
         assert!(enabled.is_provider_retry_enabled());
         assert!(!disabled.is_provider_retry_enabled());
     }
+
+    #[test]
+    fn legacy_settings_resolve_to_default_provider_feature_scopes() {
+        let legacy: AppSettings = serde_json::from_value(serde_json::json!({
+            "enableLocalProxy": true
+        }))
+        .expect("legacy settings");
+
+        assert_eq!(legacy.provider_feature_scopes, None);
+        let scopes = legacy.provider_feature_scopes.unwrap_or_default();
+        assert!(scopes.local_proxy_retry.allows(&AppType::Claude));
+        assert!(scopes.local_proxy_retry.allows(&AppType::Codex));
+        assert!(!scopes.local_proxy_retry.allows(&AppType::Gemini));
+        assert!(scopes.agent_role_routing.allows(&AppType::Codex));
+        assert!(!scopes.agent_role_routing.allows(&AppType::Claude));
+        assert!(scopes.auto_review_routing.allows(&AppType::Codex));
+        assert!(!scopes.auto_review_routing.allows(&AppType::Gemini));
+    }
+
+    #[test]
+    fn disabled_feature_scope_allows_no_apps() {
+        let scope = FeatureScope {
+            enabled: false,
+            apps: vec!["claude".to_string(), "codex".to_string()],
+        };
+
+        assert!(!scope.allows(&AppType::Claude));
+        assert!(!scope.allows(&AppType::Codex));
+        assert!(!scope.allows(&AppType::Gemini));
+    }
+
+    #[test]
+    fn provider_feature_scopes_serialize_with_camel_case_keys() {
+        let settings = AppSettings {
+            provider_feature_scopes: Some(ProviderFeatureScopes::default()),
+            ..AppSettings::default()
+        };
+
+        let value = serde_json::to_value(settings).expect("serialize settings");
+        let scopes = &value["providerFeatureScopes"];
+        assert!(scopes.get("localProxyRetry").is_some());
+        assert!(scopes.get("agentRoleRouting").is_some());
+        assert!(scopes.get("autoReviewRouting").is_some());
+        assert!(scopes.get("local_proxy_retry").is_none());
+        assert_eq!(scopes["localProxyRetry"]["apps"][0], "claude");
+    }
+
     #[test]
     fn visible_apps_old_settings_default_claude_desktop_visible() {
         let visible: VisibleApps = serde_json::from_value(serde_json::json!({

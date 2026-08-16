@@ -16,6 +16,20 @@ type LiveProviderIdsByApp = Record<
   string[]
 >;
 
+const createDefaultSettings = (): Settings => ({
+  showInTray: true,
+  minimizeToTrayOnClose: true,
+  enableClaudePluginIntegration: false,
+  claudeConfigDir: "/default/claude",
+  codexConfigDir: "/default/codex",
+  language: "zh",
+  providerFeatureScopes: {
+    localProxyRetry: { enabled: true, apps: ["claude", "codex"] },
+    agentRoleRouting: { enabled: true, apps: ["codex"] },
+    autoReviewRouting: { enabled: true, apps: ["codex"] },
+  },
+});
+
 const createDefaultProviders = (): ProvidersByApp => ({
   claude: {
     "claude-1": {
@@ -73,6 +87,8 @@ const createDefaultProviders = (): ProvidersByApp => ({
   opencode: {},
   openclaw: {},
   hermes: {},
+  deepseek: {},
+  pi: {},
 });
 
 const createDefaultCurrent = (): CurrentProviderState => ({
@@ -84,6 +100,8 @@ const createDefaultCurrent = (): CurrentProviderState => ({
   opencode: "",
   openclaw: "",
   hermes: "",
+  deepseek: "",
+  pi: "",
 });
 
 let providers = createDefaultProviders();
@@ -93,14 +111,7 @@ let liveProviderIds: LiveProviderIdsByApp = {
   openclaw: [],
   hermes: [],
 };
-let settingsState: Settings = {
-  showInTray: true,
-  minimizeToTrayOnClose: true,
-  enableClaudePluginIntegration: false,
-  claudeConfigDir: "/default/claude",
-  codexConfigDir: "/default/codex",
-  language: "zh",
-};
+let settingsState = createDefaultSettings();
 let appConfigDirOverride: string | null = null;
 const sessionMessageKey = (providerId: string, sourcePath: string) =>
   `${providerId}:${sourcePath}`;
@@ -165,6 +176,8 @@ let mcpConfigs: McpConfigState = {
         opencode: false,
         openclaw: false,
         hermes: false,
+        deepseek: false,
+        pi: false,
       },
       server: {
         type: "stdio",
@@ -185,6 +198,8 @@ let mcpConfigs: McpConfigState = {
         opencode: false,
         openclaw: false,
         hermes: false,
+        deepseek: false,
+        pi: false,
       },
       server: {
         type: "http",
@@ -197,6 +212,8 @@ let mcpConfigs: McpConfigState = {
   opencode: {},
   openclaw: {},
   hermes: {},
+  deepseek: {},
+  pi: {},
 };
 
 const cloneProviders = (value: ProvidersByApp) =>
@@ -212,14 +229,7 @@ export const resetProviderState = () => {
   };
   sessionsState = createDefaultSessions();
   sessionMessagesState = createDefaultSessionMessages();
-  settingsState = {
-    showInTray: true,
-    minimizeToTrayOnClose: true,
-    enableClaudePluginIntegration: false,
-    claudeConfigDir: "/default/claude",
-    codexConfigDir: "/default/codex",
-    language: "zh",
-  };
+  settingsState = createDefaultSettings();
   appConfigDirOverride = null;
   mcpConfigs = {
     claude: {
@@ -234,6 +244,8 @@ export const resetProviderState = () => {
           opencode: false,
           openclaw: false,
           hermes: false,
+          deepseek: false,
+          pi: false,
         },
         server: {
           type: "stdio",
@@ -254,6 +266,8 @@ export const resetProviderState = () => {
           opencode: false,
           openclaw: false,
           hermes: false,
+          deepseek: false,
+          pi: false,
         },
         server: {
           type: "http",
@@ -266,6 +280,8 @@ export const resetProviderState = () => {
     opencode: {},
     openclaw: {},
     hermes: {},
+    deepseek: {},
+    pi: {},
   };
 };
 

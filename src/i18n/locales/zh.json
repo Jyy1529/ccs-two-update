@@ -343,6 +343,23 @@
     "tabAuth": "认证",
     "tabAdvanced": "高级",
     "tabProxy": "路由",
+    "featureScopes": {
+      "title": "Provider 功能生效范围",
+      "description": "控制以下功能启用与生效的应用；未勾选的应用不显示对应配置，也不参与该功能。",
+      "codexOnlyHint": "当前仅 Codex 支持",
+      "localProxyRetry": {
+        "title": "本地代理自动重试",
+        "description": "本地代理请求失败时按 Provider 重试策略自动重试。"
+      },
+      "agentRoleRouting": {
+        "title": "前端/后端子代理模型路由",
+        "description": "前端角色可使用独立 Codex Provider，后端角色跟随当前 Provider。"
+      },
+      "autoReviewRouting": {
+        "title": "审批模型路由",
+        "description": "控制 Codex 审批请求使用原生、自动或回退模型。"
+      }
+    },
     "authCenter": {
       "title": "OAuth 认证中心",
       "description": "在 Claude Code 中使用您的其他订阅，请注意合规风险。",
@@ -820,6 +837,8 @@
     "openclawConfigDirDescription": "覆盖 OpenClaw 配置目录 (openclaw.json)。",
     "hermesConfigDir": "Hermes 配置目录",
     "hermesConfigDirDescription": "覆盖 Hermes 配置目录 (config.yaml)。",
+    "deepseekConfigDir": "DeepSeek 配置目录",
+    "piConfigDir": "Pi 配置目录",
     "browsePlaceholderClaude": "例如：/home/<你的用户名>/.claude",
     "browsePlaceholderCodex": "例如：/home/<你的用户名>/.codex",
     "browsePlaceholderGemini": "例如：/home/<你的用户名>/.gemini",
@@ -827,6 +846,8 @@
     "browsePlaceholderOpencode": "例如：/home/<你的用户名>/.config/opencode",
     "browsePlaceholderOpenclaw": "例如：/home/<你的用户名>/.openclaw",
     "browsePlaceholderHermes": "例如：/home/<你的用户名>/.hermes",
+    "browsePlaceholderDeepSeek": "例如：/home/<你的用户名>/.deepseek",
+    "browsePlaceholderPi": "例如：/home/<你的用户名>/.pi",
     "browseDirectory": "浏览目录",
     "resetDefault": "恢复默认目录（需保存后生效）",
     "checkForUpdates": "检查更新",
@@ -937,7 +958,9 @@
     "grokbuild": "Grok Build",
     "opencode": "OpenCode",
     "openclaw": "OpenClaw",
-    "hermes": "Hermes"
+    "hermes": "Hermes",
+    "deepseek": "DeepSeek",
+    "pi": "Pi"
   },
   "appSwitcher": {
     "more": "更多应用"
@@ -1917,7 +1940,9 @@
         "grokbuild": "Grok Build",
         "opencode": "OpenCode",
         "openclaw": "OpenClaw",
-        "hermes": "Hermes"
+        "hermes": "Hermes",
+        "deepseek": "DeepSeek",
+        "pi": "Pi"
       }
     },
     "userLevelPath": "用户级 MCP 配置路径",
@@ -2534,7 +2559,9 @@
       "codex": "Codex",
       "gemini": "Gemini",
       "opencode": "OpenCode",
-      "openclaw": "OpenClaw"
+      "openclaw": "OpenClaw",
+      "deepseek": "DeepSeek",
+      "pi": "Pi"
     },
     "installFromZip": {
       "button": "从 ZIP 安装",

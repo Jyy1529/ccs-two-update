@@ -343,6 +343,23 @@
     "tabAuth": "Auth",
     "tabAdvanced": "Advanced",
     "tabProxy": "Routing",
+    "featureScopes": {
+      "title": "Provider Feature Scope",
+      "description": "Control which features are enabled and which apps they apply to. Unselected apps do not show the related settings or use the feature.",
+      "codexOnlyHint": "Currently supported by Codex only",
+      "localProxyRetry": {
+        "title": "Local Proxy Automatic Retry",
+        "description": "Automatically retry failed local proxy requests according to the Provider retry policy."
+      },
+      "agentRoleRouting": {
+        "title": "Frontend/Backend Subagent Model Routing",
+        "description": "Frontend roles can use a dedicated Codex Provider, while backend roles follow the current Provider."
+      },
+      "autoReviewRouting": {
+        "title": "Approval Model Routing",
+        "description": "Control whether Codex approval requests use the native, automatic, or fallback model."
+      }
+    },
     "authCenter": {
       "title": "OAuth Authentication Center",
       "description": "Use your other subscriptions in Claude Code — please be mindful of compliance risks.",
@@ -820,6 +837,8 @@
     "openclawConfigDirDescription": "Override OpenClaw configuration directory (openclaw.json).",
     "hermesConfigDir": "Hermes Configuration Directory",
     "hermesConfigDirDescription": "Override Hermes configuration directory (config.yaml).",
+    "deepseekConfigDir": "DeepSeek configuration directory",
+    "piConfigDir": "Pi configuration directory",
     "browsePlaceholderClaude": "e.g., /home/<your-username>/.claude",
     "browsePlaceholderCodex": "e.g., /home/<your-username>/.codex",
     "browsePlaceholderGemini": "e.g., /home/<your-username>/.gemini",
@@ -827,6 +846,8 @@
     "browsePlaceholderOpencode": "e.g., /home/<your-username>/.config/opencode",
     "browsePlaceholderOpenclaw": "e.g., /home/<your-username>/.openclaw",
     "browsePlaceholderHermes": "e.g., /home/<your-username>/.hermes",
+    "browsePlaceholderDeepSeek": "e.g., /home/<your-username>/.deepseek",
+    "browsePlaceholderPi": "e.g., /home/<your-username>/.pi",
     "browseDirectory": "Browse Directory",
     "resetDefault": "Reset to default directory (takes effect after saving)",
     "checkForUpdates": "Check for Updates",
@@ -937,7 +958,9 @@
     "grokbuild": "Grok Build",
     "opencode": "OpenCode",
     "openclaw": "OpenClaw",
-    "hermes": "Hermes"
+    "hermes": "Hermes",
+    "deepseek": "DeepSeek",
+    "pi": "Pi"
   },
   "appSwitcher": {
     "more": "More apps"
@@ -1917,7 +1940,9 @@
         "grokbuild": "Grok Build",
         "opencode": "OpenCode",
         "openclaw": "OpenClaw",
-        "hermes": "Hermes"
+        "hermes": "Hermes",
+        "deepseek": "DeepSeek",
+        "pi": "Pi"
       }
     },
     "userLevelPath": "User-level MCP path",
@@ -2534,7 +2559,9 @@
       "codex": "Codex",
       "gemini": "Gemini",
       "opencode": "OpenCode",
-      "openclaw": "OpenClaw"
+      "openclaw": "OpenClaw",
+      "deepseek": "DeepSeek",
+      "pi": "Pi"
     },
     "installFromZip": {
       "button": "Install from ZIP",

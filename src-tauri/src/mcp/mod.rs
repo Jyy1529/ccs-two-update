@@ -17,6 +17,7 @@ mod gemini;
 mod grokbuild;
 mod hermes;
 mod opencode;
+mod simple_json;
 mod validation;
 
 // 重新导出公共 API
@@ -37,4 +38,8 @@ pub use grokbuild::{
 pub use hermes::{import_from_hermes, remove_server_from_hermes, sync_single_server_to_hermes};
 pub use opencode::{
     import_from_opencode, remove_server_from_opencode, sync_single_server_to_opencode,
+};
+pub use simple_json::{
+    remove_server_from_deepseek, remove_server_from_pi, sync_single_server_to_deepseek,
+    sync_single_server_to_pi,
 };

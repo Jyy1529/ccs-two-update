@@ -173,12 +173,6 @@ pub(crate) fn resolve_retry_policy_with_global(
     if !global_enabled {
         return None;
     }
-    if !matches!(
-        app_type,
-        AppType::Claude | AppType::Codex | AppType::Gemini | AppType::GrokBuild
-    ) {
-        return None;
-    }
     if matches!(app_type, AppType::Codex)
         && body.get("model").and_then(Value::as_str) == Some(AUTO_REVIEW_MODEL)
     {
@@ -524,7 +518,7 @@ mod tests {
             &json!({ "model": "gpt-5.6-sol" }),
             &provider,
         )
-        .is_none());
+        .is_some());
     }
 
     #[test]

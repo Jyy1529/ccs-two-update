@@ -24,6 +24,8 @@ export const APP_IDS: AppId[] = [
   "opencode",
   "openclaw",
   "hermes",
+  "deepseek",
+  "pi",
 ];
 
 /** App IDs shown in Skills panels (excludes OpenClaw — it doesn't support Skills) */
@@ -34,6 +36,8 @@ export const SKILLS_APP_IDS: AppId[] = [
   "grokbuild",
   "opencode",
   "hermes",
+  "deepseek",
+  "pi",
 ];
 
 /** App IDs shown in MCP panels (excludes OpenClaw) */
@@ -124,5 +128,28 @@ export const APP_ICON_MAP: Record<AppId, AppConfig> = {
       "bg-violet-500/10 ring-1 ring-violet-500/20 hover:bg-violet-500/20 text-violet-600 dark:text-violet-400",
     badgeClass:
       "bg-violet-500/10 text-violet-700 dark:text-violet-300 hover:bg-violet-500/20 border-0 gap-1.5",
+  },
+  deepseek: {
+    label: "DeepSeek",
+    icon: (
+      <ProviderIcon
+        icon="deepseek"
+        name="DeepSeek"
+        size={14}
+        showFallback={false}
+      />
+    ),
+    activeClass:
+      "bg-teal-500/10 ring-1 ring-teal-500/20 hover:bg-teal-500/20 text-teal-600 dark:text-teal-400",
+    badgeClass:
+      "bg-teal-500/10 text-teal-700 dark:text-teal-300 hover:bg-teal-500/20 border-0 gap-1.5",
+  },
+  pi: {
+    label: "Pi",
+    icon: <ProviderIcon icon="pi" name="Pi" size={14} showFallback={false} />,
+    activeClass:
+      "bg-pink-500/10 ring-1 ring-pink-500/20 hover:bg-pink-500/20 text-pink-600 dark:text-pink-400",
+    badgeClass:
+      "bg-pink-500/10 text-pink-700 dark:text-pink-300 hover:bg-pink-500/20 border-0 gap-1.5",
   },
 };

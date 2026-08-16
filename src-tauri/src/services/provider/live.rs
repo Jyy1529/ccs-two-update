@@ -527,7 +527,9 @@ fn settings_contain_common_config(app_type: &AppType, settings: &Value, snippet:
         | AppType::OpenCode
         | AppType::OpenClaw
         | AppType::Hermes
-        | AppType::ClaudeDesktop => false,
+        | AppType::ClaudeDesktop
+        | AppType::DeepSeek
+        | AppType::Pi => false,
     }
 }
 
@@ -601,7 +603,9 @@ pub(crate) fn remove_common_config_from_settings(
         | AppType::OpenCode
         | AppType::OpenClaw
         | AppType::Hermes
-        | AppType::ClaudeDesktop => Ok(settings.clone()),
+        | AppType::ClaudeDesktop
+        | AppType::DeepSeek
+        | AppType::Pi => Ok(settings.clone()),
     }
 }
 
@@ -660,7 +664,9 @@ fn apply_common_config_to_settings(
         | AppType::OpenCode
         | AppType::OpenClaw
         | AppType::Hermes
-        | AppType::ClaudeDesktop => Ok(settings.clone()),
+        | AppType::ClaudeDesktop
+        | AppType::DeepSeek
+        | AppType::Pi => Ok(settings.clone()),
     }
 }
 
@@ -1162,6 +1168,18 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
             crate::hermes_config::set_provider(&provider.id, provider.settings_config.clone())?;
             log::debug!("Hermes provider '{}' written to live config", provider.id);
         }
+        AppType::DeepSeek => {
+            // DeepSeek：写 camelCase 平铺 config.json（baseUrl / apiKey / model）
+            let path = crate::deepseek_config::get_deepseek_config_path();
+            write_json_file(&path, &provider.settings_config)?;
+            log::debug!("DeepSeek provider '{}' written to live config", provider.id);
+        }
+        AppType::Pi => {
+            // Pi：写 camelCase 平铺 config.json（baseUrl / apiKey / model）
+            let path = crate::pi_config::get_pi_config_path();
+            write_json_file(&path, &provider.settings_config)?;
+            log::debug!("Pi provider '{}' written to live config", provider.id);
+        }
     }
     Ok(())
 }
@@ -1417,6 +1435,28 @@ pub fn read_live_settings(app_type: AppType) -> Result<Value, AppError> {
             let config = crate::hermes_config::yaml_to_json(&yaml_config)?;
             Ok(config)
         }
+        AppType::DeepSeek => {
+            let config_path = crate::deepseek_config::get_deepseek_config_path();
+            if !config_path.exists() {
+                return Err(AppError::localized(
+                    "deepseek.config.missing",
+                    "DeepSeek 配置文件不存在",
+                    "DeepSeek configuration file not found",
+                ));
+            }
+            read_json_file(&config_path)
+        }
+        AppType::Pi => {
+            let config_path = crate::pi_config::get_pi_config_path();
+            if !config_path.exists() {
+                return Err(AppError::localized(
+                    "pi.config.missing",
+                    "Pi 配置文件不存在",
+                    "Pi configuration file not found",
+                ));
+            }
+            read_json_file(&config_path)
+        }
     }
 }
 
@@ -1529,6 +1569,8 @@ pub fn import_default_config(state: &AppState, app_type: AppType) -> Result<bool
         AppType::OpenCode | AppType::OpenClaw | AppType::Hermes => {
             unreachable!("additive mode apps are handled by early return")
         }
+        // DeepSeek / Pi 暂不支持从 live 导入默认配置
+        AppType::DeepSeek | AppType::Pi => return Ok(false),
     };
 
     let mut provider = Provider::with_id(

@@ -343,6 +343,23 @@
     "tabAuth": "認証",
     "tabAdvanced": "詳細",
     "tabProxy": "ルーティング",
+    "featureScopes": {
+      "title": "Provider 機能の適用範囲",
+      "description": "以下の機能の有効化と適用対象アプリを管理します。選択されていないアプリには関連設定が表示されず、その機能も適用されません。",
+      "codexOnlyHint": "現在は Codex のみ対応",
+      "localProxyRetry": {
+        "title": "ローカルプロキシの自動再試行",
+        "description": "ローカルプロキシのリクエスト失敗時に、Provider の再試行ポリシーに従って自動的に再試行します。"
+      },
+      "agentRoleRouting": {
+        "title": "フロントエンド/バックエンドサブエージェントのモデルルーティング",
+        "description": "フロントエンドロールは専用の Codex Provider を使用でき、バックエンドロールは現在の Provider に従います。"
+      },
+      "autoReviewRouting": {
+        "title": "承認モデルルーティング",
+        "description": "Codex の承認リクエストでネイティブ、自動、またはフォールバックモデルのいずれを使用するかを制御します。"
+      }
+    },
     "authCenter": {
       "title": "OAuth 認証センター",
       "description": "Claude Code で他のサブスクリプションをご利用いただけます。コンプライアンスリスクにご注意ください。",
@@ -820,6 +837,8 @@
     "openclawConfigDirDescription": "OpenClaw の設定ディレクトリ（openclaw.json）を上書きします。",
     "hermesConfigDir": "Hermes 設定ディレクトリ",
     "hermesConfigDirDescription": "Hermes の設定ディレクトリ（config.yaml）を上書きします。",
+    "deepseekConfigDir": "DeepSeek 設定ディレクトリ",
+    "piConfigDir": "Pi 設定ディレクトリ",
     "browsePlaceholderClaude": "例: /home/<your-username>/.claude",
     "browsePlaceholderCodex": "例: /home/<your-username>/.codex",
     "browsePlaceholderGemini": "例: /home/<your-username>/.gemini",
@@ -827,6 +846,8 @@
     "browsePlaceholderOpencode": "例: /home/<your-username>/.config/opencode",
     "browsePlaceholderOpenclaw": "例: /home/<your-username>/.openclaw",
     "browsePlaceholderHermes": "例: /home/<your-username>/.hermes",
+    "browsePlaceholderDeepSeek": "例: /home/<your-username>/.deepseek",
+    "browsePlaceholderPi": "例: /home/<your-username>/.pi",
     "browseDirectory": "ディレクトリを選択",
     "resetDefault": "デフォルトに戻す（保存後に反映）",
     "checkForUpdates": "アップデートを確認",
@@ -937,7 +958,9 @@
     "grokbuild": "Grok Build",
     "opencode": "OpenCode",
     "openclaw": "OpenClaw",
-    "hermes": "Hermes"
+    "hermes": "Hermes",
+    "deepseek": "DeepSeek",
+    "pi": "Pi"
   },
   "appSwitcher": {
     "more": "その他のアプリ"
@@ -1917,7 +1940,9 @@
         "grokbuild": "Grok Build",
         "opencode": "OpenCode",
         "openclaw": "OpenClaw",
-        "hermes": "Hermes"
+        "hermes": "Hermes",
+        "deepseek": "DeepSeek",
+        "pi": "Pi"
       }
     },
     "userLevelPath": "ユーザーレベルの MCP パス",
@@ -2534,7 +2559,9 @@
       "codex": "Codex",
       "gemini": "Gemini",
       "opencode": "OpenCode",
-      "openclaw": "OpenClaw"
+      "openclaw": "OpenClaw",
+      "deepseek": "DeepSeek",
+      "pi": "Pi"
     },
     "installFromZip": {
       "button": "ZIP からインストール",

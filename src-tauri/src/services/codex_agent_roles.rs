@@ -209,9 +209,86 @@ impl TransactionPostImage {
 }
 
 pub fn current_codex_role_route_requires_proxy(state: &AppState) -> Result<bool, AppError> {
+    // 功能范围关闭时角色路由整体停用，不再要求代理接管
+    if !crate::settings::agent_role_routing_allowed() {
+        return Ok(false);
+    }
     Ok(current_codex_role_owner(state)?
         .as_ref()
         .is_some_and(|(_, routing)| routing.is_enabled()))
+}
+
+/// 检查本地代理监听地址是否为回环地址
+///
+/// Codex 角色路由要求本地代理监听回环地址以避免安全风险
+fn is_loopback_address(addr: &str) -> bool {
+    let addr = addr.trim();
+    if addr.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    let ip_literal = addr
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(addr);
+    ip_literal
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// 验证 Codex 角色路由的前置条件
+///
+/// 检查：
+/// 1. 角色路由已启用
+/// 2. 本地代理监听回环地址
+pub async fn validate_codex_role_routing_requirements(
+    state: &AppState,
+    provider_id: &str,
+) -> Result<(), AppError> {
+    let provider = state
+        .db
+        .get_provider_by_id(provider_id, "codex")?
+        .ok_or_else(|| AppError::Message(format!("Provider not found: {}", provider_id)))?;
+
+    let _routing = provider
+        .meta
+        .as_ref()
+        .and_then(|m| m.codex_agent_role_routing.as_ref())
+        .filter(|r| r.is_enabled())
+        .ok_or_else(|| AppError::Message("Codex role routing is not enabled".into()))?;
+
+    // 检查本地代理监听地址
+    let proxy_config = state.db.get_proxy_config().await?;
+    let listen_address = format!(
+        "{}:{}",
+        proxy_config.listen_address, proxy_config.listen_port
+    );
+
+    if !is_loopback_address(&proxy_config.listen_address) {
+        log::error!(
+            "[CodexRoleRoute] Validation failed: listen address {} is not loopback",
+            listen_address
+        );
+        return Err(AppError::localized(
+            "codex_role_routing_requires_loopback",
+            format!(
+                "Codex 角色路由要求本地代理监听回环地址（127.0.0.1 或 ::1），当前: {}",
+                listen_address
+            ),
+            format!(
+                "Codex role routing requires local proxy to listen on loopback address (127.0.0.1 or ::1), current: {}",
+                listen_address
+            ),
+        ));
+    }
+
+    log::info!(
+        "[CodexRoleRoute] Validation passed for provider {}: listen address {}",
+        provider_id,
+        listen_address
+    );
+
+    Ok(())
 }
 
 pub async fn reconcile_current_codex_agent_roles(
@@ -231,10 +308,24 @@ pub(crate) async fn reconcile_current_codex_agent_roles_under_proxy_transaction(
 async fn reconcile_current_codex_agent_roles_locked(
     state: &AppState,
 ) -> Result<CodexAgentRoleReconcileResult, AppError> {
+    // 功能范围关闭时视为禁用：清除已生成的角色配置
+    if !crate::settings::agent_role_routing_allowed() {
+        return disable_codex_agent_roles_unlocked();
+    }
+
     let Some((owner_provider_id, routing)) = current_codex_role_owner(state)? else {
         return disable_codex_agent_roles_unlocked();
     };
     if !routing.is_enabled() {
+        return disable_codex_agent_roles_unlocked();
+    }
+
+    // 验证前置条件：本地代理监听回环地址
+    if let Err(error) = validate_codex_role_routing_requirements(state, &owner_provider_id).await {
+        log::warn!(
+            "[CodexRoleRoute] Validation failed, disabling roles: {}",
+            error
+        );
         return disable_codex_agent_roles_unlocked();
     }
 
@@ -964,10 +1055,46 @@ fn lock_role_projection() -> Result<MutexGuard<'static, ()>, AppError> {
 fn atomic_write_role_file(path: &Path, data: &[u8]) -> Result<(), AppError> {
     use std::os::unix::fs::PermissionsExt;
 
+    log::info!(
+        "[CodexRoleRoute] Writing role config to: {}",
+        path.display()
+    );
+
+    // 确保父目录存在
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            log::info!(
+                "[CodexRoleRoute] Creating parent directory: {}",
+                parent.display()
+            );
+            fs::create_dir_all(parent).map_err(|error| {
+                log::error!(
+                    "[CodexRoleRoute] Failed to create parent directory {}: {}",
+                    parent.display(),
+                    error
+                );
+                AppError::io(parent, error)
+            })?;
+        }
+    }
+
     ensure_managed_or_absent(path)?;
     atomic_write(path, data)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|error| AppError::io(path, error))
+
+    let result = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    if let Err(ref error) = result {
+        log::error!(
+            "[CodexRoleRoute] Failed to set permissions for {}: {}",
+            path.display(),
+            error
+        );
+    } else {
+        log::info!(
+            "[CodexRoleRoute] Successfully wrote role config: {}",
+            path.display()
+        );
+    }
+    result.map_err(|error| AppError::io(path, error))
 }
 
 #[cfg(windows)]
@@ -978,10 +1105,39 @@ fn atomic_write_role_file(path: &Path, data: &[u8]) -> Result<(), AppError> {
     use std::time::{SystemTime, UNIX_EPOCH};
     use windows_sys::Win32::Storage::FileSystem::{ReplaceFileW, REPLACEFILE_WRITE_THROUGH};
 
+    log::info!(
+        "[CodexRoleRoute] Writing role config to: {}",
+        path.display()
+    );
+
     let parent = path
         .parent()
         .ok_or_else(|| AppError::Config("invalid Codex Agent Role path".to_string()))?;
-    fs::create_dir_all(parent).map_err(|error| AppError::io(parent, error))?;
+
+    // 确保父目录存在
+    if !parent.exists() {
+        log::info!(
+            "[CodexRoleRoute] Creating parent directory: {}",
+            parent.display()
+        );
+    }
+    fs::create_dir_all(parent).map_err(|error| {
+        log::error!(
+            "[CodexRoleRoute] Failed to create parent directory {}: {}",
+            parent.display(),
+            error
+        );
+        AppError::io(parent, error)
+    })?;
+
+    // 检查目录权限（仅记录日志）
+    if let Ok(metadata) = fs::metadata(parent) {
+        log::debug!(
+            "[CodexRoleRoute] Parent directory readonly: {}",
+            metadata.permissions().readonly()
+        );
+    }
+
     ensure_managed_or_absent(path)?;
     let file_name = path
         .file_name()
@@ -1012,7 +1168,16 @@ fn atomic_write_role_file(path: &Path, data: &[u8]) -> Result<(), AppError> {
         ensure_managed_or_absent(path)?;
 
         if !path_entry_exists(path)? {
-            return fs::rename(&temp_path, path).map_err(|error| AppError::IoContext {
+            let rename_result = fs::rename(&temp_path, path);
+            if let Err(ref error) = rename_result {
+                log::error!(
+                    "[CodexRoleRoute] Failed to rename {} -> {}: {}",
+                    temp_path.display(),
+                    path.display(),
+                    error
+                );
+            }
+            return rename_result.map_err(|error| AppError::IoContext {
                 context: format!(
                     "Codex Agent Role atomic create failed: {} -> {}",
                     temp_path.display(),
@@ -1035,15 +1200,26 @@ fn atomic_write_role_file(path: &Path, data: &[u8]) -> Result<(), AppError> {
             )
         };
         if replaced == 0 {
+            let os_error = std::io::Error::last_os_error();
+            log::error!(
+                "[CodexRoleRoute] ReplaceFileW failed: {} -> {}, error: {}",
+                temp_path.display(),
+                path.display(),
+                os_error
+            );
             return Err(AppError::IoContext {
                 context: format!(
                     "Codex Agent Role atomic replace failed: {} -> {}",
                     temp_path.display(),
                     path.display()
                 ),
-                source: std::io::Error::last_os_error(),
+                source: os_error,
             });
         }
+        log::info!(
+            "[CodexRoleRoute] Successfully wrote role config: {}",
+            path.display()
+        );
         Ok(())
     })();
 
@@ -1296,7 +1472,7 @@ mod tests {
         create_codex_role_route_token, disable_codex_agent_roles_at,
         disable_codex_agent_roles_at_with_before_copy,
         disable_codex_agent_roles_at_with_before_move, ensure_disabled_role_copy,
-        inject_role_mutation_fault, reconcile_codex_agent_roles_at,
+        inject_role_mutation_fault, is_loopback_address, reconcile_codex_agent_roles_at,
         reconcile_codex_agent_roles_at_with_writer, reconcile_current_codex_agent_roles,
         restore_snapshots, verify_codex_role_route_token, CodexAgentRolePaths, FileSnapshot,
         RoleMutationFault, TransactionPostImage, FRONTEND_ROLE_ROUTE_VALUE,
@@ -1374,6 +1550,27 @@ mod tests {
                 reasoning_effort: None,
             }),
             backend: Some(CodexAgentRoleOverride::default()),
+        }
+    }
+
+    #[test]
+    fn loopback_address_validation_parses_ip_literals_strictly() {
+        for address in ["127.0.0.1", "127.42.0.9", "::1", "[::1]", "localhost"] {
+            assert!(is_loopback_address(address), "expected loopback: {address}");
+        }
+
+        for address in [
+            "127.evil",
+            "127.0.0.1:15777",
+            "localhost:15777",
+            "0.0.0.0",
+            "::",
+            "192.0.2.10",
+        ] {
+            assert!(
+                !is_loopback_address(address),
+                "expected non-loopback: {address}"
+            );
         }
     }
 

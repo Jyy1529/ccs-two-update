@@ -58,6 +58,10 @@ import {
 } from "@/utils/grokBuildConfig";
 import { resolveProviderIcon } from "@/utils/providerIcon";
 import { GROKBUILD_OFFICIAL_PROVIDER_ID } from "@/utils/providerCapabilities";
+import {
+  featureScopeAllows,
+  useProviderFeatureScopes,
+} from "@/lib/featureScopes";
 
 type GrokBuildProviderFormProps = Omit<ProviderFormProps, "appId">;
 
@@ -465,13 +469,19 @@ export function GrokBuildProviderForm({
     await onSubmit(payload);
   };
 
-  const retryAdvancedOptions = (
+  // 自动重试按「功能生效范围」设置决定是否显示（Grok Build 对应 appId=grokbuild）
+  const featureScopes = useProviderFeatureScopes();
+  const supportsLocalProxyRetry = featureScopeAllows(
+    featureScopes.localProxyRetry,
+    "grokbuild",
+  );
+  const retryAdvancedOptions = supportsLocalProxyRetry ? (
     <ProviderRetryPolicyConfig
       idPrefix="grokbuild-provider-retry"
       value={localProxyRetryPolicy}
       onChange={setLocalProxyRetryPolicy}
     />
-  );
+  ) : undefined;
   const rawConfigError = validateGrokBuildConfig(rawConfig);
 
   return (

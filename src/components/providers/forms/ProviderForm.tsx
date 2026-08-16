@@ -13,6 +13,10 @@ import {
   formatRequestOverrideObject,
 } from "@/lib/requestOverrides";
 import { providersApi, settingsApi, type AppId } from "@/lib/api";
+import {
+  featureScopeAllows,
+  useProviderFeatureScopes,
+} from "@/lib/featureScopes";
 import { useDarkMode } from "@/hooks/useDarkMode";
 import type {
   ProviderCategory,
@@ -134,6 +138,18 @@ import { HERMES_DEFAULT_CONFIG } from "./hooks/useHermesFormState";
 import { resolveManagedAccountId } from "@/lib/authBinding";
 import { useOpenClawLiveProviderIds } from "@/hooks/useOpenClaw";
 import { useHermesLiveProviderIds } from "@/hooks/useHermes";
+
+const DEEPSEEK_DEFAULT_CONFIG = `{
+  "baseUrl": "https://api.deepseek.com/v1",
+  "apiKey": "",
+  "model": ""
+}`;
+
+const PI_DEFAULT_CONFIG = `{
+  "baseUrl": "",
+  "apiKey": "",
+  "model": ""
+}`;
 
 type PresetEntry = {
   id: string;
@@ -328,8 +344,15 @@ function ProviderFormFull({
     () => initialData?.meta?.endpointAutoSelect ?? true,
   );
   const supportsFullUrl = appId === "claude" || appId === "codex";
-  const supportsLocalProxyRetry =
-    appId === "claude" || appId === "codex" || appId === "gemini";
+  const featureScopes = useProviderFeatureScopes();
+  // 自动重试按「功能生效范围」设置决定显示；子代理角色路由与审批路由同理（Codex 专属）
+  const supportsLocalProxyRetry = featureScopeAllows(
+    featureScopes.localProxyRetry,
+    appId,
+  );
+  const supportsAgentRoleRouting =
+    appId === "codex" &&
+    featureScopeAllows(featureScopes.agentRoleRouting, appId);
   const [localIsFullUrl, setLocalIsFullUrl] = useState<boolean>(() => {
     if (!supportsFullUrl) return false;
     return initialData?.meta?.isFullUrl ?? false;
@@ -440,7 +463,11 @@ function ProviderFormFull({
                 ? OPENCLAW_DEFAULT_CONFIG
                 : appId === "hermes"
                   ? HERMES_DEFAULT_CONFIG
-                  : CLAUDE_DEFAULT_CONFIG,
+                  : appId === "deepseek"
+                    ? DEEPSEEK_DEFAULT_CONFIG
+                    : appId === "pi"
+                      ? PI_DEFAULT_CONFIG
+                      : CLAUDE_DEFAULT_CONFIG,
       icon: initialData?.icon ?? "",
       iconColor: initialData?.iconColor ?? "",
     }),
@@ -764,6 +791,11 @@ function ProviderFormFull({
         id: `hermes-${index}`,
         preset,
       }));
+    } else if (appId === "deepseek" || appId === "pi") {
+      // No native preset contract exists for these clients yet. Do not expose
+      // Claude presets, whose env/config shape cannot be written to their
+      // flat camelCase config.json files.
+      return [];
     }
     return providerPresets
       .filter((p) => !p.hidden)
@@ -1680,9 +1712,10 @@ function ProviderFormFull({
         codexAutoReviewMode !== "native"
           ? codexAutoReviewFallbackModel.trim() || undefined
           : undefined,
+      // scope 关闭时保留已存策略（隐藏+停用但不销毁；重新开启范围后原配置仍在）
       localProxyRetryPolicy: supportsLocalProxyRetry
         ? normalizeLocalProxyRetryPolicy(localProxyRetryPolicy)
-        : undefined,
+        : initialData?.meta?.localProxyRetryPolicy,
       codexAgentRoleRouting:
         appId === "codex"
           ? normalizeCodexAgentRoleRouting(codexAgentRoleRouting)
@@ -2061,10 +2094,10 @@ function ProviderFormFull({
           supportsLocalProxyRetry ? setLocalProxyRetryPolicy : undefined
         }
         codexAgentRoleRouting={
-          appId === "codex" ? codexAgentRoleRouting : undefined
+          supportsAgentRoleRouting ? codexAgentRoleRouting : undefined
         }
         onCodexAgentRoleRoutingChange={
-          appId === "codex" ? setCodexAgentRoleRouting : undefined
+          supportsAgentRoleRouting ? setCodexAgentRoleRouting : undefined
         }
         ownerProviderId={providerId}
         ownerDefaultModel={codexModel}
@@ -2085,7 +2118,7 @@ function ProviderFormFull({
           onSubmit={form.handleSubmit(handleSubmit)}
           className="space-y-6 glass rounded-xl p-6 border border-white/10"
         >
-          {!initialData && (
+          {!initialData && appId !== "deepseek" && appId !== "pi" && (
             <ProviderPresetSelector
               selectedPresetId={selectedPresetId}
               presetEntries={presetEntries}
@@ -2670,7 +2703,10 @@ function ProviderFormFull({
               </div>
               {settingsConfigErrorField}
             </>
-          ) : appId === "openclaw" || appId === "hermes" ? (
+          ) : appId === "openclaw" ||
+            appId === "hermes" ||
+            appId === "deepseek" ||
+            appId === "pi" ? (
             <>
               <div className="space-y-2">
                 <Label htmlFor="settingsConfig">
@@ -2686,7 +2722,19 @@ function ProviderFormFull({
   "base_url": "https://api.example.com/v1",
   "api_key": ""
 }`
-                      : `{
+                      : appId === "deepseek"
+                        ? `{
+  "baseUrl": "https://api.deepseek.com/v1",
+  "apiKey": "",
+  "model": ""
+}`
+                        : appId === "pi"
+                          ? `{
+  "baseUrl": "https://api.example.com/v1",
+  "apiKey": "",
+  "model": ""
+}`
+                          : `{
   "baseUrl": "https://api.example.com/v1",
   "apiKey": "your-api-key-here",
   "api": "openai-completions",

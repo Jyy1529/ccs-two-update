@@ -1,9 +1,12 @@
+import type { PropsWithChildren, ReactElement } from "react";
+import { QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { FormProvider, useForm } from "react-hook-form";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CodexFormFields } from "@/components/providers/forms/CodexFormFields";
+import { createTestQueryClient } from "../utils/testQueryClient";
 
 type AutoReviewMode = "native" | "auto" | "fallback";
 
@@ -94,13 +97,46 @@ function TestFields({
   );
 }
 
+function renderWithQueryClient(
+  ui: ReactElement,
+  autoReviewRouting = { enabled: true, apps: ["codex"] },
+) {
+  const queryClient = createTestQueryClient();
+  queryClient.setQueryData(["settings"], {
+    providerFeatureScopes: {
+      localProxyRetry: { enabled: true, apps: ["claude", "codex"] },
+      agentRoleRouting: { enabled: true, apps: ["codex"] },
+      autoReviewRouting,
+    },
+  });
+  const Wrapper = ({ children }: PropsWithChildren) => (
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  );
+  return render(ui, { wrapper: Wrapper });
+}
+
 function renderFields(mode: AutoReviewMode, onModeChange = vi.fn()) {
-  return render(<TestFields mode={mode} onModeChange={onModeChange} />);
+  return renderWithQueryClient(
+    <TestFields mode={mode} onModeChange={onModeChange} />,
+  );
 }
 
 describe("CodexFormFields auto-review routing", () => {
   beforeEach(() => {
     fetchModelsForConfigMock.mockReset();
+  });
+
+  it("hides reviewer routing when its feature scope is disabled", () => {
+    renderWithQueryClient(<TestFields mode="auto" onModeChange={vi.fn()} />, {
+      enabled: false,
+      apps: ["codex"],
+    });
+
+    expect(
+      screen.queryByRole("radiogroup", {
+        name: /Approval reviewer routing|审批模型路由/i,
+      }),
+    ).not.toBeInTheDocument();
   });
 
   it("shows three modes and uses the provider model as the fallback placeholder", async () => {
@@ -143,7 +179,7 @@ describe("CodexFormFields auto-review routing", () => {
 
   it("opens advanced options for a loaded reviewer route configuration", () => {
     const advancedButtonName = /高级选项|Advanced Options/i;
-    const { unmount } = render(
+    const { unmount } = renderWithQueryClient(
       <TestFields mode="auto" onModeChange={vi.fn()} apiFormat="openai_chat" />,
     );
 
@@ -152,7 +188,7 @@ describe("CodexFormFields auto-review routing", () => {
     ).toHaveAttribute("aria-expanded", "true");
 
     unmount();
-    render(
+    renderWithQueryClient(
       <TestFields
         mode="native"
         onModeChange={vi.fn()}
@@ -176,7 +212,7 @@ describe("CodexFormFields auto-review routing", () => {
     ]);
     const onFallbackModelChange = vi.fn();
     const user = userEvent.setup();
-    render(
+    renderWithQueryClient(
       <TestFields
         mode="auto"
         onModeChange={vi.fn()}
@@ -209,7 +245,7 @@ describe("CodexFormFields auto-review routing", () => {
       .mockImplementationOnce(() => first.promise)
       .mockImplementationOnce(() => second.promise);
     const user = userEvent.setup();
-    const { rerender } = render(
+    const { rerender } = renderWithQueryClient(
       <TestFields
         mode="auto"
         onModeChange={vi.fn()}

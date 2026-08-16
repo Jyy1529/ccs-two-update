@@ -1,11 +1,15 @@
+import type { PropsWithChildren, ReactElement } from "react";
+import { QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { parse as parseToml } from "smol-toml";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   GrokBuildProviderForm,
   grokApiBackendFromApiFormat,
 } from "@/components/providers/forms/GrokBuildProviderForm";
+import { createTestQueryClient } from "../utils/testQueryClient";
+import { setSettings } from "../msw/state";
 
 vi.mock("@/components/JsonEditor", () => ({
   default: ({
@@ -22,6 +26,37 @@ vi.mock("@/components/JsonEditor", () => ({
     />
   ),
 }));
+
+function renderWithQueryClient(ui: ReactElement) {
+  const queryClient = createTestQueryClient();
+  queryClient.setQueryData(["settings"], {
+    providerFeatureScopes: {
+      localProxyRetry: {
+        enabled: true,
+        apps: ["claude", "codex", "grokbuild"],
+      },
+      agentRoleRouting: { enabled: true, apps: ["codex"] },
+      autoReviewRouting: { enabled: true, apps: ["codex"] },
+    },
+  });
+  const Wrapper = ({ children }: PropsWithChildren) => (
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  );
+  return render(ui, { wrapper: Wrapper });
+}
+
+beforeEach(() => {
+  setSettings({
+    providerFeatureScopes: {
+      localProxyRetry: {
+        enabled: true,
+        apps: ["claude", "codex", "grokbuild"],
+      },
+      agentRoleRouting: { enabled: true, apps: ["codex"] },
+      autoReviewRouting: { enabled: true, apps: ["codex"] },
+    },
+  });
+});
 
 async function openAdvancedOptions(user: ReturnType<typeof userEvent.setup>) {
   const advancedButton = screen.getByRole("button", {
@@ -44,7 +79,7 @@ async function openRetryPolicy(user: ReturnType<typeof userEvent.setup>) {
 describe("GrokBuildProviderForm", () => {
   it("offers curated Grok Build presets and applies one", async () => {
     const user = userEvent.setup();
-    const { container } = render(
+    const { container } = renderWithQueryClient(
       <GrokBuildProviderForm
         submitLabel="Save"
         onSubmit={() => {}}
@@ -69,7 +104,7 @@ describe("GrokBuildProviderForm", () => {
   it("keeps the official Grok form minimal and exposes provider retry", async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn();
-    const { container } = render(
+    const { container } = renderWithQueryClient(
       <GrokBuildProviderForm
         submitLabel="Save"
         onSubmit={onSubmit}
@@ -123,7 +158,7 @@ describe("GrokBuildProviderForm", () => {
   it("submits a complete config.toml payload with Grok defaults", async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn();
-    const { container } = render(
+    const { container } = renderWithQueryClient(
       <GrokBuildProviderForm
         submitLabel="Save"
         onSubmit={onSubmit}
@@ -174,7 +209,7 @@ describe("GrokBuildProviderForm", () => {
     // 组件级接线用带显式 apiFormat 的 Responses 预设验证
     const user = userEvent.setup();
     const onSubmit = vi.fn();
-    render(
+    renderWithQueryClient(
       <GrokBuildProviderForm
         submitLabel="Save"
         onSubmit={onSubmit}
@@ -199,7 +234,7 @@ describe("GrokBuildProviderForm", () => {
 
   it("renders localized validation feedback for malformed TOML", async () => {
     const onSubmit = vi.fn();
-    render(
+    renderWithQueryClient(
       <GrokBuildProviderForm
         submitLabel="Save"
         onSubmit={onSubmit}
@@ -229,7 +264,7 @@ api_key = "existing-key"
 api_backend = "responses"
 context_window = 250000
 `;
-    const { container } = render(
+    const { container } = renderWithQueryClient(
       <GrokBuildProviderForm
         providerId="existing-provider"
         submitLabel="Save"
@@ -277,7 +312,7 @@ api_key = "existing-key"
 api_backend = "responses"
 context_window = 250000
 `;
-    render(
+    renderWithQueryClient(
       <GrokBuildProviderForm
         providerId="existing-provider"
         submitLabel="Save"

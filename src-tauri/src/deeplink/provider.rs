@@ -175,6 +175,9 @@ pub(crate) fn build_provider_from_request(
         AppType::OpenCode => build_opencode_settings(request),
         AppType::OpenClaw => build_additive_app_settings(request),
         AppType::Hermes => build_hermes_settings(request),
+        // DeepSeek / Pi 使用 camelCase 平铺（baseUrl / apiKey / model），
+        // 与 OpenClaw 的通用 additive 结构一致
+        AppType::DeepSeek | AppType::Pi => build_additive_app_settings(request),
     };
 
     // Build usage script configuration if provided

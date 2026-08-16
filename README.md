@@ -12,7 +12,7 @@
 | 上游项目 | [farion1231/cc-switch](https://github.com/farion1231/cc-switch) |
 | 归档版本 | CC Switch 3.18.0、3.19.0、3.19.2 |
 | 桌面框架 | Tauri 2 + React + TypeScript + Rust |
-| 当前推荐版本 | CC Switch 3.19.2 |
+| 当前推荐版本 | CC Switch 3.19.3（二次开发版） |
 | 主要平台 | Windows、macOS、Linux；Codex Desktop 自动修复面向 Windows |
 
 ## 二次开发目标
@@ -172,7 +172,7 @@
 
 | 分支 | 内容 |
 | --- | --- |
-| `main` | 当前 3.19.2 二次开发版本，也是 GitHub 默认分支 |
+| `main` | 当前 3.19.3 二次开发版本，也是 GitHub 默认分支 |
 | `archive/v3.19-safe-2026-08-10` | 3.19.0 二次开发归档，用于版本追溯和升级比较 |
 | `archive/auto-review-2026-08-10` | 早期自动审查开发快照，保留用于追溯和差异比较 |
 
@@ -185,8 +185,11 @@
 | 1 | 3.18.0 | `archive/auto-review-2026-08-10` | `src-tauri/target/release/bundle/nsis/CC Switch_3.18.0_x64-setup.exe` | `src-tauri/target/release/bundle/msi/CC Switch_3.18.0_x64_en-US.msi` |
 | 2 | 3.19.0 | `archive/v3.19-safe-2026-08-10` | `src-tauri/target/release/bundle/nsis/CC Switch_3.19.0_x64-setup.exe` | `src-tauri/target/release/bundle/msi/CC Switch_3.19.0_x64_en-US.msi` |
 | 3 | 3.19.2 | `main` | `src-tauri/target/release/bundle/nsis/CC Switch_3.19.2_x64-setup.exe` | `src-tauri/target/release/bundle/msi/CC Switch_3.19.2_x64_en-US.msi` |
+| 4 | 3.19.3 | `main` | GitHub Release asset `CC-Switch-v3.19.3-Windows-Setup.exe` | GitHub Release asset `CC-Switch-v3.19.3-Windows.msi` |
 
-从旧版本逐级升级时，按 `3.18.0 -> 3.19.0 -> 3.19.2` 安装。新设备直接安装 `3.19.2` 即可。NSIS 适合常规交互式安装，MSI 适合企业部署和脚本化安装；同一版本选择其中一种安装包即可。
+从旧版本逐级升级时，按 `3.18.0 -> 3.19.0 -> 3.19.2 -> 3.19.3` 安装。新设备直接安装 `3.19.3` 即可。NSIS 适合常规交互式安装，MSI 适合企业部署和脚本化安装；同一版本选择其中一种安装包即可。
+
+`3.19.3` 是本仓库的 Windows 二次开发手动发布：安装器未进行 Authenticode 签名，未生成 Tauri updater `.sig` 或 `latest.json`，应用内自动更新通道暂不可用。请从本仓库的 [GitHub Release](https://github.com/Jyy1529/ccs-two-update/releases/tag/v3.19.3) 手动下载并核对发布说明中的 SHA-256。
 
 ## 开发环境
 

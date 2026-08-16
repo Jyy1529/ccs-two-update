@@ -135,6 +135,8 @@ const VALID_APPS: AppId[] = [
   "opencode",
   "openclaw",
   "hermes",
+  "deepseek",
+  "pi",
 ];
 
 const getInitialApp = (): AppId => {
@@ -217,6 +219,8 @@ function App() {
     opencode: true,
     openclaw: true,
     hermes: true,
+    deepseek: true,
+    pi: true,
   };
 
   const getFirstVisibleApp = (): AppId => {
@@ -228,6 +232,8 @@ function App() {
     if (visibleApps.opencode) return "opencode";
     if (visibleApps.openclaw) return "openclaw";
     if (visibleApps.hermes) return "hermes";
+    if (visibleApps.deepseek) return "deepseek";
+    if (visibleApps.pi) return "pi";
     return "claude"; // fallback
   };
 

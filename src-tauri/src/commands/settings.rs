@@ -32,6 +32,9 @@ fn merge_settings_for_save(
     if incoming.provider_retry_enabled.is_none() {
         incoming.provider_retry_enabled = existing.provider_retry_enabled;
     }
+    if incoming.provider_feature_scopes.is_none() {
+        incoming.provider_feature_scopes = existing.provider_feature_scopes.clone();
+    }
 
     match (&mut incoming.s3_sync, &existing.s3_sync) {
         // incoming 没有 s3 → 保留现有
@@ -72,7 +75,19 @@ pub async fn save_settings(
     let unify_codex_changed =
         merged.unify_codex_session_history != existing.unify_codex_session_history;
     let unify_codex_enabled = merged.unify_codex_session_history;
+    let feature_scopes_changed = merged.provider_feature_scopes != existing.provider_feature_scopes;
     crate::settings::update_settings(merged).map_err(|e| e.to_string())?;
+
+    // 功能范围（子代理角色路由等）变更后立即 reconcile，让开关关闭时
+    // 已生成的角色配置文件即刻清除、开启时即刻生成，无需等下次切换。
+    if feature_scopes_changed {
+        if let Err(err) =
+            crate::services::codex_agent_roles::reconcile_current_codex_agent_roles(state.inner())
+                .await
+        {
+            log::warn!("功能范围变更后 Codex 角色路由 reconcile 失败: {err}");
+        }
+    }
 
     // 统一会话开关变更时立即重写当前官方 Codex 供应商的 live 配置，
     // 不必等下一次切换才生效。

@@ -5,6 +5,29 @@ All notable changes to CC Switch will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.19.3] - 2026-08-16
+
+This fork release carries the Provider feature-scope controls and the DeepSeek/Pi MCP and Skills persistence work from the handoff scope. It also hardens the newly exposed DeepSeek/Pi surfaces so their provider forms write the documented flat `baseUrl` / `apiKey` / `model` JSON shape, hides unsupported universal-provider entry points, and validates Codex role-routing listeners as strict loopback IP literals.
+
+### Added
+
+- Provider feature-scope settings for local proxy retry, Codex agent-role routing, and Codex approval routing, with four-language UI coverage.
+- DeepSeek/Pi MCP and Skills enable-state persistence, schema v17 migration, independent `mcp.json` synchronization, and directory settings.
+- Regression coverage for DeepSeek/Pi provider JSON forms, MCP dialogs, directory selection, feature scopes, and strict loopback validation.
+
+### Changed
+
+- Gemini no longer shows local-proxy retry by default; feature scope settings control the effective application set.
+- DeepSeek/Pi provider forms no longer reuse Claude presets or common-config editors.
+- Fork metadata and release links point to `Jyy1529/ccs-two-update`; the updater endpoint is reserved for a future fork-signed channel.
+
+### Release notes
+
+- Windows MSI/NSIS assets are manual-install artifacts for this release.
+- The installers have no Authenticode signature.
+- No Tauri updater artifact, `.sig`, or `latest.json` is generated; automatic in-app updates are unavailable for this release.
+- Verify the SHA-256 values published with the GitHub Release assets.
+
 ## [3.19.2] - 2026-08-06
 
 Development since v3.19.1 is a correctness and hardening pass, with the management UI picking up its two most-requested conveniences. The headline fix is to Codex usage accounting: a rollout file that interleaves several cumulative token counters — a gateway replaying the same snapshot under different rate-limit buckets, or two genuinely distinct counters alternating — could record several times its true usage, and the importer now recognizes both shapes; replaying a real corpus of ~1,900 rollout files lands within 0.001% of an independently computed ideal recount (#3011). A six-part security hardening caps every unbounded read a contributor's audit surfaced — usage scripts, Grok session logs, catalog files, proxy response bodies and their decompression — and the deep-link import dialog now shows two credential fields it previously persisted without rendering. OMO setups regain a working integration on two fronts: when OMO's unified config (`~/.omo/omo.jsonc` or `omo.json`) exists, writes land inside it instead of the legacy file the runtime no longer reads, and the model pickers merge in whatever the installed OpenCode reports at runtime. The MCP, prompt and skill panels gain search, with bulk per-app toggles joining the MCP and skill lists; the Auth Center shows each ChatGPT account's subscription usage inline; and two write-path overhauls — batched SQL backups and batched Codex session imports — cut the worst restore, sync and reimport stalls on large databases.

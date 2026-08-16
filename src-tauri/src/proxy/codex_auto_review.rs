@@ -21,6 +21,10 @@ pub(crate) fn is_auto_review_request(app_type: &AppType, endpoint: &str, body: &
 }
 
 fn configured_mode(provider: &Provider) -> CodexAutoReviewMode {
+    // 功能范围关闭时视为 Native：不做任何审批模型改写
+    if !crate::settings::auto_review_routing_allowed() {
+        return CodexAutoReviewMode::Native;
+    }
     provider
         .meta
         .as_ref()

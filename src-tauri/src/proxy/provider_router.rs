@@ -182,6 +182,10 @@ impl ProviderRouter {
     ) -> Result<Option<ProviderRoutePlan>, AppError> {
         const APP_TYPE: &str = "codex";
 
+        if !crate::settings::agent_role_routing_allowed() {
+            return Ok(None);
+        }
+
         let Some(owner) = self.db.get_provider_by_id(owner_provider_id, APP_TYPE)? else {
             let current_id =
                 crate::settings::get_effective_current_provider(&self.db, &AppType::Codex)?
@@ -603,6 +607,32 @@ mod tests {
             .and_then(|meta| meta.codex_agent_role_routing.as_ref())
             .expect("Codex role routing");
         create_codex_role_route_token(&owner.id, FRONTEND_ROLE_ROUTE_VALUE, routing)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn disabled_agent_role_scope_skips_frontend_route_selection() {
+        let _home = TempHome::new();
+        let mut settings = crate::settings::get_settings();
+        let scopes = crate::settings::ProviderFeatureScopes {
+            agent_role_routing: crate::settings::FeatureScope {
+                enabled: false,
+                apps: vec!["codex".to_string()],
+            },
+            ..Default::default()
+        };
+        settings.provider_feature_scopes = Some(scopes);
+        crate::settings::update_settings(settings).expect("disable agent role routing scope");
+
+        let router = ProviderRouter::new(Arc::new(Database::memory().expect("memory db")));
+        let plan = router
+            .select_codex_frontend_route_plan("old-owner", "client-model", "old-token")
+            .await
+            .expect("disabled role route selection");
+
+        assert!(plan.is_none());
+        crate::settings::update_settings(crate::settings::AppSettings::default())
+            .expect("restore default settings");
     }
 
     #[tokio::test]

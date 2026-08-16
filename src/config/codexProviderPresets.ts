@@ -968,6 +968,38 @@ requires_openai_auth = true`,
     iconColor: "#1E88E5",
   },
   {
+    name: "Pi AI (Inflection)",
+    websiteUrl: "https://pi.ai",
+    apiKeyUrl: "https://aimlapi.com",
+    auth: generateThirdPartyAuth(""),
+    config: generateThirdPartyConfig(
+      "pi_inflection",
+      "https://api.aimlapi.com/v1",
+      "inflection/inflection-3-pi",
+    ),
+    endpointCandidates: ["https://api.aimlapi.com/v1"],
+    // Pi AI (Inflection) 没有直接官方 API，通过 AIML API 聚合器访问
+    // 使用 Chat Completions API，需要本地路由转换
+    apiFormat: "openai_chat",
+    modelCatalog: modelCatalog([
+      {
+        model: "inflection/inflection-3-pi",
+        displayName: "Inflection 3 Pi",
+        contextWindow: 128000,
+        inputModalities: ["text"],
+      },
+      {
+        model: "inflection/inflection-3-productivity",
+        displayName: "Inflection 3 Productivity",
+        contextWindow: 128000,
+        inputModalities: ["text"],
+      },
+    ]),
+    category: "third_party",
+    icon: "pi",
+    iconColor: "#FF6B6B",
+  },
+  {
     name: "Zhipu GLM",
     websiteUrl: "https://open.bigmodel.cn",
     apiKeyUrl: "https://www.bigmodel.cn/claude-code?ic=RRVJPB5SII",

@@ -399,6 +399,13 @@ mod tests {
                     );
                     assert!(provider.settings_config.get("baseUrl").is_none());
                 }
+                AppType::DeepSeek | AppType::Pi => {
+                    assert_eq!(
+                        provider.settings_config["baseUrl"],
+                        portable_fields().base_url
+                    );
+                    assert_eq!(provider.settings_config["apiKey"], "sk-secret");
+                }
             }
         }
     }
@@ -623,7 +630,7 @@ mod tests {
         )
         .expect("empty-key transfer");
 
-        assert_eq!(results.len(), 7);
+        assert_eq!(results.len(), 9);
         assert!(results
             .iter()
             .all(|result| result.status == super::ProviderTransferStatus::Created));

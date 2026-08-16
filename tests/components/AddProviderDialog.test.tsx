@@ -216,6 +216,24 @@ context_window = 500000
     expect(document.querySelectorAll("form")).toHaveLength(1);
   });
 
+  it.each(["deepseek", "pi"] as const)(
+    "%s 页面不显示不支持当前应用的统一供应商入口",
+    (appId) => {
+      render(
+        <AddProviderDialog
+          open
+          onOpenChange={vi.fn()}
+          appId={appId}
+          onSubmit={vi.fn()}
+        />,
+      );
+
+      expect(
+        screen.queryByRole("tab", { name: "provider.tabUniversal" }),
+      ).not.toBeInTheDocument();
+    },
+  );
+
   it("uses a unique form id for each open dialog", async () => {
     const firstSubmit = vi.fn().mockResolvedValue(undefined);
     const secondSubmit = vi.fn().mockResolvedValue(undefined);

@@ -4404,6 +4404,7 @@ impl ProviderService {
             AppType::OpenCode => Self::extract_opencode_common_config(&provider.settings_config),
             AppType::OpenClaw => Self::extract_openclaw_common_config(&provider.settings_config),
             AppType::Hermes => Ok(String::new()), // Hermes doesn't use common config snippets
+            AppType::DeepSeek | AppType::Pi => Ok(String::new()), // 暂不支持通用配置片段
         }
     }
 
@@ -4421,6 +4422,7 @@ impl ProviderService {
             AppType::OpenCode => Self::extract_opencode_common_config(settings_config),
             AppType::OpenClaw => Self::extract_openclaw_common_config(settings_config),
             AppType::Hermes => Ok(String::new()), // Hermes doesn't use common config snippets
+            AppType::DeepSeek | AppType::Pi => Ok(String::new()), // 暂不支持通用配置片段
         }
     }
 
@@ -5186,6 +5188,16 @@ impl ProviderService {
                     ));
                 }
             }
+            AppType::DeepSeek | AppType::Pi => {
+                // DeepSeek / Pi: 配置为 camelCase 平铺 JSON 对象（baseUrl / apiKey / model）
+                if !provider.settings_config.is_object() {
+                    return Err(AppError::localized(
+                        "provider.settings.not_object",
+                        "配置必须是 JSON 对象",
+                        "Configuration must be a JSON object",
+                    ));
+                }
+            }
         }
 
         // Validate and clean UsageScript configuration (common for all app types)
@@ -5390,8 +5402,8 @@ impl ProviderService {
 
                 Ok((api_key, base_url))
             }
-            AppType::OpenClaw | AppType::Hermes => {
-                // OpenClaw/Hermes use apiKey and baseUrl directly on the object
+            AppType::OpenClaw | AppType::Hermes | AppType::DeepSeek | AppType::Pi => {
+                // OpenClaw/Hermes/DeepSeek/Pi use apiKey and baseUrl directly on the object
                 let api_key = provider
                     .settings_config
                     .get("apiKey")

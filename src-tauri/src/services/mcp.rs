@@ -46,6 +46,12 @@ impl McpService {
         if prev_apps.hermes && !server.apps.hermes {
             Self::remove_server_from_app(state, &server.id, &AppType::Hermes)?;
         }
+        if prev_apps.deepseek && !server.apps.deepseek {
+            Self::remove_server_from_app(state, &server.id, &AppType::DeepSeek)?;
+        }
+        if prev_apps.pi && !server.apps.pi {
+            Self::remove_server_from_app(state, &server.id, &AppType::Pi)?;
+        }
 
         // 同步到各个启用的应用
         Self::sync_server_to_apps(state, &server)?;
@@ -145,6 +151,12 @@ impl McpService {
             AppType::Hermes => {
                 mcp::sync_single_server_to_hermes(&Default::default(), &server.id, &server.server)?;
             }
+            AppType::DeepSeek => {
+                mcp::sync_single_server_to_deepseek(&server.id, &server.server)?;
+            }
+            AppType::Pi => {
+                mcp::sync_single_server_to_pi(&server.id, &server.server)?;
+            }
         }
         Ok(())
     }
@@ -180,6 +192,12 @@ impl McpService {
             }
             AppType::Hermes => {
                 mcp::remove_server_from_hermes(id)?;
+            }
+            AppType::DeepSeek => {
+                mcp::remove_server_from_deepseek(id)?;
+            }
+            AppType::Pi => {
+                mcp::remove_server_from_pi(id)?;
             }
         }
         Ok(())
