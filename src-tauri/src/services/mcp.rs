@@ -16,7 +16,11 @@ impl McpService {
     }
 
     /// 添加或更新 MCP 服务器
-    pub fn upsert_server(state: &AppState, server: McpServer) -> Result<(), AppError> {
+    pub fn upsert_server(state: &AppState, mut server: McpServer) -> Result<(), AppError> {
+        // Keep legacy serialized fields compatible without persisting unsupported MCP targets.
+        server.apps.deepseek = false;
+        server.apps.pi = false;
+
         // 读取旧状态：用于处理“编辑时取消勾选某个应用”的场景（需要从对应 live 配置中移除）
         let prev_apps = state
             .db
@@ -46,13 +50,6 @@ impl McpService {
         if prev_apps.hermes && !server.apps.hermes {
             Self::remove_server_from_app(state, &server.id, &AppType::Hermes)?;
         }
-        if prev_apps.deepseek && !server.apps.deepseek {
-            Self::remove_server_from_app(state, &server.id, &AppType::DeepSeek)?;
-        }
-        if prev_apps.pi && !server.apps.pi {
-            Self::remove_server_from_app(state, &server.id, &AppType::Pi)?;
-        }
-
         // 同步到各个启用的应用
         Self::sync_server_to_apps(state, &server)?;
 
@@ -151,11 +148,11 @@ impl McpService {
             AppType::Hermes => {
                 mcp::sync_single_server_to_hermes(&Default::default(), &server.id, &server.server)?;
             }
-            AppType::DeepSeek => {
-                mcp::sync_single_server_to_deepseek(&server.id, &server.server)?;
-            }
-            AppType::Pi => {
-                mcp::sync_single_server_to_pi(&server.id, &server.server)?;
+            AppType::DeepSeek | AppType::Pi => {
+                log::debug!(
+                    "{} does not support CC Switch MCP sync, skipping",
+                    app.as_str()
+                );
             }
         }
         Ok(())
@@ -193,11 +190,11 @@ impl McpService {
             AppType::Hermes => {
                 mcp::remove_server_from_hermes(id)?;
             }
-            AppType::DeepSeek => {
-                mcp::remove_server_from_deepseek(id)?;
-            }
-            AppType::Pi => {
-                mcp::remove_server_from_pi(id)?;
+            AppType::DeepSeek | AppType::Pi => {
+                log::debug!(
+                    "{} does not support CC Switch MCP sync, skipping",
+                    app.as_str()
+                );
             }
         }
         Ok(())
@@ -243,7 +240,10 @@ impl McpService {
         servers: &IndexMap<String, McpServer>,
         app: &AppType,
     ) -> Result<(), AppError> {
-        if matches!(app, AppType::OpenClaw | AppType::ClaudeDesktop) {
+        if matches!(
+            app,
+            AppType::OpenClaw | AppType::ClaudeDesktop | AppType::DeepSeek | AppType::Pi
+        ) {
             return Ok(());
         }
 

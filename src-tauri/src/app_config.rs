@@ -37,8 +37,7 @@ impl McpApps {
             AppType::OpenClaw => false, // OpenClaw doesn't support MCP
             AppType::Hermes => self.hermes,
             AppType::ClaudeDesktop => false,
-            AppType::DeepSeek => self.deepseek,
-            AppType::Pi => self.pi,
+            AppType::DeepSeek | AppType::Pi => false,
         }
     }
 
@@ -53,8 +52,7 @@ impl McpApps {
             AppType::OpenClaw => {} // OpenClaw doesn't support MCP, ignore
             AppType::Hermes => self.hermes = enabled,
             AppType::ClaudeDesktop => {} // Claude Desktop 3P provider config doesn't support MCP here
-            AppType::DeepSeek => self.deepseek = enabled,
-            AppType::Pi => self.pi = enabled,
+            AppType::DeepSeek | AppType::Pi => {}
         }
     }
 
@@ -79,12 +77,6 @@ impl McpApps {
         if self.hermes {
             apps.push(AppType::Hermes);
         }
-        if self.deepseek {
-            apps.push(AppType::DeepSeek);
-        }
-        if self.pi {
-            apps.push(AppType::Pi);
-        }
         apps
     }
 
@@ -96,8 +88,6 @@ impl McpApps {
             && !self.grokbuild
             && !self.opencode
             && !self.hermes
-            && !self.deepseek
-            && !self.pi
     }
 }
 
@@ -1098,6 +1088,20 @@ mod tests {
         assert!(apps.is_enabled_for(&AppType::Pi));
         assert_eq!(apps.enabled_apps(), vec![AppType::DeepSeek, AppType::Pi]);
         assert!(!apps.is_empty());
+    }
+
+    #[test]
+    fn mcp_apps_ignore_legacy_deepseek_and_pi_flags() {
+        let apps = McpApps {
+            deepseek: true,
+            pi: true,
+            ..McpApps::default()
+        };
+
+        assert!(apps.is_empty());
+        assert!(!apps.is_enabled_for(&AppType::DeepSeek));
+        assert!(!apps.is_enabled_for(&AppType::Pi));
+        assert!(apps.enabled_apps().is_empty());
     }
 
     struct TempHome {

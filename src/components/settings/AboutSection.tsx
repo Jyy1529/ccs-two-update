@@ -67,6 +67,8 @@ const TOOL_NAMES = [
   "opencode",
   "openclaw",
   "hermes",
+  "dsh",
+  "pi",
 ] as const;
 type ToolName = (typeof TOOL_NAMES)[number];
 type ToolLifecycleAction = "install" | "update";
@@ -138,7 +140,11 @@ ${posixScriptInstallCommand("https://opencode.ai/install")} || npm i -g opencode
 # OpenClaw
 npm i -g openclaw@latest
 # Hermes
-${posixScriptInstallCommand("https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh")}`;
+${posixScriptInstallCommand("https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh")}
+# DeepSeek Harness
+npm i -g @deepseek-ai/dsh@latest
+# Pi
+npm i -g --ignore-scripts @earendil-works/pi-coding-agent@latest`;
 
 const WINDOWS_ONE_CLICK_INSTALL_COMMANDS = `# Claude Code
 npm i -g @anthropic-ai/claude-code@latest
@@ -153,7 +159,11 @@ npm i -g opencode-ai@latest
 # OpenClaw
 npm i -g openclaw@latest
 # Hermes
-${HERMES_WINDOWS_INSTALL_COMMAND}`;
+${HERMES_WINDOWS_INSTALL_COMMAND}
+# DeepSeek Harness
+npm i -g @deepseek-ai/dsh@latest
+# Pi
+npm i -g --ignore-scripts @earendil-works/pi-coding-agent@latest`;
 
 const ONE_CLICK_INSTALL_COMMANDS = isWindows()
   ? WINDOWS_ONE_CLICK_INSTALL_COMMANDS
@@ -167,6 +177,8 @@ const TOOL_DISPLAY_NAMES: Record<ToolName, string> = {
   opencode: "OpenCode",
   openclaw: "OpenClaw",
   hermes: "Hermes",
+  dsh: "DeepSeek Harness",
+  pi: "Pi",
 };
 
 // 后端返回的 tool 是 string；这里收敛唯一的 ToolName 断言与兜底，供升级确认
@@ -183,6 +195,8 @@ const TOOL_APP_IDS: Record<ToolName, AppId> = {
   opencode: "opencode",
   openclaw: "openclaw",
   hermes: "hermes",
+  dsh: "deepseek",
+  pi: "pi",
 };
 
 // 工具版本探测代价高：每个工具一次 `--version` 子进程 + 一次 npm/github/pypi 网络请求。
@@ -345,7 +359,7 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
       try {
         // 逐工具并发探测：每个工具一完成就合并进 toolVersions（并写模块缓存）、清掉自己
         // 的 loadingTools 标志，对应卡片随即独立刷新——而非等全部探测完才一次性显示（后端
-        // 原本对 6 个工具串行 await，总耗时累加；并发后压成「最慢的那一个」）。refreshTool-
+        // 原本对全部工具串行 await，总耗时累加；并发后压成「最慢的那一个」）。refreshTool-
         // Versions 已内建按 name 合并 + per-tool loading + try/catch 兜底（单工具失败返回 []
         // 不拖累其余），故 Promise.all 永不 reject。Respect current shell/flag overrides.
         await Promise.all(
@@ -392,7 +406,7 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
 
     // 本软件自身版本走本地调用（getVersion，无网络，毫秒级），与工具版本探测彼此独立。
     // 之前两者被塞进同一个 Promise.all，导致 setVersion / setIsLoadingVersion 被压在
-    // 「全部工具检查完成」之后——图标下方的版本徽标因此要干等 6 个工具全检完才显示。
+    // 「全部工具检查完成」之后——图标下方的版本徽标因此要干等所有工具全检完才显示。
     // 拆成两条独立链路：应用版本一拿到就立刻显示，工具探测各自渐进刷新，互不阻塞。
     const loadAppVersion = async () => {
       try {
@@ -534,7 +548,7 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
     }
   }, []);
 
-  // 顶部按钮：一次性诊断全部 6 个工具，有冲突的写入各自卡片，
+  // 顶部按钮：一次性诊断全部工具，有冲突的写入各自卡片，
   // 全部无冲突时给一条 info toast。后端逐工具枚举所有安装并判定分歧。
   const handleDiagnoseAll = useCallback(async () => {
     setIsDiagnosingAll(true);

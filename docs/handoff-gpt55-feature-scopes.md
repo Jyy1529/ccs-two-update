@@ -1,5 +1,8 @@
 # 交接说明书：Provider 功能范围设置 + DeepSeek/Pi 数据持久化（收尾）
 
+> [!WARNING]
+> 这是 3.19.3 开发期间的历史交接材料，不是当前 DeepSeek/Pi 配置契约。其中关于 `~/.deepseek/mcp.json`、`~/.pi/mcp.json` 和 Pi/DeepSeek MCP 支持的内容已由 3.19.4 撤销。当前行为以 [`deepseek-harness-preset.md`](./deepseek-harness-preset.md)、[`pi-harness-preset.md`](./pi-harness-preset.md) 和源码回归测试为准。
+
 > **执行者**：GPT-5.6
 > **审核者**：Claude（完成后做 code review 与问题修复）
 > **仓库**：`D:\AI_Projects\ccs-two-update`（Tauri 2 + React/TS + Rust，包管理 pnpm）

@@ -43,8 +43,8 @@ const APP_DIRECTORY_META: Record<
   opencode: { key: "opencode", defaultFolder: ".config/opencode" },
   openclaw: { key: "openclaw", defaultFolder: ".openclaw" },
   hermes: { key: "hermes", defaultFolder: ".hermes" },
-  deepseek: { key: "deepseek", defaultFolder: ".deepseek" },
-  pi: { key: "pi", defaultFolder: ".pi" },
+  deepseek: { key: "deepseek", defaultFolder: ".dsh" },
+  pi: { key: "pi", defaultFolder: ".pi/agent" },
 };
 
 const DIRECTORY_KEY_TO_SETTINGS_FIELD: Record<

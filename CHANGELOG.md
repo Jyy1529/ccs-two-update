@@ -5,6 +5,36 @@ All notable changes to CC Switch will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.19.4] - 2026-08-17
+
+This patch release corrects the DeepSeek Harness and Pi integrations introduced in 3.19.3. The application now follows each CLI's published package, directory, and configuration contracts instead of treating either tool as a Codex-compatible MCP target.
+
+### Added
+
+- Local environment detection, version lookup, installation, and upgrade support for DeepSeek Harness (`dsh` / `@deepseek-ai/dsh`) and Pi (`pi` / `@earendil-works/pi-coding-agent`).
+- Official DeepSeek Harness projection to `DSH_HOME` or `~/.dsh/settings.yaml` plus `.credentials.yaml`.
+- Official Pi projection to `PI_CODING_AGENT_DIR` or `~/.pi/agent/models.json` plus `settings.json`, preserving unrelated providers, settings, headers, and model metadata.
+- Focused frontend and Rust regression coverage for provider forms, directory settings, configuration round trips, damaged-file protection, empty-key preservation, and unsupported MCP targets.
+
+### Changed
+
+- Pi now uses the official `pi.dev` logo and product identity; it is not mapped to Inflection AI.
+- Pi installation and every npm/pnpm upgrade path retain the official `--ignore-scripts` option. Pi requires Node.js `>=22.19.0`.
+- DeepSeek/Pi Provider transfers continue processing independent targets when Pi cannot be created because no model was supplied.
+- Current documentation and the compatibility test entry point now describe and exercise the real CLI contracts.
+
+### Fixed
+
+- Removed the unsupported DeepSeek/Pi MCP UI targets and stopped creating the non-standard `~/.deepseek/mcp.json` and `~/.pi/mcp.json` files. Legacy database flags are normalized off; Skills support remains available.
+- Protected existing DeepSeek/Pi credentials when a form is saved with an empty key, and refused to overwrite malformed user configuration files.
+
+### Release notes
+
+- Windows x86_64 MSI, NSIS, and Portable ZIP assets are manual-install artifacts.
+- The installers have no Authenticode signature.
+- No Tauri updater artifact, `.sig`, or `latest.json` is generated; automatic in-app updates remain unavailable for this release.
+- Verify every downloaded asset against `SHA256SUMS.txt` on the GitHub Release.
+
 ## [3.19.3] - 2026-08-16
 
 This fork release carries the Provider feature-scope controls and the DeepSeek/Pi MCP and Skills persistence work from the handoff scope. It also hardens the newly exposed DeepSeek/Pi surfaces so their provider forms write the documented flat `baseUrl` / `apiKey` / `model` JSON shape, hides unsupported universal-provider entry points, and validates Codex role-routing listeners as strict loopback IP literals.

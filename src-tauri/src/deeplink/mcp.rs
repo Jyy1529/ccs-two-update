@@ -174,8 +174,9 @@ pub(crate) fn parse_mcp_apps(apps_str: &str) -> Result<McpApps, AppError> {
                 log::debug!("OpenClaw doesn't support MCP, ignoring in apps parameter");
             }
             "hermes" => apps.hermes = true,
-            "deepseek" => apps.deepseek = true,
-            "pi" => apps.pi = true,
+            "deepseek" | "pi" => {
+                log::debug!("{app} doesn't support MCP, ignoring in apps parameter");
+            }
             other => {
                 return Err(AppError::InvalidInput(format!(
                     "Invalid app in 'apps': {other}"
@@ -229,7 +230,7 @@ mod tests {
         assert!(merged.grokbuild);
         assert!(merged.opencode);
         assert!(merged.hermes);
-        assert!(merged.deepseek);
-        assert!(merged.pi);
+        assert!(!merged.deepseek);
+        assert!(!merged.pi);
     }
 }

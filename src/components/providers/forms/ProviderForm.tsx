@@ -140,15 +140,16 @@ import { useOpenClawLiveProviderIds } from "@/hooks/useOpenClaw";
 import { useHermesLiveProviderIds } from "@/hooks/useHermes";
 
 const DEEPSEEK_DEFAULT_CONFIG = `{
-  "baseUrl": "https://api.deepseek.com/v1",
+  "baseUrl": "https://api.deepseek.com",
   "apiKey": "",
-  "model": ""
+  "model": "deepseek-v4-flash"
 }`;
 
 const PI_DEFAULT_CONFIG = `{
   "baseUrl": "",
   "apiKey": "",
-  "model": ""
+  "model": "",
+  "api": "openai-completions"
 }`;
 
 type PresetEntry = {
@@ -792,9 +793,8 @@ function ProviderFormFull({
         preset,
       }));
     } else if (appId === "deepseek" || appId === "pi") {
-      // No native preset contract exists for these clients yet. Do not expose
-      // Claude presets, whose env/config shape cannot be written to their
-      // flat camelCase config.json files.
+      // The form/database keeps a compact compatibility shape. Rust projects
+      // it into each client's official multi-file configuration contract.
       return [];
     }
     return providerPresets
@@ -2724,15 +2724,16 @@ function ProviderFormFull({
 }`
                       : appId === "deepseek"
                         ? `{
-  "baseUrl": "https://api.deepseek.com/v1",
+  "baseUrl": "https://api.deepseek.com",
   "apiKey": "",
-  "model": ""
+  "model": "deepseek-v4-flash"
 }`
                         : appId === "pi"
                           ? `{
   "baseUrl": "https://api.example.com/v1",
   "apiKey": "",
-  "model": ""
+  "model": "my-model",
+  "api": "openai-completions"
 }`
                           : `{
   "baseUrl": "https://api.example.com/v1",

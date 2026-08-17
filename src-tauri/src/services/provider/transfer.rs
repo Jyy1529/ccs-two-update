@@ -602,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_api_key_imports_to_every_other_app_as_db_only() {
+    fn empty_api_key_imports_as_db_only_and_reports_pi_model_requirement() {
         let db = Arc::new(Database::memory().expect("in-memory database"));
         let state = AppState::new(db.clone());
         let source = Provider::with_id(
@@ -631,8 +631,19 @@ mod tests {
         .expect("empty-key transfer");
 
         assert_eq!(results.len(), 9);
+        let pi_result = results
+            .iter()
+            .find(|result| result.app_id == AppType::Pi.as_str())
+            .expect("Pi result");
+        assert_eq!(pi_result.status, super::ProviderTransferStatus::Failed);
+        assert!(pi_result
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("model"));
         assert!(results
             .iter()
+            .filter(|result| result.app_id != AppType::Pi.as_str())
             .all(|result| result.status == super::ProviderTransferStatus::Created));
     }
 

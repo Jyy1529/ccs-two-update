@@ -1,5 +1,8 @@
 # CCS 前端/后端代理路由修复与 Pi/DeepSeek Harness 支持方案
 
+> [!WARNING]
+> 本文是 3.19.3 开发前的历史探索方案，不是当前配置契约。3.19.4 已通过官方仓库和 npm 包重新核验：DeepSeek Harness 使用 `dsh`、`~/.dsh/settings.yaml` 和 `.credentials.yaml`；Pi 指 `pi.dev` coding agent，使用 `~/.pi/agent/models.json` 与 `settings.json`，并且官方明确 `No MCP`。本文后续的伪 HTTP API、单文件 JSON、Codex 角色路由桥接和配置导出示例均未作为产品功能发布，请勿照抄。当前行为以 [DeepSeek Harness 配置说明](./deepseek-harness-preset.md)、[Pi Coding Agent 配置说明](./pi-harness-preset.md) 和源码测试为准。
+
 ## 问题分析
 
 根据项目截图和代码分析，当前存在以下问题：

@@ -724,19 +724,19 @@ fn upsert_mcp_server_disabling_app_removes_from_claude_live_config() {
 }
 
 #[test]
-fn upsert_mcp_server_disabling_deepseek_and_pi_removes_live_files() {
+fn upsert_mcp_server_ignores_deepseek_and_pi_mcp_flags() {
     let _guard = test_mutex().lock().expect("acquire test mutex");
     reset_test_fs();
     let home = ensure_test_home();
     let state = support::create_test_state().expect("create test state");
 
-    let server = |deepseek: bool, pi: bool| McpServer {
+    let server = McpServer {
         id: "echo".to_string(),
         name: "echo".to_string(),
         server: json!({"type": "stdio", "command": "echo"}),
         apps: McpApps {
-            deepseek,
-            pi,
+            deepseek: true,
+            pi: true,
             ..Default::default()
         },
         description: None,
@@ -745,23 +745,23 @@ fn upsert_mcp_server_disabling_deepseek_and_pi_removes_live_files() {
         tags: Vec::new(),
     };
 
-    McpService::upsert_server(&state, server(true, true)).expect("sync to simple-json apps");
+    McpService::upsert_server(&state, server).expect("save MCP server");
     for directory in [".deepseek", ".pi"] {
         let path = home.join(directory).join("mcp.json");
-        let value: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).expect("read live mcp file"))
-                .expect("parse live mcp file");
-        assert!(value.pointer("/mcpServers/echo").is_some());
+        assert!(
+            !path.exists(),
+            "unsupported {directory} MCP target must not create a live file"
+        );
     }
 
-    McpService::upsert_server(&state, server(false, false)).expect("remove from simple-json apps");
-    for directory in [".deepseek", ".pi"] {
-        let path = home.join(directory).join("mcp.json");
-        let value: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).expect("read live mcp file"))
-                .expect("parse live mcp file");
-        assert!(value.pointer("/mcpServers/echo").is_none());
-    }
+    let saved = state
+        .db
+        .get_all_mcp_servers()
+        .expect("read saved MCP servers")
+        .shift_remove("echo")
+        .expect("saved server");
+    assert!(!saved.apps.deepseek);
+    assert!(!saved.apps.pi);
 }
 
 #[test]

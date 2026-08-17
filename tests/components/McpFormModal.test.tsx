@@ -454,26 +454,44 @@ type = "stdio"
     expect(toastErrorMock).not.toHaveBeenCalled();
   });
 
-  it("允许在弹窗中选择 DeepSeek 和 Pi", async () => {
-    renderForm({ defaultEnabledApps: [] });
+  it("不展示 DeepSeek 和 Pi，并清理遗留启用状态", async () => {
+    const initialData: McpServer = {
+      id: "legacy-apps",
+      name: "Legacy apps",
+      server: { type: "stdio", command: "run" },
+      apps: {
+        claude: false,
+        codex: false,
+        gemini: false,
+        grokbuild: false,
+        opencode: false,
+        openclaw: false,
+        hermes: false,
+        deepseek: true,
+        pi: true,
+      },
+    } as McpServer;
 
-    fireEvent.change(screen.getByPlaceholderText("mcp.form.titlePlaceholder"), {
-      target: { value: "new-apps" },
+    renderForm({
+      editingId: "legacy-apps",
+      initialData,
+      defaultEnabledApps: ["deepseek", "pi"],
     });
-    fireEvent.change(screen.getByPlaceholderText("mcp.form.jsonPlaceholder"), {
-      target: { value: '{"type":"stdio","command":"run"}' },
-    });
-    fireEvent.click(
-      screen.getByLabelText("mcp.unifiedPanel.apps.deepseek"),
-    );
-    fireEvent.click(screen.getByLabelText("mcp.unifiedPanel.apps.pi"));
-    fireEvent.click(screen.getByText("common.add"));
+
+    expect(
+      screen.queryByLabelText("mcp.unifiedPanel.apps.deepseek"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("mcp.unifiedPanel.apps.pi"),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("common.save"));
 
     await waitFor(() => expect(upsertMock).toHaveBeenCalledTimes(1));
     const [entry] = upsertMock.mock.calls.at(-1) ?? [];
     expect(entry.apps).toMatchObject({
-      deepseek: true,
-      pi: true,
+      deepseek: false,
+      pi: false,
     });
   });
 

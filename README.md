@@ -12,7 +12,7 @@
 | 上游项目 | [farion1231/cc-switch](https://github.com/farion1231/cc-switch) |
 | 归档版本 | CC Switch 3.18.0、3.19.0、3.19.2 |
 | 桌面框架 | Tauri 2 + React + TypeScript + Rust |
-| 当前推荐版本 | CC Switch 3.19.3（二次开发版） |
+| 当前推荐版本 | CC Switch 3.19.4（二次开发版） |
 | 主要平台 | Windows、macOS、Linux；Codex Desktop 自动修复面向 Windows |
 
 ## 二次开发目标
@@ -154,6 +154,14 @@
 - 高级配置折叠、全屏面板和代理设置交互。
 - 应用初始化、设置对话框和 Provider 表单集成。
 
+### 8. DeepSeek Harness 与 Pi Coding Agent
+
+- 本地环境检查支持官方 `dsh` / `@deepseek-ai/dsh` 和 `pi` / `@earendil-works/pi-coding-agent` CLI。
+- DeepSeek Harness 使用 `DSH_HOME` 或 `~/.dsh/settings.yaml`、`.credentials.yaml`。
+- Pi 指 [`pi.dev`](https://pi.dev) coding agent，使用官方图标以及 `PI_CODING_AGENT_DIR` 或 `~/.pi/agent/models.json`、`settings.json`；要求 Node.js `>=22.19.0`。
+- Pi 官方明确 `No MCP`，DeepSeek Harness 也没有旧版通用 `mcp.json` 契约，因此二者不显示 MCP 开关、不生成伪配置文件；Skills 同步仍受支持。
+- Provider 投影会保留无关设置和已有密钥，遇到损坏的用户配置时拒绝覆盖。
+
 主归档提交共涉及 `113` 个文件，新增约 `28,335` 行，删除约 `2,104` 行。
 
 ## 关键配置行为
@@ -172,13 +180,13 @@
 
 | 分支 | 内容 |
 | --- | --- |
-| `main` | 当前 3.19.3 二次开发版本，也是 GitHub 默认分支 |
+| `main` | 当前 3.19.4 二次开发版本，也是 GitHub 默认分支 |
 | `archive/v3.19-safe-2026-08-10` | 3.19.0 二次开发归档，用于版本追溯和升级比较 |
 | `archive/auto-review-2026-08-10` | 早期自动审查开发快照，保留用于追溯和差异比较 |
 
 ## 安装包和安装顺序
 
-仓库按开发演进顺序保存三个版本的 Windows 安装包。安装包只包含正式发布目录中的 NSIS 安装程序和 MSI 安装程序；debug 可执行文件、Rust 构建辅助程序和旧的 3.17.0 包不属于发布安装包。
+仓库按开发演进顺序记录 Windows 发布包。安装包只包含正式 Release 中的 NSIS、MSI 和便携包；debug 可执行文件、Rust 构建辅助程序和旧的 3.17.0 包不属于发布资产。
 
 | 顺序 | 版本 | 分支 | NSIS 安装程序 | MSI 安装程序 |
 | ---: | --- | --- | --- | --- |
@@ -186,10 +194,11 @@
 | 2 | 3.19.0 | `archive/v3.19-safe-2026-08-10` | `src-tauri/target/release/bundle/nsis/CC Switch_3.19.0_x64-setup.exe` | `src-tauri/target/release/bundle/msi/CC Switch_3.19.0_x64_en-US.msi` |
 | 3 | 3.19.2 | `main` | `src-tauri/target/release/bundle/nsis/CC Switch_3.19.2_x64-setup.exe` | `src-tauri/target/release/bundle/msi/CC Switch_3.19.2_x64_en-US.msi` |
 | 4 | 3.19.3 | `main` | GitHub Release asset `CC-Switch-v3.19.3-Windows-Setup.exe` | GitHub Release asset `CC-Switch-v3.19.3-Windows.msi` |
+| 5 | 3.19.4 | `main` | GitHub Release asset `CC-Switch-v3.19.4-Windows-Setup.exe` | GitHub Release asset `CC-Switch-v3.19.4-Windows.msi` |
 
-从旧版本逐级升级时，按 `3.18.0 -> 3.19.0 -> 3.19.2 -> 3.19.3` 安装。新设备直接安装 `3.19.3` 即可。NSIS 适合常规交互式安装，MSI 适合企业部署和脚本化安装；同一版本选择其中一种安装包即可。
+从旧版本逐级升级时，按 `3.18.0 -> 3.19.0 -> 3.19.2 -> 3.19.3 -> 3.19.4` 安装。新设备直接安装 `3.19.4` 即可。NSIS 适合常规交互式安装，MSI 适合企业部署和脚本化安装；同一版本选择其中一种安装包即可，便携包无需安装。
 
-`3.19.3` 是本仓库的 Windows 二次开发手动发布：安装器未进行 Authenticode 签名，未生成 Tauri updater `.sig` 或 `latest.json`，应用内自动更新通道暂不可用。请从本仓库的 [GitHub Release](https://github.com/Jyy1529/ccs-two-update/releases/tag/v3.19.3) 手动下载并核对发布说明中的 SHA-256。
+`3.19.4` 是本仓库的 Windows 二次开发手动发布：安装器未进行 Authenticode 签名，未生成 Tauri updater `.sig` 或 `latest.json`，应用内自动更新通道暂不可用。请从本仓库的 [GitHub Release](https://github.com/Jyy1529/ccs-two-update/releases/tag/v3.19.4) 手动下载并使用 `SHA256SUMS.txt` 核对文件完整性。
 
 ## 开发环境
 

@@ -1,277 +1,104 @@
-# DeepSeek Harness 配置预设
+# DeepSeek Harness 配置说明
 
-## 概述
+## 产品边界
 
-DeepSeek Harness 支持通过 CC Switch 进行 Codex 角色路由，适用于：
-- DeepSeek V3 官方 API
-- DeepSeek Chat Completions 格式
-- 需要本地路由转换的场景
+DeepSeek Harness 是 DeepSeek 官方 coding agent CLI，与 CC Switch 中给 Codex 创建的 DeepSeek API Provider 是两个不同的配置目标。
 
-## Provider 配置模板
+- 官方仓库：[`deepseek-ai/deepseek-harness`](https://github.com/deepseek-ai/deepseek-harness)
+- npm 包：[`@deepseek-ai/dsh`](https://www.npmjs.com/package/@deepseek-ai/dsh)
+- CLI：`dsh`
+- 官方站点：[`deepseek.com/harness`](https://deepseek.com/harness)
 
-### 1. DeepSeek 原生 Responses 直连（推荐）
-
-适用于 3.19.1+ 版本，无需本地路由。
-
-```json
-{
-  "id": "deepseek-v3",
-  "name": "DeepSeek V3",
-  "appType": "codex",
-  "baseUrl": "https://api.deepseek.com/v1",
-  "apiKey": "YOUR_DEEPSEEK_API_KEY",
-  "models": [
-    {
-      "id": "deepseek-chat",
-      "name": "DeepSeek V3",
-      "contextWindow": 64000,
-      "maxOutputTokens": 8000
-    },
-    {
-      "id": "deepseek-reasoner",
-      "name": "DeepSeek R1",
-      "contextWindow": 64000,
-      "maxOutputTokens": 8000
-    }
-  ],
-  "meta": {
-    "codexAgentRoleRouting": {
-      "enabled": false
-    }
-  }
-}
-```
-
-### 2. DeepSeek Chat Completions 格式（需本地路由）
-
-适用于需要 Chat Completions → Responses 转换的场景。
-
-```json
-{
-  "id": "deepseek-local-route",
-  "name": "DeepSeek (Local Route)",
-  "appType": "codex",
-  "baseUrl": "http://127.0.0.1:15777/deepseek/v1",
-  "apiKey": "YOUR_DEEPSEEK_API_KEY",
-  "models": [
-    {
-      "id": "deepseek-chat",
-      "name": "DeepSeek V3",
-      "contextWindow": 64000,
-      "maxOutputTokens": 8000
-    }
-  ],
-  "meta": {
-    "codexAgentRoleRouting": {
-      "enabled": false
-    }
-  }
-}
-```
-
-## Codex 角色路由配置
-
-### 启用前端/后端代理路由
-
-```json
-{
-  "id": "deepseek-with-roles",
-  "name": "DeepSeek (With Role Routing)",
-  "appType": "codex",
-  "baseUrl": "https://api.deepseek.com/v1",
-  "apiKey": "YOUR_DEEPSEEK_API_KEY",
-  "models": [
-    {
-      "id": "deepseek-chat",
-      "name": "DeepSeek V3",
-      "contextWindow": 64000,
-      "maxOutputTokens": 8000
-    }
-  ],
-  "meta": {
-    "codexAgentRoleRouting": {
-      "enabled": true,
-      "frontend": {
-        "providerId": "cc-switch-frontend-local",
-        "override": {
-          "model": "deepseek-chat",
-          "instructions": "You are the CC Switch frontend specialist. Focus on user-facing interface work."
-        }
-      },
-      "backend": {
-        "override": {
-          "model": "deepseek-reasoner",
-          "instructions": "You are the CC Switch backend specialist. Focus on services, APIs, and backend logic."
-        }
-      }
-    }
-  }
-}
-```
-
-## 前置条件
-
-1. **本地代理监听回环地址**
-   - 必须配置为 `127.0.0.1` 或 `::1`
-   - 不能使用 `0.0.0.0`（安全风险）
-
-2. **角色配置文件路径**
-   - Windows: `%USERPROFILE%\.codex\agents\`
-   - macOS/Linux: `~/.codex/agents/`
-
-3. **自动生成的文件**
-   - `cc-switch-frontend.toml` - 前端角色配置
-   - `cc-switch-backend.toml` - 后端角色配置
-
-## 使用流程
-
-### 1. 创建 Provider
-
-在 CC Switch 中添加 DeepSeek Provider，配置角色路由。
-
-### 2. 启用角色路由
-
-```javascript
-// 通过 API 启用
-await fetch('/api/providers/deepseek-with-roles/enable-role-routing', {
-  method: 'POST'
-});
-```
-
-### 3. 验证配置
-
-检查生成的 TOML 文件：
+安装命令：
 
 ```bash
-# Windows
-type %USERPROFILE%\.codex\agents\cc-switch-frontend.toml
-type %USERPROFILE%\.codex\agents\cc-switch-backend.toml
-
-# macOS/Linux
-cat ~/.codex/agents/cc-switch-frontend.toml
-cat ~/.codex/agents/cc-switch-backend.toml
+npm install -g @deepseek-ai/dsh
 ```
 
-## 路由令牌验证
+## 官方配置位置
 
-CC Switch 使用 HMAC-SHA256 验证路由请求：
+DeepSeek Harness 使用 `DSH_HOME` 作为配置目录覆盖变量。未设置时默认目录为：
 
-1. **生成令牌**
-   - 输入: `owner_provider_id` + `route` + `routing_version`
-   - 算法: HMAC-SHA256
-   - 编码: Base64 URL-safe
-
-2. **HTTP Headers**
-   ```
-   x-cc-switch-role-route: frontend
-   x-cc-switch-role-owner: deepseek-with-roles
-   x-cc-switch-role-token: <HMAC-SHA256-token>
-   ```
-
-3. **验证流程**
-   - Codex 代理接收请求
-   - 读取 headers 并验证令牌
-   - 令牌有效 → 路由到指定 Provider
-   - 令牌无效 → 拒绝请求
-
-## 故障排查
-
-### 问题 1: 配置文件未生成
-
-**症状**: `~/.codex/agents/` 目录为空
-
-**原因**:
-- 角色路由未启用
-- 父目录不存在
-- 权限不足
-
-**解决**:
-```bash
-# 检查目录
-ls -la ~/.codex/agents/
-
-# 手动创建目录
-mkdir -p ~/.codex/agents/
-
-# 检查权限
-chmod 700 ~/.codex/agents/
+```text
+~/.dsh
 ```
 
-### 问题 2: 监听地址验证失败
+CC Switch 管理的官方文件是：
 
-**症状**: 日志显示 "listen address is not loopback"
-
-**原因**: 本地代理监听在 `0.0.0.0`
-
-**解决**:
-```javascript
-// 修改代理配置
-await fetch('/api/proxy/config', {
-  method: 'PUT',
-  body: JSON.stringify({
-    listen_address: '127.0.0.1',  // 改为回环地址
-    listen_port: 15777
-  })
-});
+```text
+~/.dsh/settings.yaml
+~/.dsh/.credentials.yaml
 ```
 
-### 问题 3: 路由令牌验证失败
+旧实现中的 `~/.deepseek/config.json` 和 `~/.deepseek/mcp.json` 都不是 DeepSeek Harness 官方配置契约。
 
-**症状**: 请求被拒绝，日志显示 token verification failed
+## CC Switch Provider 配置
 
-**原因**:
-- 令牌过期
-- 配置版本不匹配
-- HMAC 密钥不同
-
-**解决**:
-1. 重启 CC Switch（刷新 HMAC 密钥）
-2. 重新生成配置文件
-3. 检查 Codex 配置是否同步
-
-## 性能优化
-
-### 1. 模型选择
-
-- **Frontend**: 使用 `deepseek-chat`（更快响应）
-- **Backend**: 使用 `deepseek-reasoner`（更强推理）
-
-### 2. 超时配置
+Provider 表单保存以下兼容配置，Rust 后端负责投影到官方 YAML：
 
 ```json
 {
-  "streaming_first_byte_timeout": 30,
-  "streaming_idle_timeout": 60,
-  "non_streaming_timeout": 120
+  "baseUrl": "https://api.deepseek.com",
+  "apiKey": "YOUR_DEEPSEEK_API_KEY",
+  "model": "deepseek-v4-flash"
 }
 ```
 
-### 3. 熔断保护
+默认值：
 
-```json
-{
-  "circuit_failure_threshold": 5,
-  "circuit_success_threshold": 2,
-  "circuit_timeout_seconds": 60
-}
+| 字段 | 默认值 |
+| --- | --- |
+| `baseUrl` | `https://api.deepseek.com` |
+| `model` | `deepseek-v4-flash` |
+| 凭据环境变量名 | `DEEPSEEK_API_KEY` |
+
+投影后的核心结构如下：
+
+```yaml
+llm-deepseek:
+  baseURL: https://api.deepseek.com
+  apiKeyEnv: DEEPSEEK_API_KEY
+  models:
+    - id: deepseek-v4-flash
+    - id: deepseek-v4-pro
+
+agent-default-model:
+  provider: deepseek-official
+  model: deepseek-v4-flash
 ```
 
-## 安全注意事项
+密钥单独写入：
 
-1. **API Key 保护**
-   - 不要硬编码在配置文件中
-   - 使用环境变量或密钥管理服务
+```yaml
+DEEPSEEK_API_KEY: YOUR_DEEPSEEK_API_KEY
+```
 
-2. **回环地址要求**
-   - 必须使用 `127.0.0.1` 或 `::1`
-   - 防止外部访问本地代理
+Unix 平台上的 `.credentials.yaml` 权限会收紧到 `0600`。表单中的 API Key 留空时，CC Switch 不会清除已有凭据。
 
-3. **令牌验证**
-   - 每个请求都会验证 HMAC 令牌
-   - 令牌包含路由配置的版本哈希
+已有 YAML 顶层设置、`llm-deepseek` 未知字段、模型元数据和其他凭据都会保留。损坏 YAML 会直接报错并保持原文件不变。
+
+## 与 Codex DeepSeek Provider 的区别
+
+本文件只描述 AppType `deepseek` 对 DeepSeek Harness CLI 的配置投影。
+
+若要配置 Codex 直连 DeepSeek Responses API，请使用 [Codex DeepSeek 路由指南](./guides/codex-deepseek-routing-guide-zh.md)。不要把 Codex 的 `config.toml`、角色路由或代理端口配置复制到 `settings.yaml`。
+
+## MCP 与 Skills
+
+DeepSeek Harness 有自己的插件能力，但旧版 CC Switch 使用的通用 `~/.deepseek/mcp.json` 没有官方依据。因此：
+
+- MCP 表单不展示 DeepSeek 开关。
+- 历史数据库中的 `deepseek: true` 会被归一化为 `false`。
+- CC Switch 不创建 `~/.deepseek/mcp.json`。
+- Skills 同步仍支持 DeepSeek，默认目录基于 `~/.dsh`。
+
+## 环境检查
+
+设置页的本地环境检查执行 `dsh --version`，并通过 npm 注册表查询 `@deepseek-ai/dsh` 最新版本。未安装时可直接使用设置页安装按钮或上面的官方命令。
 
 ## 参考链接
 
-- [DeepSeek 官方文档](https://platform.deepseek.com/docs)
-- [CC Switch 代理路由指南](./fix-and-enhancement-plan.md)
-- [Codex 配置参考](https://docs.codex.ai/configuration)
+- [DeepSeek Harness GitHub](https://github.com/deepseek-ai/deepseek-harness)
+- [DeepSeek Harness npm 包](https://www.npmjs.com/package/@deepseek-ai/dsh)
+- [DeepSeek Harness 官网](https://deepseek.com/harness)
+- [DeepSeek API Codex 集成](https://api-docs.deepseek.com/quick_start/agent_integrations/codex/)

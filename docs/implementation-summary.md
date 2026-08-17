@@ -132,159 +132,56 @@ async fn reconcile_current_codex_agent_roles_locked(
 - ✅ 拒绝非回环地址（0.0.0.0）
 - ✅ 验证失败时自动禁用角色路由
 
-### 阶段 2：DeepSeek Harness 支持 ✅
+### 阶段 2：DeepSeek Harness 支持 ✅（3.19.4 纠正）
+
+`DeepSeek Harness` 指官方 `dsh` coding agent，不等同于 Codex 的 DeepSeek Provider。
 
 **实施内容**:
-- 创建 DeepSeek Provider 预设模板文档
-- 包含原生 Responses 直连配置
-- 包含 Chat Completions 本地路由配置
-- 包含角色路由完整配置示例
+- 设置页检测、安装和升级 `dsh` / `@deepseek-ai/dsh`。
+- 使用 `DSH_HOME`，默认目录 `~/.dsh`。
+- 将 Provider 兼容配置投影到官方 `settings.yaml` 与 `.credentials.yaml`。
+- 默认端点 `https://api.deepseek.com`，默认模型 `deepseek-v4-flash`。
+- 保留未知 YAML 字段和其他凭据；空密钥不清除已有凭据。
+- 不再创建无官方依据的 `~/.deepseek/mcp.json`。
 
 **文档路径**:
 - `docs/deepseek-harness-preset.md`
+- Codex DeepSeek Provider 另见 `docs/guides/codex-deepseek-routing-guide-zh.md`。
 
-**关键配置模板**:
+### 阶段 3：Pi Coding Agent 支持 ✅（3.19.4 纠正）
 
-1. **原生 Responses 直连**（推荐）:
-```json
-{
-  "id": "deepseek-v3",
-  "name": "DeepSeek V3",
-  "appType": "codex",
-  "baseUrl": "https://api.deepseek.com/v1",
-  "apiKey": "YOUR_DEEPSEEK_API_KEY",
-  "models": [
-    {
-      "id": "deepseek-chat",
-      "name": "DeepSeek V3",
-      "contextWindow": 64000,
-      "maxOutputTokens": 8000
-    }
-  ]
-}
-```
-
-2. **带角色路由**:
-```json
-{
-  "meta": {
-    "codexAgentRoleRouting": {
-      "enabled": true,
-      "frontend": {
-        "providerId": "cc-switch-frontend-local",
-        "override": {
-          "model": "deepseek-chat",
-          "instructions": "You are the CC Switch frontend specialist..."
-        }
-      },
-      "backend": {
-        "override": {
-          "model": "deepseek-reasoner",
-          "instructions": "You are the CC Switch backend specialist..."
-        }
-      }
-    }
-  }
-}
-```
-
-**包含内容**:
-- ✅ 3 种配置模板
-- ✅ 前置条件说明
-- ✅ 使用流程
-- ✅ 路由令牌验证说明
-- ✅ 故障排查指南
-- ✅ 性能优化建议
-- ✅ 安全注意事项
-
-### 阶段 3：Pi Harness 支持 ✅
+本项目中的 Pi 指 `pi.dev` coding agent，不是 Inflection AI。
 
 **实施内容**:
-- 创建 Pi Provider 预设模板文档
-- 通过 OpenRouter 访问配置
-- 通过 AIML API 访问配置
-- 包含角色路由完整配置示例
+- 设置页检测、安装和升级 `pi` / `@earendil-works/pi-coding-agent`。
+- 官方安装命令保留 `--ignore-scripts`，要求 Node.js `>=22.19.0`。
+- 使用 `PI_CODING_AGENT_DIR`，默认目录 `~/.pi/agent`。
+- 将 Provider 兼容配置投影到官方 `models.json` 和 `settings.json`。
+- `baseUrl` 与 `model` 必填；空密钥不清除已有受管 Provider 密钥。
+- 保留其他 Provider、未知设置、请求头和模型元数据。
+- Pi 官方明确 `No MCP`，因此不展示 Pi MCP 开关，也不创建 `~/.pi/mcp.json`。
 
 **文档路径**:
 - `docs/pi-harness-preset.md`
 
-**关键配置模板**:
-
-1. **Pi via OpenRouter**（推荐）:
-```json
-{
-  "id": "pi-openrouter",
-  "name": "Pi AI (OpenRouter)",
-  "appType": "codex",
-  "baseUrl": "https://openrouter.ai/api/v1",
-  "apiKey": "YOUR_OPENROUTER_API_KEY",
-  "models": [
-    {
-      "id": "inflection/inflection-3-pi",
-      "name": "Inflection 3 Pi",
-      "contextWindow": 8000,
-      "maxOutputTokens": 1000
-    }
-  ]
-}
-```
-
-2. **带角色路由**:
-```json
-{
-  "meta": {
-    "codexAgentRoleRouting": {
-      "enabled": true,
-      "frontend": {
-        "providerId": "cc-switch-frontend-local",
-        "override": {
-          "model": "inflection/inflection-3-pi",
-          "instructions": "Focus on user-facing interface work..."
-        }
-      },
-      "backend": {
-        "override": {
-          "model": "inflection/inflection-3-productivity",
-          "instructions": "Focus on services, APIs, and backend logic..."
-        }
-      }
-    }
-  }
-}
-```
-
-**包含内容**:
-- ✅ 2 种访问方式（OpenRouter、AIML API）
-- ✅ 2 种模型（Pi、Productivity）
-- ✅ 完整的角色路由配置
-- ✅ 使用流程和验证步骤
-- ✅ 故障排查指南
-- ✅ 成本估算
-- ✅ 与 DeepSeek 的对比分析
-
 ### 阶段 4：测试工具 ✅
 
 **实施内容**:
-- 创建集成测试脚本
-- 自动化测试所有关键功能
+- 将旧的模拟 HTTP API 脚本改为调用仓库真实的 Rust/Vitest 回归测试。
+- 覆盖 DeepSeek/Pi Provider 表单、环境检查、官方配置投影和 MCP 边界。
 
 **测试脚本**:
 - `scripts/test-role-routing.sh`
 
 **测试覆盖**:
-1. ✅ 服务状态检查
-2. ✅ 代理配置验证（回环地址）
-3. ✅ DeepSeek Provider 创建
-4. ✅ Pi Provider 创建
-5. ✅ 角色配置文件生成验证
-6. ✅ 测试数据清理
+1. ✅ DeepSeek `settings.yaml` / `.credentials.yaml` 投影与回读
+2. ✅ Pi `models.json` / `settings.json` 投影与回读
+3. ✅ `dsh` / `pi` 环境检查与官方 Pi 图标
+4. ✅ Provider 表单默认值和目录设置
+5. ✅ DeepSeek/Pi 不参与 CC Switch MCP 投影
 
 **使用方法**:
 ```bash
-# 给脚本添加执行权限
-chmod +x scripts/test-role-routing.sh
-
-# 运行测试
 ./scripts/test-role-routing.sh
 ```
 
@@ -300,15 +197,15 @@ chmod +x scripts/test-role-routing.sh
 
 | 文档 | 字数 | 用途 |
 |------|------|------|
-| `deepseek-harness-preset.md` | ~3500 | DeepSeek 配置指南 |
-| `pi-harness-preset.md` | ~4000 | Pi AI 配置指南 |
+| `deepseek-harness-preset.md` | - | DeepSeek Harness 官方配置指南 |
+| `pi-harness-preset.md` | - | pi.dev coding agent 官方配置指南 |
 | `implementation-summary.md` | ~1500 | 实施总结 |
 
 ### 测试脚本
 
 | 脚本 | 行数 | 功能 |
 |------|------|------|
-| `test-role-routing.sh` | ~300 | 自动化集成测试 |
+| `test-role-routing.sh` | - | DeepSeek/Pi 聚焦回归入口 |
 
 ## 安全改进
 

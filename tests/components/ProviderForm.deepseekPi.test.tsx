@@ -117,21 +117,34 @@ beforeEach(() => {
 
 describe("DeepSeek/Pi provider form", () => {
   it.each([
-    ["deepseek", "https://api.deepseek.com/v1"],
-    ["pi", ""],
+    [
+      "deepseek",
+      {
+        baseUrl: "https://api.deepseek.com",
+        apiKey: "",
+        model: "deepseek-v4-flash",
+      },
+    ],
+    [
+      "pi",
+      {
+        baseUrl: "",
+        apiKey: "",
+        model: "",
+        api: "openai-completions",
+      },
+    ],
   ] as const)(
-    "uses a flat %s config instead of Claude env/config",
-    async (appId, baseUrl) => {
+    "uses the %s compatibility config instead of Claude env/config",
+    async (appId, expectedConfig) => {
       renderProviderForm(appId);
 
       const editor = await screen.findByRole("textbox", {
         name: "settings-json",
       });
-      expect(JSON.parse((editor as HTMLTextAreaElement).value)).toEqual({
-        baseUrl,
-        apiKey: "",
-        model: "",
-      });
+      expect(JSON.parse((editor as HTMLTextAreaElement).value)).toEqual(
+        expectedConfig,
+      );
       expect(screen.queryByTestId("preset-selector")).not.toBeInTheDocument();
       expect(screen.queryByTestId("common-config")).not.toBeInTheDocument();
     },

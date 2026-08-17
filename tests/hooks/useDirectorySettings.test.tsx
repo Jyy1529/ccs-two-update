@@ -199,6 +199,8 @@ describe("useDirectorySettings", () => {
         settings: createSettings({
           claudeConfigDir: "/custom/claude",
           codexConfigDir: "/custom/codex",
+          deepseekConfigDir: "/custom/deepseek",
+          piConfigDir: "/custom/pi",
         }),
         onUpdateSettings,
       }),
@@ -208,6 +210,8 @@ describe("useDirectorySettings", () => {
     await act(async () => {
       await result.current.resetDirectory("claude");
       await result.current.resetDirectory("codex");
+      await result.current.resetDirectory("deepseek");
+      await result.current.resetDirectory("pi");
       await result.current.resetAppConfigDir();
     });
 
@@ -217,8 +221,16 @@ describe("useDirectorySettings", () => {
     expect(onUpdateSettings).toHaveBeenCalledWith({
       codexConfigDir: undefined,
     });
+    expect(onUpdateSettings).toHaveBeenCalledWith({
+      deepseekConfigDir: undefined,
+    });
+    expect(onUpdateSettings).toHaveBeenCalledWith({
+      piConfigDir: undefined,
+    });
     expect(result.current.resolvedDirs.claude).toBe("/home/mock/.claude");
     expect(result.current.resolvedDirs.codex).toBe("/home/mock/.codex");
+    expect(result.current.resolvedDirs.deepseek).toBe("/home/mock/.dsh");
+    expect(result.current.resolvedDirs.pi).toBe("/home/mock/.pi/agent");
     expect(result.current.resolvedDirs.appConfig).toBe("/home/mock/.cc-switch");
   });
 

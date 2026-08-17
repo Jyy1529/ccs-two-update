@@ -136,8 +136,7 @@ pub async fn get_config_status(
             Ok(ConfigStatus { exists, path })
         }
         AppType::DeepSeek => {
-            let config_path = crate::deepseek_config::get_deepseek_config_path();
-            let exists = config_path.exists();
+            let exists = crate::deepseek_config::config_exists();
             let path = crate::deepseek_config::get_deepseek_dir()
                 .to_string_lossy()
                 .to_string();
@@ -145,8 +144,7 @@ pub async fn get_config_status(
             Ok(ConfigStatus { exists, path })
         }
         AppType::Pi => {
-            let config_path = crate::pi_config::get_pi_config_path();
-            let exists = config_path.exists();
+            let exists = crate::pi_config::config_exists();
             let path = crate::pi_config::get_pi_dir().to_string_lossy().to_string();
 
             Ok(ConfigStatus { exists, path })

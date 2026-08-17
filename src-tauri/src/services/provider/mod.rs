@@ -5188,15 +5188,11 @@ impl ProviderService {
                     ));
                 }
             }
-            AppType::DeepSeek | AppType::Pi => {
-                // DeepSeek / Pi: 配置为 camelCase 平铺 JSON 对象（baseUrl / apiKey / model）
-                if !provider.settings_config.is_object() {
-                    return Err(AppError::localized(
-                        "provider.settings.not_object",
-                        "配置必须是 JSON 对象",
-                        "Configuration must be a JSON object",
-                    ));
-                }
+            AppType::DeepSeek => {
+                crate::deepseek_config::validate_provider_settings(&provider.settings_config)?;
+            }
+            AppType::Pi => {
+                crate::pi_config::validate_provider_settings(&provider.settings_config)?;
             }
         }
 

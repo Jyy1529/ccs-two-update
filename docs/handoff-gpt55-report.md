@@ -1,5 +1,8 @@
 # GPT-5.5 Provider 功能范围与 3.19.3 发布前执行报告
 
+> [!WARNING]
+> 这是 v3.19.3 发布前的历史执行记录。v3.19.3 后续已经发布，其中记录的 DeepSeek/Pi 独立 `mcp.json` 方案已在 v3.19.4 按官方 CLI 契约纠正；不要将本文的待发布状态或旧 MCP 说明视为当前状态。
+
 - 执行日期：2026-08-16（Asia/Shanghai）
 - 仓库：`D:\AI_Projects\ccs-two-update`
 - 分支：`main`

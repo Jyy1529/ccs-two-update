@@ -76,8 +76,8 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
       return {
         ...initialData.apps,
         grokbuild: initialData.apps.grokbuild ?? false,
-        deepseek: initialData.apps.deepseek ?? false,
-        pi: initialData.apps.pi ?? false,
+        deepseek: false,
+        pi: false,
       };
     }
     return {
@@ -88,8 +88,8 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
       opencode: defaultEnabledApps.includes("opencode"),
       openclaw: defaultEnabledApps.includes("openclaw"),
       hermes: defaultEnabledApps.includes("hermes"),
-      deepseek: defaultEnabledApps.includes("deepseek"),
-      pi: defaultEnabledApps.includes("pi"),
+      deepseek: false,
+      pi: false,
     };
   });
 
@@ -377,7 +377,12 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
         id: trimmedId,
         name: finalName,
         server: serverSpec,
-        apps: enabledApps,
+        apps: {
+          ...enabledApps,
+          // DeepSeek and Pi do not expose a CC Switch MCP projection.
+          deepseek: false,
+          pi: false,
+        },
       };
 
       const descriptionTrimmed = formDescription.trim();
@@ -629,38 +634,6 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
                     className="text-sm text-foreground cursor-pointer select-none"
                   >
                     {t("mcp.unifiedPanel.apps.hermes")}
-                  </label>
-                </div>
-
-                <div className="flex items-center gap-2">
-                  <Checkbox
-                    id="enable-deepseek"
-                    checked={enabledApps.deepseek}
-                    onCheckedChange={(checked: boolean) =>
-                      setEnabledApps({ ...enabledApps, deepseek: checked })
-                    }
-                  />
-                  <label
-                    htmlFor="enable-deepseek"
-                    className="text-sm text-foreground cursor-pointer select-none"
-                  >
-                    {t("mcp.unifiedPanel.apps.deepseek")}
-                  </label>
-                </div>
-
-                <div className="flex items-center gap-2">
-                  <Checkbox
-                    id="enable-pi"
-                    checked={enabledApps.pi}
-                    onCheckedChange={(checked: boolean) =>
-                      setEnabledApps({ ...enabledApps, pi: checked })
-                    }
-                  />
-                  <label
-                    htmlFor="enable-pi"
-                    className="text-sm text-foreground cursor-pointer select-none"
-                  >
-                    {t("mcp.unifiedPanel.apps.pi")}
                   </label>
                 </div>
               </div>

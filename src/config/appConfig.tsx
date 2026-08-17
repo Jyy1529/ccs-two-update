@@ -40,8 +40,15 @@ export const SKILLS_APP_IDS: AppId[] = [
   "pi",
 ];
 
-/** App IDs shown in MCP panels (excludes OpenClaw) */
-export const MCP_APP_IDS: AppId[] = [...SKILLS_APP_IDS];
+/** App IDs with a supported MCP projection in CC Switch. */
+export const MCP_APP_IDS: AppId[] = [
+  "claude",
+  "codex",
+  "gemini",
+  "grokbuild",
+  "opencode",
+  "hermes",
+];
 
 export const APP_ICON_MAP: Record<AppId, AppConfig> = {
   claude: {
