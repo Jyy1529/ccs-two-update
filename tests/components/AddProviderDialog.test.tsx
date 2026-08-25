@@ -41,10 +41,14 @@ vi.mock("@/components/providers/forms/ProviderForm", () => ({
     onSubmit,
     onSubmitReadyChange,
     onManageAuthAccounts,
+    formId,
+    onRequestAddProvider,
   }: {
     onSubmit: (values: ProviderFormValues) => void;
     onSubmitReadyChange?: (isReady: boolean) => void;
     onManageAuthAccounts?: (target: "codex_oauth") => void;
+    formId?: string;
+    onRequestAddProvider?: (onCreated: (providerId: string) => void) => void;
   }) => {
     useEffect(() => {
       if (onSubmitReadyChange) {
@@ -54,7 +58,7 @@ vi.mock("@/components/providers/forms/ProviderForm", () => ({
     }, [onSubmitReadyChange]);
     return (
       <form
-        id="provider-form"
+        id={formId ?? "provider-form"}
         onSubmit={(event) => {
           event.preventDefault();
           onSubmit(mockFormValues);
@@ -66,6 +70,14 @@ vi.mock("@/components/providers/forms/ProviderForm", () => ({
         >
           manage-auth
         </button>
+        {onRequestAddProvider && (
+          <button
+            type="button"
+            onClick={() => onRequestAddProvider(() => undefined)}
+          >
+            request-role-provider
+          </button>
+        )}
       </form>
     );
   },
@@ -347,5 +359,88 @@ context_window = 500000
 
     act(() => staleCallback?.(true));
     expect(reopenedButton).toBeDisabled();
+  });
+
+  it("把角色路由的新增 Provider 请求传给内部表单", () => {
+    const onRequestAddProvider = vi.fn();
+    render(
+      <AddProviderDialog
+        open
+        onOpenChange={vi.fn()}
+        appId="codex"
+        onSubmit={vi.fn()}
+        onRequestAddProvider={onRequestAddProvider}
+      />,
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "request-role-provider" }),
+    );
+    expect(onRequestAddProvider).toHaveBeenCalledTimes(1);
+  });
+
+  it("角色 Provider 新增模式只显示 Codex 专属表单", () => {
+    render(
+      <AddProviderDialog
+        open
+        onOpenChange={vi.fn()}
+        appId="codex"
+        onSubmit={vi.fn()}
+        appSpecificOnly
+      />,
+    );
+
+    expect(
+      screen.queryByRole("tab", { name: "provider.tabUniversal" }),
+    ).not.toBeInTheDocument();
+    expect(document.querySelectorAll("form")).toHaveLength(1);
+  });
+
+  it.each(["deepseek", "pi"] as const)(
+    "%s 页面不显示不支持当前应用的统一供应商入口",
+    (appId) => {
+      render(
+        <AddProviderDialog
+          open
+          onOpenChange={vi.fn()}
+          appId={appId}
+          onSubmit={vi.fn()}
+        />,
+      );
+
+      expect(
+        screen.queryByRole("tab", { name: "provider.tabUniversal" }),
+      ).not.toBeInTheDocument();
+    },
+  );
+
+  it("uses a unique form id for each open dialog", async () => {
+    const firstSubmit = vi.fn().mockResolvedValue(undefined);
+    const secondSubmit = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <>
+        <AddProviderDialog
+          open
+          onOpenChange={vi.fn()}
+          appId="codex"
+          onSubmit={firstSubmit}
+        />
+        <AddProviderDialog
+          open
+          onOpenChange={vi.fn()}
+          appId="codex"
+          onSubmit={secondSubmit}
+        />
+      </>,
+    );
+
+    const forms = Array.from(document.querySelectorAll("form"));
+    expect(forms).toHaveLength(2);
+    expect(forms[0]?.id).not.toBe(forms[1]?.id);
+
+    fireEvent.click(screen.getAllByRole("button", { name: "common.add" })[1]);
+    await waitFor(() => expect(secondSubmit).toHaveBeenCalledTimes(1));
+    expect(firstSubmit).not.toHaveBeenCalled();
   });
 });

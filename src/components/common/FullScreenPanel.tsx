@@ -20,6 +20,7 @@ interface FullScreenPanelProps {
   footer?: React.ReactNode;
   /** Entry/exit motion. Nested navigation panels can opt into a horizontal transition. */
   motionPreset?: "fade" | "slide-from-right";
+  escapeEnabled?: boolean;
   /**
    * 覆盖内容区滚动容器的内边距/间距类。默认 `px-6 py-6 space-y-6`。
    * 通过 `cn`(twMerge) 合并，传入如 `pt-3` 只覆盖顶部内边距，其余保持默认。
@@ -60,6 +61,7 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
   onClose,
   children,
   footer,
+  escapeEnabled = true,
   contentClassName,
   motionPreset = "fade",
 }) => {
@@ -82,7 +84,7 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
   }, [onClose]);
 
   React.useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen || !escapeEnabled) return;
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
@@ -105,7 +107,7 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
     return () => {
       window.removeEventListener("keydown", handleKeyDown, false);
     };
-  }, [isOpen]);
+  }, [escapeEnabled, isOpen]);
 
   return createPortal(
     <AnimatePresence>

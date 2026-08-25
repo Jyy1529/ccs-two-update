@@ -111,8 +111,8 @@ pub struct ToolVersion {
     wsl_distro: Option<String>,
 }
 
-const VALID_TOOLS: [&str; 8] = [
-    "claude", "codex", "gemini", "grok", "opencode", "openclaw", "hermes", "pi",
+const VALID_TOOLS: [&str; 9] = [
+    "claude", "codex", "gemini", "grok", "opencode", "openclaw", "hermes", "dsh", "pi",
 ];
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -433,6 +433,7 @@ fn tool_display_name(tool: &str) -> &'static str {
         "opencode" => "OpenCode",
         "openclaw" => "OpenClaw",
         "hermes" => "Hermes",
+        "dsh" => "DeepSeek Harness",
         "pi" => "Pi",
         _ => "Unknown",
     }
@@ -514,7 +515,8 @@ fn npm_install_command_for(tool: &str) -> Option<&'static str> {
         "grok" => Some("npm i -g @xai-official/grok@latest"),
         "opencode" => Some("npm i -g opencode-ai@latest"),
         "openclaw" => Some("npm i -g openclaw@latest"),
-        "pi" => Some("npm i -g @earendil-works/pi-coding-agent@latest"),
+        "dsh" => Some("npm i -g @deepseek-ai/dsh@latest"),
+        "pi" => Some("npm i -g --ignore-scripts @earendil-works/pi-coding-agent@latest"),
         _ => None,
     }
 }
@@ -822,6 +824,7 @@ async fn get_single_tool_version_impl(
         }
         "openclaw" => fetch_npm_latest_for_tool(&client, "openclaw", tool, local).await,
         "hermes" => fetch_pypi_latest_version(&client, "hermes-agent").await,
+        "dsh" => fetch_npm_latest_for_tool(&client, "@deepseek-ai/dsh", tool, local).await,
         "pi" => {
             fetch_npm_latest_for_tool(&client, "@earendil-works/pi-coding-agent", tool, local).await
         }
@@ -2455,8 +2458,17 @@ fn npm_package_for(tool: &str) -> Option<&'static str> {
         "grok" => Some("@xai-official/grok"),
         "opencode" => Some("opencode-ai"),
         "openclaw" => Some("openclaw"),
+        "dsh" => Some("@deepseek-ai/dsh"),
         "pi" => Some("@earendil-works/pi-coding-agent"),
         _ => None,
+    }
+}
+
+fn npm_install_args_for(tool: &str, package: &str) -> String {
+    if tool == "pi" {
+        format!("i -g --ignore-scripts {package}@latest")
+    } else {
+        format!("i -g {package}@latest")
     }
 }
 
@@ -2829,7 +2841,7 @@ fn package_manager_anchored_command_from_paths(
         // self-update，上层会直接锚到 CLI 自身；否则返回 None 走静态兜底。
         _ => return None,
     }
-    anchored_npm_command(bin_path, &format!("i -g {pkg}@latest"))
+    anchored_npm_command(bin_path, &npm_install_args_for(tool, pkg))
 }
 
 /// 给定工具、原始 bin 路径（命令行命中的入口）、canonicalize 后的真身路径，
@@ -2906,9 +2918,14 @@ fn package_manager_anchored_command_from_paths(tool: &str, bin_path: &str) -> Op
         }
         "pnpm" => {
             let pnpm = sibling_bin_with_ext(bin_path, "pnpm", &["cmd", "exe"])?;
+            let ignore_scripts = if tool == "pi" {
+                " --ignore-scripts"
+            } else {
+                ""
+            };
             Some(format!(
-                "{} add -g {pkg}@latest",
-                win_quote_path_for_batch(&pnpm)
+                "{} add -g{ignore_scripts} {pkg}@latest",
+                win_quote_path_for_batch(&pnpm),
             ))
         }
         // 兜底 = npm 类:Scoop / Chocolatey / winget / nvm-windows / MS Store nodejs /
@@ -2916,8 +2933,9 @@ fn package_manager_anchored_command_from_paths(tool: &str, bin_path: &str) -> Op
         _ => {
             let npm = sibling_bin_with_ext(bin_path, "npm", &["cmd", "exe"])?;
             Some(format!(
-                "{} i -g {pkg}@latest",
-                win_quote_path_for_batch(&npm)
+                "{} {}",
+                win_quote_path_for_batch(&npm),
+                npm_install_args_for(tool, pkg),
             ))
         }
     }
@@ -3650,6 +3668,7 @@ fn wsl_distro_for_tool(tool: &str) -> Option<String> {
         "opencode" => crate::settings::get_opencode_override_dir(),
         "openclaw" => crate::settings::get_openclaw_override_dir(),
         "hermes" => crate::settings::get_hermes_override_dir(),
+        "dsh" => crate::settings::get_deepseek_override_dir(),
         "pi" => crate::settings::get_pi_override_dir(),
         _ => None,
     }?;
@@ -4852,9 +4871,21 @@ mod tests {
     }
 
     #[test]
-    fn pi_lifecycle_metadata_matches_pinned_distribution() {
-        let requested = vec!["unsupported".to_string(), "pi".to_string()];
-        assert_eq!(normalize_requested_tools(&requested), vec!["pi"]);
+    fn deepseek_and_pi_lifecycle_metadata_is_consistent() {
+        let requested = vec![
+            "unsupported".to_string(),
+            "pi".to_string(),
+            "dsh".to_string(),
+        ];
+        assert_eq!(normalize_requested_tools(&requested), vec!["dsh", "pi"]);
+
+        assert_eq!(tool_display_name("dsh"), "DeepSeek Harness");
+        assert_eq!(npm_package_for("dsh"), Some("@deepseek-ai/dsh"));
+        assert_eq!(
+            npm_install_command_for("dsh"),
+            Some("npm i -g @deepseek-ai/dsh@latest")
+        );
+
         assert_eq!(tool_display_name("pi"), "Pi");
         assert_eq!(
             npm_package_for("pi"),
@@ -4862,11 +4893,17 @@ mod tests {
         );
         assert_eq!(
             npm_install_command_for("pi"),
-            Some("npm i -g @earendil-works/pi-coding-agent@latest")
+            Some("npm i -g --ignore-scripts @earendil-works/pi-coding-agent@latest")
         );
-        // The verified distribution exposes `pi --version`, but no updater
-        // contract is assumed; upgrades stay on the package-manager path.
         assert_eq!(official_update_args("pi"), None);
+        assert_eq!(
+            npm_install_args_for("pi", "@earendil-works/pi-coding-agent"),
+            "i -g --ignore-scripts @earendil-works/pi-coding-agent@latest"
+        );
+        assert_eq!(
+            npm_install_args_for("dsh", "@deepseek-ai/dsh"),
+            "i -g @deepseek-ai/dsh@latest"
+        );
     }
 
     #[test]
@@ -5563,7 +5600,7 @@ mod tests {
 
         #[test]
         fn windows_scoop_still_identified() {
-            // Scoop 已有 `/scoop/` 分支;我们的 6 个工具都不是 scoop formula,所以这条
+            // Scoop 已有 `/scoop/` 分支;当前这些 CLI 都不是 scoop formula,所以这条
             // 实际不影响锚定决策(锚定层会用 sibling npm.cmd),但归类保留方便未来。
             assert_eq!(
                 infer_install_source(Path::new("C:\\Users\\me\\scoop\\shims\\codex.cmd")),

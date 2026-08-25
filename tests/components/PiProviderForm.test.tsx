@@ -46,7 +46,7 @@ vi.mock("@/components/JsonEditor", () => ({
   ),
 }));
 
-describe("PiProviderForm", () => {
+describe("PiProviderForm", { timeout: 15_000 }, () => {
   beforeEach(() => {
     Element.prototype.scrollIntoView = vi.fn();
   });

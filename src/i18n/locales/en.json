@@ -179,6 +179,21 @@
     },
     "duplicateLiveIdsLoadFailed": "Failed to read provider identifiers from config, please fix the config and try again"
   },
+  "providerTransfer": {
+    "action": "Import to other Agents",
+    "title": "Import to other Agents",
+    "description": "Choose the Agents that should receive this provider",
+    "name": "Provider Name",
+    "notes": "Notes",
+    "website": "Website URL",
+    "endpoint": "API Endpoint",
+    "targets": "Target Agents",
+    "import": "Import",
+    "success": "Provider imported",
+    "partialSuccess": "Provider imported to some Agents",
+    "failed": "Provider import failed",
+    "skipped": "Skipped"
+  },
   "claudeCode": {
     "needsRouting": "Needs Routing",
     "noRoutingSupport": "No Routing Support"
@@ -344,6 +359,23 @@
     "tabAuth": "Auth",
     "tabAdvanced": "Advanced",
     "tabProxy": "Routing",
+    "featureScopes": {
+      "title": "Provider Feature Scope",
+      "description": "Control which features are enabled and which apps they apply to. Unselected apps do not show the related settings or use the feature.",
+      "codexOnlyHint": "Currently supported by Codex only",
+      "localProxyRetry": {
+        "title": "Local Proxy Automatic Retry",
+        "description": "Automatically retry failed local proxy requests according to the Provider retry policy."
+      },
+      "agentRoleRouting": {
+        "title": "Frontend/Backend Subagent Model Routing",
+        "description": "Frontend roles can use a dedicated Codex Provider, while backend roles follow the current Provider."
+      },
+      "autoReviewRouting": {
+        "title": "Approval Model Routing",
+        "description": "Control whether Codex approval requests use the native, automatic, or fallback model."
+      }
+    },
     "authCenter": {
       "title": "OAuth Authentication Center",
       "description": "Use your other subscriptions in Claude Code — please be mindful of compliance risks.",
@@ -364,6 +396,8 @@
         "enableFeatureDescription": "When enabled, the routing and failover toggles will appear at the top of the main page",
         "enableFailoverToggle": "Show Failover Toggle on Main Page",
         "enableFailoverToggleDescription": "When enabled, the failover toggle will appear independently at the top of the main page",
+        "providerRetryEnabled": "Enable Provider automatic retry",
+        "providerRetryEnabledDescription": "Globally pause or resume Provider automatic retries. Retry counts, intervals, and triggers remain saved while disabled.",
         "running": "Running",
         "stopped": "Stopped"
       },
@@ -498,6 +532,12 @@
       "deleteFailed": "Delete failed",
       "deleteConfirmTitle": "Confirm Delete",
       "deleteConfirmMessage": "This backup will be permanently deleted. This action cannot be undone."
+    },
+    "postImportSync": {
+      "partialSuccess": "Restore completed with a synchronization warning",
+      "retry": "Retry sync",
+      "retrySuccess": "Synchronization completed",
+      "retryFailed": "Synchronization retry failed: {{error}}"
     },
     "webdavSync": {
       "title": "WebDAV Cloud Sync",
@@ -694,6 +734,30 @@
     "silentStartup": "Silent Startup",
     "silentStartupDescription": "Start in background mode without showing main window",
     "autoLaunchFailed": "Failed to set auto-launch",
+    "codexRepair": {
+      "title": "Codex Desktop Repair",
+      "description": "Detect update-related problems and launch an administrator repair when needed.",
+      "enabled": "Codex Desktop health detection",
+      "enabledDescription": "Check Codex Desktop repair state when CC Switch starts",
+      "checkNow": "Check now",
+      "repair": "Repair as administrator",
+      "runtimeMissing": "The Fast Patch runtime will be downloaded and verified during repair.",
+      "checkFailed": "Codex Desktop detection failed",
+      "launchStarted": "Administrator permission requested; confirm the UAC prompt",
+      "launchFailed": "Could not start administrator repair",
+      "repairRunning": "Repair running",
+      "repairRunningDescription": "The standalone administrator window is running the repair. Follow progress there.",
+      "confirmTitle": "Start Codex Desktop repair?",
+      "confirmDescription": "Codex configuration is backed up first, then a visible standalone administrator window runs the repair. Codex Desktop may close and restart.",
+      "confirm": "Start repair",
+      "state": {
+        "unsupported": "Unsupported platform",
+        "notInstalled": "Codex Desktop is not installed",
+        "healthy": "Healthy",
+        "needsRepair": "Needs repair",
+        "unknown": "Waiting for detection"
+      }
+    },
     "minimizeToTray": "Minimize to tray on close",
     "minimizeToTrayDescription": "When checked, clicking the close button will hide to system tray, otherwise the app will exit directly.",
     "useAppWindowControls": "Enable app-level window controls",
@@ -789,6 +853,7 @@
     "openclawConfigDirDescription": "Override OpenClaw configuration directory (openclaw.json).",
     "hermesConfigDir": "Hermes Configuration Directory",
     "hermesConfigDirDescription": "Override Hermes configuration directory (config.yaml).",
+    "deepseekConfigDir": "DeepSeek configuration directory",
     "piConfigDir": "Pi Configuration Directory",
     "piConfigDirDescription": "Override the Pi configuration directory (models.json, instruction files, prompts, skills, and sessions).",
     "browsePlaceholderClaude": "e.g., /home/<your-username>/.claude",
@@ -798,6 +863,7 @@
     "browsePlaceholderOpencode": "e.g., /home/<your-username>/.config/opencode",
     "browsePlaceholderOpenclaw": "e.g., /home/<your-username>/.openclaw",
     "browsePlaceholderHermes": "e.g., /home/<your-username>/.hermes",
+    "browsePlaceholderDeepSeek": "e.g., /home/<your-username>/.dsh",
     "browsePlaceholderPi": "e.g., /home/<your-username>/.pi/agent",
     "browseDirectory": "Browse Directory",
     "resetDefault": "Reset to default directory (takes effect after saving)",
@@ -819,7 +885,7 @@
     "officialWebsite": "Official Website",
     "github": "GitHub",
     "manualInstallCommands": "Manual Install Commands",
-    "oneClickInstallHint": "Install or upgrade Claude Code / Codex / Gemini CLI / OpenCode / OpenClaw / Hermes / Pi",
+    "oneClickInstallHint": "Install or upgrade Claude Code / Codex / Gemini CLI / Grok Build / OpenCode / OpenClaw / Hermes / DeepSeek Harness / Pi",
     "localEnvCheck": "Local environment check",
     "updateAllTools": "Update All ({{count}})",
     "currentVersion": "Current Version",
@@ -910,6 +976,7 @@
     "opencode": "OpenCode",
     "openclaw": "OpenClaw",
     "hermes": "Hermes",
+    "deepseek": "DeepSeek",
     "pi": "Pi"
   },
   "pi": {
@@ -1330,7 +1397,7 @@
     "quickSetModels": "Quick Set",
     "quickSetSuccess": "Model name applied to all roles",
     "advancedOptionsToggle": "Advanced Options",
-    "advancedOptionsHint": "Includes API format, auth field, and model mapping. Defaults work for most use cases.",
+    "advancedOptionsHint": "Includes available API format, auth, model mapping, local proxy automatic retry, and pricing settings. Defaults work for most use cases.",
     "categoryOfficial": "Official",
     "categoryCnOfficial": "Opensource Official",
     "categoryAggregation": "Aggregation",
@@ -1494,7 +1561,59 @@
     "pricingModelSourceInherit": "Inherit global default",
     "pricingModelSourceRequest": "Request model",
     "pricingModelSourceResponse": "Response model",
-    "pricingModelSourceHint": "Choose whether to match pricing by request model or response model"
+    "pricingModelSourceHint": "Choose whether to match pricing by request model or response model",
+    "retryPolicy": "Local proxy automatic retry",
+    "retryPolicyDesc": "Retry matching ordinary-model errors on this provider. Finite retries continue to existing failover after the limit; unlimited retries stay on this provider until success, a non-matching error, or request cancellation.",
+    "retryProviderEnabled": "Enable this Provider automatic retry",
+    "retryGlobalHint": "The global switch is in Settings → Proxy → Advanced proxy configuration.",
+    "retryZeroCountHint": "Unlimited retry is enabled. Matching errors keep retrying this Provider and do not reach failover until success, a non-matching error, or request cancellation.",
+    "retryMaxRetries": "Additional retries",
+    "retryMaxRetriesHint": "When enabled, 0 means unlimited retries; finite values range from 1 to 100. Turn off the Provider switch to disable retries.",
+    "retryDelayMs": "Retry interval (ms)",
+    "retryDelayMsHint": "Fixed delay between attempts, from 1 to 60000 ms.",
+    "retryErrorTypes": "Preset error types",
+    "retryErrorTypeRateLimit": "Rate limit (HTTP 429)",
+    "retryErrorTypeOverloaded": "Overloaded (HTTP 503)",
+    "retryErrorTypeServerError": "Other server errors (HTTP 5xx)",
+    "retryErrorTypeNetwork": "Network and timeout errors",
+    "retryCustomMessages": "Error message contains",
+    "retryCustomMessagesHint": "One case-insensitive substring per line. Only error packets are inspected.",
+    "retryValidation": {
+      "maxRetries": "Additional retries must be an integer from 0 to 100.",
+      "retryDelayMs": "Retry interval must be an integer from 1 to 60000 ms.",
+      "triggerRequired": "Choose at least one error type or enter an error message when retries are enabled."
+    },
+    "agentRoleRouting": "Frontend/backend subagent model routing",
+    "agentRoleRoutingSummary": "Route the frontend role through an independent Codex provider while the backend follows the current provider.",
+    "agentRoleEnabled": "Enable agent role routing",
+    "agentRoleRoutingDesc": "The frontend route requires Codex local proxy takeover. Provider B uses its own retry policy, then falls back to the owner provider A without changing the global current provider.",
+    "agentRoleFrontend": "Frontend subagent",
+    "agentRoleFrontendHint": "Choose an independent provider and upstream model. Codex capability metadata follows the main agent unless explicitly overridden.",
+    "agentRoleFrontendProvider": "Frontend provider",
+    "agentRoleFollowCurrentProvider": "Follow current provider",
+    "agentRoleUnavailableProvider": "Unavailable provider",
+    "agentRoleAddProvider": "Add provider",
+    "agentRoleUnavailableProviderHint": "The configured provider is unavailable. Runtime routing will fall back to the current provider.",
+    "agentRoleUpstreamModel": "Frontend upstream model",
+    "agentRoleUpstreamModelPlaceholder": "Follow target provider default model",
+    "agentRoleFetchModels": "Fetch models",
+    "agentRoleUpstreamModelHint": "This is the actual model sent to the selected provider. Free-form model IDs are supported.",
+    "agentRoleCapabilityModel": "Codex capability model",
+    "agentRoleFollowMainAgent": "Follow main agent",
+    "agentRoleUnknownCapabilityModel": "This model is not present in the visible shared catalog. Codex will use fallback model metadata.",
+    "agentRoleReasoning": "Reasoning effort",
+    "agentRoleFollowMain": "Follow main agent",
+    "agentRoleBackend": "Backend subagent",
+    "agentRoleBackendProviderHint": "The backend role always uses the owner provider: {{provider}}.",
+    "agentRoleCurrentProvider": "current provider",
+    "agentRoleBackendModel": "Backend capability model",
+    "agentRoleOwnerDeleteBlocked": "Disable agent role routing on this provider before deleting it.",
+    "agentRoleTargetDeleteBlocked": "This provider is used by frontend roles configured on: {{providers}}.",
+    "agentRoleProxyDisableBlocked": "Codex proxy takeover is required by an active agent role route. Disable the route first.",
+    "agentRoleLoopbackRequired": "Frontend subagent provider routing requires the Codex local proxy to listen on a loopback address (127.0.0.1 or ::1). Change the listen address and try again.",
+    "agentRoleProxyAutoEnabled": "Codex local proxy takeover was enabled automatically for the frontend role route.",
+    "agentRoleSavedSwitchRequired": "The agent role routing configuration was saved. Switch to this Provider to enable the proxy automatically and apply the configuration.",
+    "agentRoleRestartRequired": "Create a new Codex task or restart Codex so the managed agent roles are discovered."
   },
   "codexConfig": {
     "authJson": "auth.json (JSON) *",
@@ -1537,6 +1656,13 @@
     "promptCacheRoutingEnabled": "Enabled",
     "promptCacheRoutingDisabled": "Disabled",
     "promptCacheRoutingHint": "Auto sends prompt_cache_key only to known-compatible upstreams. Enable it for other compatible gateways, or disable it if a strict gateway rejects unknown fields with HTTP 400. Only a stable client-provided session ID is used.",
+    "autoReviewModeLabel": "Approval reviewer routing",
+    "autoReviewModeNative": "Native",
+    "autoReviewModeAuto": "Auto",
+    "autoReviewModeFallback": "Fallback",
+    "autoReviewModeHint": "Auto first tries codex-auto-review and switches to the fallback model when unavailable.",
+    "autoReviewFallbackModelLabel": "Fallback reviewer model",
+    "autoReviewFallbackModelHint": "Leave empty to use this provider's default Codex model.",
     "upstreamModelName": "Upstream Model Name",
     "upstreamModelNameHint": "For Chat format, enter the real upstream model here; routing converts Codex Responses requests to Chat Completions while keeping this model.",
     "modelNamePlaceholder": "e.g., gpt-5-codex",
@@ -1575,7 +1701,7 @@
     "reasoningEffortHint": "Enable when the upstream supports thinking-depth control such as low/high/max. Enabling this also turns on thinking mode and converts Codex's reasoning.effort into the upstream Chat parameter.",
     "reasoningGroupTitle": "Reasoning Capability",
     "reasoningSectionHint": "Preset providers are configured automatically; custom providers are inferred from name/URL. Override manually only when auto-detection is wrong.",
-    "advancedSectionHint": "Includes upstream format, model mapping, reasoning overrides and custom User-Agent. Providers using the Chat Completions protocol require routing takeover to be enabled.",
+    "advancedSectionHint": "Includes upstream format, model mapping, reasoning overrides, custom User-Agent, local proxy automatic retry, and pricing. Providers using the Chat Completions protocol require routing takeover to be enabled.",
     "noCommonConfigToApply": "The common config snippet is empty or contains nothing to write"
   },
   "geminiConfig": {
@@ -2013,7 +2139,9 @@
         "grokbuild": "Grok Build",
         "opencode": "OpenCode",
         "openclaw": "OpenClaw",
-        "hermes": "Hermes"
+        "hermes": "Hermes",
+        "deepseek": "DeepSeek",
+        "pi": "Pi"
       }
     },
     "userLevelPath": "User-level MCP path",
@@ -2627,7 +2755,9 @@
       "codex": "Codex",
       "gemini": "Gemini",
       "opencode": "OpenCode",
-      "openclaw": "OpenClaw"
+      "openclaw": "OpenClaw",
+      "deepseek": "DeepSeek",
+      "pi": "Pi"
     },
     "installFromZip": {
       "button": "Install from ZIP",

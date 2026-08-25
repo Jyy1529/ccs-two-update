@@ -11,6 +11,7 @@ export type AppType =
   | "opencode"
   | "openclaw"
   | "hermes"
+  | "deepseek"
   | "pi";
 
 /** Skill 应用启用状态 */
@@ -24,6 +25,7 @@ export interface SkillApps {
   openclaw: boolean;
   hermes: boolean;
   pi: boolean;
+  deepseek: boolean;
 }
 
 /** 已安装的 Skill（v3.10.0+ 统一结构） */

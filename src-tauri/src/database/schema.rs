@@ -67,7 +67,9 @@ impl Database {
             enabled_claude BOOLEAN NOT NULL DEFAULT 0, enabled_codex BOOLEAN NOT NULL DEFAULT 0,
             enabled_gemini BOOLEAN NOT NULL DEFAULT 0, enabled_grokbuild BOOLEAN NOT NULL DEFAULT 0,
             enabled_opencode BOOLEAN NOT NULL DEFAULT 0,
-            enabled_hermes BOOLEAN NOT NULL DEFAULT 0
+            enabled_hermes BOOLEAN NOT NULL DEFAULT 0,
+            enabled_deepseek BOOLEAN NOT NULL DEFAULT 0,
+            enabled_pi BOOLEAN NOT NULL DEFAULT 0
         )",
             [],
         )
@@ -97,6 +99,8 @@ impl Database {
             enabled_grokbuild BOOLEAN NOT NULL DEFAULT 0,
             enabled_opencode BOOLEAN NOT NULL DEFAULT 0,
             enabled_hermes BOOLEAN NOT NULL DEFAULT 0,
+            enabled_deepseek BOOLEAN NOT NULL DEFAULT 0,
+            enabled_pi BOOLEAN NOT NULL DEFAULT 0,
             installed_at INTEGER NOT NULL DEFAULT 0,
             content_hash TEXT,
             updated_at INTEGER NOT NULL DEFAULT 0
@@ -536,6 +540,11 @@ impl Database {
                         Self::migrate_v16_to_v17(conn)?;
                         Self::set_user_version(conn, 17)?;
                     }
+                    17 => {
+                        log::info!("迁移数据库从 v17 到 v18（协调会话去重账本与 DeepSeek/Pi 列）");
+                        Self::migrate_v17_to_v18(conn)?;
+                        Self::set_user_version(conn, 18)?;
+                    }
                     _ => {
                         return Err(AppError::Database(format!(
                             "未知的数据库版本 {version}，无法迁移到 {SCHEMA_VERSION}"
@@ -544,6 +553,10 @@ impl Database {
                 }
                 version = Self::get_user_version(conn)?;
             }
+            // v17 曾在上游版和二开版中承载不同结构。即使数据库已经标记为
+            // 当前版本，也按实际表/列做一次幂等校验，避免部分迁移或手工恢复
+            // 留下结构缺口。
+            Self::reconcile_v18_schema(conn)?;
             Ok(())
         })();
 
@@ -1548,7 +1561,9 @@ impl Database {
         crate::services::session_usage_codex::reset_codex_usage_on_conn(conn, &codex_dir)
     }
 
-    /// v16 -> v17: preserve session request identities after detail rollup.
+    /// v16 -> v17: reconcile both historical v17 layouts. Older fork builds
+    /// used this version for DeepSeek/Pi projection columns while upstream used
+    /// it for the session dedup ledger, so this migration must install both.
     fn migrate_v16_to_v17(conn: &Connection) -> Result<(), AppError> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS session_usage_dedup (
@@ -1562,6 +1577,60 @@ impl Database {
              ON session_usage_dedup(data_source, semantic_id, has_entry_id);",
         )
         .map_err(|error| AppError::Database(format!("创建会话用量去重账本失败: {error}")))?;
+        for column in ["enabled_deepseek", "enabled_pi"] {
+            if Self::table_exists(conn, "mcp_servers")? {
+                Self::add_column_if_missing(
+                    conn,
+                    "mcp_servers",
+                    column,
+                    "BOOLEAN NOT NULL DEFAULT 0",
+                )?;
+            }
+            if Self::table_exists(conn, "skills")? {
+                Self::add_column_if_missing(conn, "skills", column, "BOOLEAN NOT NULL DEFAULT 0")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// v17 -> v18: repair databases whose v17 marker came from either the
+    /// upstream release or the DeepSeek/Pi fork. All operations are idempotent.
+    fn migrate_v17_to_v18(conn: &Connection) -> Result<(), AppError> {
+        Self::ensure_v18_projection_schema(conn)
+    }
+
+    fn reconcile_v18_schema(conn: &Connection) -> Result<(), AppError> {
+        Self::ensure_v18_projection_schema(conn)
+    }
+
+    fn ensure_v18_projection_schema(conn: &Connection) -> Result<(), AppError> {
+        if Self::table_exists(conn, "mcp_servers")? {
+            for column in ["enabled_deepseek", "enabled_pi"] {
+                Self::add_column_if_missing(
+                    conn,
+                    "mcp_servers",
+                    column,
+                    "BOOLEAN NOT NULL DEFAULT 0",
+                )?;
+            }
+        }
+        if Self::table_exists(conn, "skills")? {
+            for column in ["enabled_deepseek", "enabled_pi"] {
+                Self::add_column_if_missing(conn, "skills", column, "BOOLEAN NOT NULL DEFAULT 0")?;
+            }
+        }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_usage_dedup (
+                data_source TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                semantic_id TEXT NOT NULL,
+                has_entry_id INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (data_source, request_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_session_usage_dedup_semantic
+             ON session_usage_dedup(data_source, semantic_id, has_entry_id);",
+        )
+        .map_err(|error| AppError::Database(format!("补齐会话用量去重账本失败: {error}")))?;
         Ok(())
     }
 
@@ -3348,6 +3417,93 @@ mod tests {
         assert_eq!(mcp_values, (1, 0));
         assert_eq!(skill_values, (1, 0));
 
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v16_to_v17_adds_deepseek_pi_columns() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE mcp_servers (
+                id TEXT PRIMARY KEY,
+                enabled_codex BOOLEAN NOT NULL DEFAULT 0
+            );
+            CREATE TABLE skills (
+                id TEXT PRIMARY KEY,
+                enabled_codex BOOLEAN NOT NULL DEFAULT 0
+            );
+            INSERT INTO mcp_servers (id, enabled_codex) VALUES ('mcp-1', 1);
+            INSERT INTO skills (id, enabled_codex) VALUES ('skill-1', 1);",
+        )?;
+        Database::set_user_version(&conn, 16)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        for table in ["mcp_servers", "skills"] {
+            for column in ["enabled_deepseek", "enabled_pi"] {
+                assert!(Database::has_column(&conn, table, column)?);
+            }
+        }
+        let mcp_values: (i64, i64, i64) = conn.query_row(
+            "SELECT enabled_codex, enabled_deepseek, enabled_pi
+             FROM mcp_servers WHERE id = 'mcp-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let skill_values: (i64, i64, i64) = conn.query_row(
+            "SELECT enabled_codex, enabled_deepseek, enabled_pi
+             FROM skills WHERE id = 'skill-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(mcp_values, (1, 0, 0));
+        assert_eq!(skill_values, (1, 0, 0));
+
+        Ok(())
+    }
+
+    #[test]
+    fn v17_marker_from_upstream_is_repaired_to_full_v18_schema() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE mcp_servers (id TEXT PRIMARY KEY, enabled_codex BOOLEAN NOT NULL DEFAULT 0);
+             CREATE TABLE skills (id TEXT PRIMARY KEY, enabled_codex BOOLEAN NOT NULL DEFAULT 0);
+             CREATE TABLE session_usage_dedup (
+                 data_source TEXT NOT NULL,
+                 request_id TEXT NOT NULL,
+                 semantic_id TEXT NOT NULL,
+                 has_entry_id INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (data_source, request_id)
+             );",
+        )?;
+        Database::set_user_version(&conn, 17)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        for table in ["mcp_servers", "skills"] {
+            for column in ["enabled_deepseek", "enabled_pi"] {
+                assert!(Database::has_column(&conn, table, column)?);
+            }
+        }
+        assert!(Database::table_exists(&conn, "session_usage_dedup")?);
+        Ok(())
+    }
+
+    #[test]
+    fn v17_marker_from_fork_is_repaired_to_full_v18_schema() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE mcp_servers (id TEXT PRIMARY KEY, enabled_deepseek BOOLEAN NOT NULL DEFAULT 0, enabled_pi BOOLEAN NOT NULL DEFAULT 0);
+             CREATE TABLE skills (id TEXT PRIMARY KEY, enabled_deepseek BOOLEAN NOT NULL DEFAULT 0, enabled_pi BOOLEAN NOT NULL DEFAULT 0);",
+        )?;
+        Database::set_user_version(&conn, 17)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        assert!(Database::table_exists(&conn, "session_usage_dedup")?);
         Ok(())
     }
 

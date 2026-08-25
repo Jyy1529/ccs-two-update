@@ -8,6 +8,8 @@ import type { Provider, SessionMeta, Settings } from "@/types";
 import {
   extractErrorMessage,
   translatePiProviderMutationError,
+  translateCodexAgentRoleDeleteError,
+  translateCodexAgentRoleProxyError,
 } from "@/utils/errorUtils";
 import { generateUUID } from "@/utils/uuid";
 import { openclawKeys } from "@/hooks/useOpenClaw";
@@ -143,6 +145,7 @@ export const useAddProviderMutation = (appId: AppId) => {
         (appId === "pi"
           ? translatePiProviderMutationError(rawDetail, t)
           : "") ||
+        translateCodexAgentRoleProxyError(rawDetail, t) ||
         rawDetail ||
         t("common.unknown");
       toast.error(
@@ -208,6 +211,7 @@ export const useUpdateProviderMutation = (appId: AppId) => {
         (appId === "pi"
           ? translatePiProviderMutationError(rawDetail, t)
           : "") ||
+        translateCodexAgentRoleProxyError(rawDetail, t) ||
         rawDetail ||
         t("common.unknown");
       toast.error(
@@ -284,6 +288,7 @@ export const useDeleteProviderMutation = (appId: AppId) => {
         (appId === "pi"
           ? translatePiProviderMutationError(rawDetail, t)
           : "") ||
+        translateCodexAgentRoleDeleteError(rawDetail, t) ||
         rawDetail ||
         t("common.unknown");
       toast.error(

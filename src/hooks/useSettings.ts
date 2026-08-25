@@ -118,6 +118,7 @@ export function useSettings(): UseSettingsResult {
       opencode: sanitizeDir(data?.opencodeConfigDir),
       openclaw: sanitizeDir(data?.openclawConfigDir),
       hermes: sanitizeDir(data?.hermesConfigDir),
+      deepseek: sanitizeDir(data?.deepseekConfigDir),
       pi: sanitizeDir(data?.piConfigDir),
     });
     setRequiresRestart(false);

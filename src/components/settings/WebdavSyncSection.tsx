@@ -542,6 +542,35 @@ export function WebdavSyncSection({
     }
   }, [buildSettings, form.password, passwordTouched, queryClient, t]);
 
+  const handlePostImportSyncRetry = useCallback(async () => {
+    try {
+      await settingsApi.retryPostImportSync();
+      toast.success(t("settings.postImportSync.retrySuccess"));
+      await queryClient.invalidateQueries();
+    } catch (error) {
+      toast.error(
+        t("settings.postImportSync.retryFailed", {
+          error: (error as Error)?.message ?? String(error),
+        }),
+      );
+    }
+  }, [queryClient, t]);
+
+  const showPostImportSyncWarning = useCallback(
+    (warning: string) => {
+      toast.warning(t("settings.postImportSync.partialSuccess"), {
+        description: warning,
+        duration: 10000,
+        closeButton: true,
+        action: {
+          label: t("settings.postImportSync.retry"),
+          onClick: () => void handlePostImportSyncRetry(),
+        },
+      });
+    },
+    [handlePostImportSyncRetry, t],
+  );
+
   /** Fetch remote info, then open upload confirmation dialog. */
   const handleUploadClick = useCallback(async () => {
     if (dirty) {
@@ -635,8 +664,12 @@ export function WebdavSyncSection({
     closeDialog();
     setActionState("downloading");
     try {
-      await settingsApi.webdavSyncDownload();
-      toast.success(t("settings.webdavSync.downloadSuccess"));
+      const result = await settingsApi.webdavSyncDownload();
+      if (result.warning) {
+        showPostImportSyncWarning(result.warning);
+      } else {
+        toast.success(t("settings.webdavSync.downloadSuccess"));
+      }
       await queryClient.invalidateQueries();
     } catch (error) {
       toast.error(
@@ -647,7 +680,7 @@ export function WebdavSyncSection({
     } finally {
       setActionState("idle");
     }
-  }, [closeDialog, dirty, queryClient, t]);
+  }, [closeDialog, dirty, queryClient, showPostImportSyncWarning, t]);
 
   // ─── S3 helpers ────────────────────────────────────────────
 
@@ -846,8 +879,12 @@ export function WebdavSyncSection({
     closeS3Dialog();
     setS3ActionState("downloading");
     try {
-      await settingsApi.s3SyncDownload();
-      toast.success(t("settings.s3Sync.downloadSuccess"));
+      const result = await settingsApi.s3SyncDownload();
+      if (result.warning) {
+        showPostImportSyncWarning(result.warning);
+      } else {
+        toast.success(t("settings.s3Sync.downloadSuccess"));
+      }
       await queryClient.invalidateQueries();
     } catch (error) {
       toast.error(
@@ -858,7 +895,7 @@ export function WebdavSyncSection({
     } finally {
       setS3ActionState("idle");
     }
-  }, [closeS3Dialog, s3Dirty, queryClient, t]);
+  }, [closeS3Dialog, s3Dirty, queryClient, showPostImportSyncWarning, t]);
 
   // ─── Sync type switching with mutual exclusion ─────────────
 

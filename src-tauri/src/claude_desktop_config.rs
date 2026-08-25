@@ -321,15 +321,23 @@ pub fn direct_gateway_credentials(
         .get("ANTHROPIC_AUTH_TOKEN")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            AppError::localized(
-                "claude_desktop.provider.auth_token_missing",
-                "Claude Desktop 直连供应商缺少 ANTHROPIC_AUTH_TOKEN（Bearer Token）",
-                "Claude Desktop direct provider is missing ANTHROPIC_AUTH_TOKEN (Bearer Token)",
-            )
-        })?
+        .unwrap_or_default()
         .to_string();
+    let local_no_auth = url::Url::parse(&base_url)
+        .ok()
+        .and_then(|url| url.host().map(|host| host.to_owned()))
+        .is_some_and(|host| match host {
+            url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+            url::Host::Ipv4(address) => address.is_loopback(),
+            url::Host::Ipv6(address) => address.is_loopback(),
+        });
+    if api_key.is_empty() && !local_no_auth {
+        return Err(AppError::localized(
+            "claude_desktop.provider.auth_token_missing",
+            "Claude Desktop 直连供应商缺少 ANTHROPIC_AUTH_TOKEN（Bearer Token）",
+            "Claude Desktop direct provider is missing ANTHROPIC_AUTH_TOKEN (Bearer Token)",
+        ));
+    }
 
     Ok(DirectGatewayCredentials { base_url, api_key })
 }
@@ -2218,5 +2226,19 @@ mod tests {
             None,
         );
         assert!(!is_compatible_direct_provider(&missing_bearer));
+    }
+
+    #[test]
+    fn claude_desktop_direct_allows_empty_key_for_loopback_endpoint_only() {
+        let mut local = direct_provider("local-no-auth");
+        local.settings_config["env"]["ANTHROPIC_BASE_URL"] = json!("http://127.0.0.1:11434/v1");
+        local.settings_config["env"]["ANTHROPIC_AUTH_TOKEN"] = json!("");
+
+        let credentials = direct_gateway_credentials(&local).expect("loopback no-auth provider");
+        assert_eq!(credentials.base_url, "http://127.0.0.1:11434/v1");
+        assert!(credentials.api_key.is_empty());
+
+        local.settings_config["env"]["ANTHROPIC_BASE_URL"] = json!("https://gateway.example.com");
+        assert!(direct_gateway_credentials(&local).is_err());
     }
 }

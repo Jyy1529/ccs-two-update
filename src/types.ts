@@ -171,6 +171,50 @@ export interface LocalProxyRequestOverrides {
   body?: Record<string, unknown>;
 }
 
+export type CodexAutoReviewMode = "native" | "auto" | "fallback";
+
+export type LocalProxyRetryErrorType =
+  | "rate_limit"
+  | "overloaded"
+  | "server_error"
+  | "network";
+
+export interface LocalProxyRetryPolicy {
+  // Optional for legacy ProviderMeta; omitted values infer enabled from maxRetries.
+  enabled?: boolean;
+  // With enabled=true, 0 means unlimited retries; finite values range from 1 to 100.
+  maxRetries: number;
+  retryDelayMs: number;
+  customMessages: string[];
+  errorTypes: LocalProxyRetryErrorType[];
+}
+
+export type CodexAgentReasoningEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max"
+  | "ultra";
+
+export interface CodexAgentRoleOverride {
+  model?: string;
+  reasoningEffort?: CodexAgentReasoningEffort;
+}
+
+export interface CodexFrontendAgentRoleOverride extends CodexAgentRoleOverride {
+  providerId?: string;
+  upstreamModel?: string;
+}
+
+export interface CodexAgentRoleRouting {
+  enabled?: boolean;
+  frontend?: CodexFrontendAgentRoleOverride;
+  backend?: CodexAgentRoleOverride;
+}
+
 // 供应商元数据（字段名与后端一致，保持 snake_case）
 export interface ProviderMeta {
   // 自定义端点：以 URL 为键，值为端点信息
@@ -232,6 +276,14 @@ export interface ProviderMeta {
   localProxyRequestOverrides?: LocalProxyRequestOverrides;
   // Whether this provider is currently projected into an additive app's live config.
   liveConfigManaged?: boolean;
+  // Routing policy for Codex's internal approval reviewer model.
+  codexAutoReviewMode?: CodexAutoReviewMode;
+  // Explicit fallback; the provider default model is used when omitted.
+  codexAutoReviewFallbackModel?: string;
+  // Same-provider retries for ordinary local-proxy model requests.
+  localProxyRetryPolicy?: LocalProxyRetryPolicy;
+  // Provider and model overrides for CC Switch-managed Codex agent roles.
+  codexAgentRoleRouting?: CodexAgentRoleRouting;
   // 供应商类型（用于识别 Copilot 等特殊供应商）
   providerType?: string;
   // GitHub Copilot 关联账号 ID（旧字段，保留兼容读取）
@@ -297,7 +349,22 @@ export interface VisibleApps {
   opencode: boolean;
   openclaw: boolean;
   hermes: boolean;
+  deepseek: boolean;
   pi: boolean;
+}
+
+// 单个 Provider 功能的生效范围：总开关 + 应用列表（AppId 字符串）
+export interface FeatureScope {
+  enabled: boolean;
+  apps: string[];
+}
+
+// Provider 功能的应用生效范围集合
+// 自动重试默认 Claude Code + Codex；角色路由与审批路由为 Codex 专属实现，默认仅 Codex
+export interface ProviderFeatureScopes {
+  localProxyRetry: FeatureScope;
+  agentRoleRouting: FeatureScope;
+  autoReviewRouting: FeatureScope;
 }
 
 // WebDAV 同步状态
@@ -368,10 +435,16 @@ export interface Settings {
   skipClaudeOnboarding?: boolean;
   // 是否开机自启
   launchOnStartup?: boolean;
+  // 是否启用 Codex Desktop 健康检测
+  codexRepairDetectionEnabled?: boolean;
   // 静默启动（程序启动时不显示主窗口）
   silentStartup?: boolean;
   // 是否启用主页面本地代理功能（默认关闭）
   enableLocalProxy?: boolean;
+  // 全局 Provider 自动重试开关；缺省按开启处理以兼容旧配置
+  providerRetryEnabled?: boolean;
+  // Provider 功能的应用生效范围（自动重试 / 子代理角色路由 / 审批模型路由）
+  providerFeatureScopes?: ProviderFeatureScopes;
   // User has confirmed the local proxy first-run notice
   proxyConfirmed?: boolean;
   // User has confirmed the usage query first-run notice
@@ -418,6 +491,9 @@ export interface Settings {
   // 覆盖 Hermes 配置目录（可选）
   hermesConfigDir?: string;
   // 覆盖 Pi agent 配置目录（可选）
+  // 覆盖 DeepSeek 配置目录（可选）
+  deepseekConfigDir?: string;
+  // 覆盖 Pi 配置目录（可选）
   piConfigDir?: string;
 
   // ===== 当前供应商 ID（设备级）=====
@@ -511,6 +587,8 @@ export interface McpApps {
   opencode: boolean;
   openclaw: boolean;
   hermes: boolean;
+  deepseek: boolean;
+  pi: boolean;
 }
 
 // MCP 服务器条目（v3.7.0 统一结构）

@@ -24,6 +24,21 @@ pub fn import_provider_from_deeplink(
     state: &AppState,
     request: DeepLinkImportRequest,
 ) -> Result<String, AppError> {
+    import_provider_from_deeplink_impl(state, request, false)
+}
+
+pub(crate) fn import_provider_from_deeplink_under_proxy_transaction(
+    state: &AppState,
+    request: DeepLinkImportRequest,
+) -> Result<String, AppError> {
+    import_provider_from_deeplink_impl(state, request, true)
+}
+
+fn import_provider_from_deeplink_impl(
+    state: &AppState,
+    request: DeepLinkImportRequest,
+    under_proxy_transaction: bool,
+) -> Result<String, AppError> {
     // Verify this is a provider request
     if request.resource != "provider" {
         return Err(AppError::InvalidInput(format!(
@@ -110,7 +125,11 @@ pub fn import_provider_from_deeplink(
     let provider_id = provider.id.clone();
 
     // Use ProviderService to add the provider
-    ProviderService::add(state, app_type.clone(), provider, true)?;
+    if under_proxy_transaction {
+        ProviderService::add_under_proxy_transaction(state, app_type.clone(), provider, true)?;
+    } else {
+        ProviderService::add(state, app_type.clone(), provider, true)?;
+    }
 
     // Add extra endpoints as custom endpoints (skip first one as it's the primary)
     for ep in all_endpoints.iter().skip(1) {
@@ -132,7 +151,11 @@ pub fn import_provider_from_deeplink(
 
     // If enabled=true, set as current provider
     if merged_request.enabled.unwrap_or(false) {
-        ProviderService::switch(state, app_type.clone(), &provider_id)?;
+        if under_proxy_transaction {
+            ProviderService::switch_under_proxy_transaction(state, app_type.clone(), &provider_id)?;
+        } else {
+            ProviderService::switch(state, app_type.clone(), &provider_id)?;
+        }
         log::info!("Provider '{provider_id}' set as current for {app_type:?}");
     }
 
@@ -152,6 +175,7 @@ pub(crate) fn build_provider_from_request(
         AppType::OpenCode => build_opencode_settings(request),
         AppType::OpenClaw => build_additive_app_settings(request),
         AppType::Hermes => build_hermes_settings(request),
+        AppType::DeepSeek => build_additive_app_settings(request),
         AppType::Pi => {
             return Err(AppError::InvalidInput(
                 "Pi providers must be added from the Pi provider page".to_string(),

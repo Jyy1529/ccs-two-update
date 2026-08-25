@@ -69,11 +69,15 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
     opencode: boolean;
     openclaw: boolean;
     hermes: boolean;
+    deepseek: boolean;
+    pi: boolean;
   }>(() => {
     if (initialData?.apps) {
       return {
         ...initialData.apps,
         grokbuild: initialData.apps.grokbuild ?? false,
+        deepseek: false,
+        pi: false,
       };
     }
     return {
@@ -84,6 +88,8 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
       opencode: defaultEnabledApps.includes("opencode"),
       openclaw: defaultEnabledApps.includes("openclaw"),
       hermes: defaultEnabledApps.includes("hermes"),
+      deepseek: false,
+      pi: false,
     };
   });
 
@@ -371,7 +377,12 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
         id: trimmedId,
         name: finalName,
         server: serverSpec,
-        apps: enabledApps,
+        apps: {
+          ...enabledApps,
+          // DeepSeek and Pi do not expose a CC Switch MCP projection.
+          deepseek: false,
+          pi: false,
+        },
       };
 
       const descriptionTrimmed = formDescription.trim();

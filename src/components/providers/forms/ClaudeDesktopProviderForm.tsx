@@ -94,6 +94,7 @@ export interface ClaudeDesktopProviderFormProps {
   };
   showButtons?: boolean;
   onManageAuthAccounts?: (target: ManagedAuthProvider) => void;
+  formId?: string;
 }
 
 type RouteRow = {
@@ -247,6 +248,7 @@ export function ClaudeDesktopProviderForm({
   initialData,
   showButtons = true,
   onManageAuthAccounts,
+  formId = "provider-form",
 }: ClaudeDesktopProviderFormProps) {
   const { t } = useTranslation();
   const initialMode = isOAuthProviderType(initialData?.meta?.providerType)
@@ -859,7 +861,7 @@ export function ClaudeDesktopProviderForm({
   return (
     <Form {...form}>
       <form
-        id="provider-form"
+        id={formId}
         onSubmit={form.handleSubmit(handleSubmit)}
         className="space-y-6 glass rounded-xl p-6 border border-white/10"
       >

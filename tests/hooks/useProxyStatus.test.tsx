@@ -131,4 +131,31 @@ describe("useProxyStatus", () => {
     expect(invokeMock).toHaveBeenCalledWith("start_proxy_server");
     expect(invokeMock).toHaveBeenCalledWith("stop_proxy_server");
   });
+
+  it("translates role-routing guard errors from proxy mutations", async () => {
+    const defaultInvoke = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "stop_proxy_server") {
+        return Promise.reject(
+          new Error("codex_agent_role_proxy_required: owner-provider"),
+        );
+      }
+      return defaultInvoke?.(command);
+    });
+    const { wrapper } = createWrapper();
+    const { result } = renderHook(() => useProxyStatus(), { wrapper });
+
+    await waitFor(() => expect(result.current.status).toBeDefined());
+
+    await expect(
+      act(async () => {
+        await result.current.stopProxyServer();
+      }),
+    ).rejects.toThrow("codex_agent_role_proxy_required");
+    await waitFor(() =>
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "停止代理服务失败: providerAdvanced.agentRoleProxyDisableBlocked",
+      ),
+    );
+  });
 });

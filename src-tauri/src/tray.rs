@@ -444,7 +444,13 @@ pub fn handle_profile_tray_event(app: &tauri::AppHandle, event_id: &str) -> bool
         };
         match crate::services::profile::ProfileService::apply(app_state.inner(), &profile_id, scope)
         {
-            Ok((warnings, should_stop_proxy)) => {
+            Ok((mut warnings, should_stop_proxy)) => {
+                let should_stop_proxy = crate::commands::finalize_codex_role_profile_apply(
+                    app_state.inner(),
+                    scope,
+                    &mut warnings,
+                    should_stop_proxy,
+                );
                 for warning in &warnings {
                     log::warn!("[Profile] 应用项目 {profile_id} 警告: {warning}");
                 }
@@ -520,6 +526,34 @@ pub fn handle_provider_tray_event(app: &tauri::AppHandle, event_id: &str) -> boo
 fn handle_auto_click(app: &tauri::AppHandle, app_type: &AppType) -> Result<(), AppError> {
     if let Some(app_state) = app.try_state::<AppState>() {
         let app_type_str = app_type.as_str();
+
+        if matches!(app_type, AppType::Codex) {
+            let p1_provider_id = tauri::async_runtime::block_on(
+                crate::services::codex_provider_lifecycle::enable_codex_auto_mode_from_tray(
+                    app_state.inner().owned_clone(),
+                ),
+            )?;
+
+            if let Ok(new_menu) = create_tray_menu(app, app_state.inner()) {
+                if let Some(tray) = app.tray_by_id(TRAY_ID) {
+                    let _ = tray.set_menu(Some(new_menu));
+                }
+            }
+
+            let event_data = serde_json::json!({
+                "appType": app_type_str,
+                "proxyEnabled": true,
+                "autoFailoverEnabled": true,
+                "providerId": p1_provider_id
+            });
+            if let Err(e) = app.emit("proxy-flags-changed", event_data.clone()) {
+                log::error!("发射 proxy-flags-changed 事件失败: {e}");
+            }
+            if let Err(e) = app.emit("provider-switched", event_data) {
+                log::error!("发射 provider-switched 事件失败: {e}");
+            }
+            return Ok(());
+        }
 
         // 强一致语义：Auto 模式开启后立即切到队列 P1（P1→P2→...）
         // 若队列为空，则尝试把“当前供应商”自动加入队列作为 P1，避免用户陷入无法开启的死锁。
@@ -603,12 +637,10 @@ fn handle_auto_click(app: &tauri::AppHandle, app_type: &AppType) -> Result<(), A
             return Err(AppError::Message(format!("执行接管失败: {e}")));
         }
 
-        // 3) 设置 auto_failover_enabled = true
+        // 3) 设置 auto_failover 并立即切到队列 P1。
         app_state
             .db
             .set_proxy_flags_sync(app_type_str, true, true)?;
-
-        // 3.1) 立即切到队列 P1（热切换：不写 Live，仅更新 DB/settings/备份）
         if let Err(e) = futures::executor::block_on(
             proxy_service.switch_proxy_target(app_type_str, &p1_provider_id),
         ) {
@@ -654,13 +686,39 @@ fn handle_provider_click(
 
         // 获取当前 proxy 状态，保持 enabled 不变，只关闭 auto_failover
         let (proxy_enabled, _) = app_state.db.get_proxy_flags_sync(app_type_str);
-        app_state
-            .db
-            .set_proxy_flags_sync(app_type_str, proxy_enabled, false)?;
+        if matches!(app_type, AppType::Codex) {
+            let lifecycle_state = app_state.inner().owned_clone();
+            let provider_id = provider_id.to_string();
+            tauri::async_runtime::block_on(
+                crate::services::codex_provider_lifecycle::run_codex_provider_mutation(
+                    lifecycle_state,
+                    "switch Codex Provider from tray",
+                    move |state| {
+                        state
+                            .db
+                            .set_proxy_flags_sync("codex", proxy_enabled, false)?;
+                        crate::services::ProviderService::switch_under_proxy_transaction(
+                            state.as_ref(),
+                            AppType::Codex,
+                            &provider_id,
+                        )?;
+                        Ok(())
+                    },
+                ),
+            )?;
+        } else {
+            app_state
+                .db
+                .set_proxy_flags_sync(app_type_str, proxy_enabled, false)?;
 
-        // 切换供应商。需要本地路由的供应商也不在这里自动启动代理，
-        // 由用户在页面/设置中手动开启。
-        crate::services::ProviderService::switch(app_state.inner(), app_type.clone(), provider_id)?;
+            // 切换供应商。需要本地路由的供应商也不在这里自动启动代理，
+            // 由用户在页面/设置中手动开启。
+            crate::services::ProviderService::switch(
+                app_state.inner(),
+                app_type.clone(),
+                provider_id,
+            )?;
+        }
 
         // 更新托盘菜单
         if let Ok(new_menu) = create_tray_menu(app, app_state.inner()) {
@@ -973,6 +1031,16 @@ pub fn refresh_tray_menu(app: &tauri::AppHandle) {
     }
 }
 
+pub fn ensure_tray_visible(app: &tauri::AppHandle) {
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        if let Err(err) = tray.set_visible(true) {
+            log::warn!("恢复托盘图标失败: {err}");
+        }
+    } else {
+        log::warn!("恢复托盘图标失败: 托盘实例不存在");
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub fn apply_tray_policy(app: &tauri::AppHandle, dock_visible: bool) {
     use tauri::ActivationPolicy;
@@ -999,21 +1067,7 @@ pub fn handle_tray_menu_event(app: &tauri::AppHandle, event_id: &str) {
     match event_id {
         "show_main" => {
             if let Some(window) = app.get_webview_window("main") {
-                #[cfg(target_os = "windows")]
-                {
-                    let _ = window.set_skip_taskbar(false);
-                }
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
-                #[cfg(target_os = "linux")]
-                {
-                    crate::linux_fix::nudge_main_window(window.clone());
-                }
-                #[cfg(target_os = "macos")]
-                {
-                    apply_tray_policy(app, true);
-                }
+                crate::show_main_window(&window);
             } else if crate::lightweight::is_lightweight_mode() {
                 if let Err(e) = crate::lightweight::exit_lightweight_mode(app) {
                     log::error!("退出轻量模式重建窗口失败: {e}");

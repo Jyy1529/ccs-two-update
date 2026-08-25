@@ -8,14 +8,17 @@
 //! - Claude 的格式转换逻辑保留在此文件（用于 OpenRouter 旧接口回退）
 
 use super::{
-    content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
+    content_encoding::{
+        decompress_body_with_limit, get_content_encoding, is_supported_content_encoding,
+        DecompressError,
+    },
     error_mapper::{get_error_message, map_proxy_error_to_status},
     forwarder::ActiveConnectionGuard,
     handler_config::{
         claude_stream_usage_event_filter, codex_stream_usage_event_filter, CLAUDE_PARSER_CONFIG,
         CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
     },
-    handler_context::RequestContext,
+    handler_context::{RequestContext, RequestContextParams},
     providers::{
         codex_chat_common::extract_reasoning_field_text,
         codex_chat_history::record_responses_sse_stream,
@@ -48,7 +51,7 @@ use super::{
 use crate::app_config::AppType;
 use crate::database::PRICING_SOURCE_REQUEST;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
@@ -710,6 +713,31 @@ fn endpoint_with_query(uri: &axum::http::Uri, endpoint: &str) -> String {
     }
 }
 
+const MAX_CODEX_REQUEST_BODY_BYTES: usize = 200 * 1024 * 1024;
+
+async fn collect_request_body_with_limit(
+    mut body: axum::body::Body,
+    limit: usize,
+) -> Result<Bytes, ProxyError> {
+    let mut collected = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame =
+            frame.map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        let observed = collected
+            .len()
+            .checked_add(data.len())
+            .ok_or(ProxyError::RequestBodyTooLarge(usize::MAX))?;
+        if observed > limit {
+            return Err(ProxyError::RequestBodyTooLarge(observed));
+        }
+        collected.extend_from_slice(&data);
+    }
+    Ok(collected.freeze())
+}
+
 /// Codex 客户端（尤其 Desktop 登录态）可能对请求体启用 zstd 压缩，使得后续
 /// `serde_json::from_slice` 直接解析失败。这里在解析前解压，并剥掉已失真的实体头
 /// （content-encoding / content-length / transfer-encoding）——转发层会基于解压后的
@@ -718,6 +746,18 @@ fn decode_codex_request_body(
     headers: &mut axum::http::HeaderMap,
     body_bytes: Bytes,
 ) -> Result<Bytes, ProxyError> {
+    decode_codex_request_body_with_limit(headers, body_bytes, MAX_CODEX_REQUEST_BODY_BYTES)
+}
+
+fn decode_codex_request_body_with_limit(
+    headers: &mut axum::http::HeaderMap,
+    body_bytes: Bytes,
+    limit: usize,
+) -> Result<Bytes, ProxyError> {
+    if body_bytes.len() > limit {
+        return Err(ProxyError::RequestBodyTooLarge(body_bytes.len()));
+    }
+
     let Some(encoding) = get_content_encoding(headers) else {
         return Ok(body_bytes);
     };
@@ -729,7 +769,7 @@ fn decode_codex_request_body(
     }
 
     log::debug!("[Codex] 解压请求体: content-encoding={encoding}");
-    let decompressed = match decompress_body(&encoding, &body_bytes) {
+    let decompressed = match decompress_body_with_limit(&encoding, &body_bytes, limit) {
         Ok(Some(decompressed)) => decompressed,
         // is_supported_content_encoding 已确保编码受支持，正常不会返回 None；
         // 防御性兜底：宁可报错，也不能把压缩字节当 JSON 透传下去。
@@ -738,7 +778,10 @@ fn decode_codex_request_body(
                 "Unsupported request content-encoding: {encoding}"
             )));
         }
-        Err(e) => {
+        Err(DecompressError::TooLarge { limit }) => {
+            return Err(ProxyError::RequestBodyTooLarge(limit.saturating_add(1)));
+        }
+        Err(DecompressError::Io(e)) => {
             log::warn!("[Codex] 请求体解压失败 ({encoding}): {e}");
             return Err(ProxyError::InvalidRequest(format!(
                 "Failed to decompress request body ({encoding}): {e}"
@@ -767,18 +810,25 @@ pub async fn handle_chat_completions(
     let uri = parts.uri;
     let mut headers = parts.headers;
     let extensions = parts.extensions;
-    let body_bytes = req_body
-        .collect()
-        .await
-        .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
-        .to_bytes();
+    let body_bytes =
+        collect_request_body_with_limit(req_body, MAX_CODEX_REQUEST_BODY_BYTES).await?;
     let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
     let endpoint = endpoint_with_query(&uri, "/chat/completions");
+    let peer_addr = extensions.get::<std::net::SocketAddr>().copied();
+    let mut ctx = RequestContext::new_with_peer_addr(RequestContextParams {
+        state: &state,
+        body: &body,
+        headers: &headers,
+        app_type: AppType::Codex,
+        tag: "Codex",
+        app_type_str: "codex",
+        endpoint: &endpoint,
+        peer_addr,
+    })
+    .await?;
 
     let is_stream = body
         .get("stream")
@@ -857,18 +907,25 @@ async fn handle_responses_for_app(
     let uri = parts.uri;
     let mut headers = parts.headers;
     let extensions = parts.extensions;
-    let body_bytes = req_body
-        .collect()
-        .await
-        .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
-        .to_bytes();
+    let body_bytes =
+        collect_request_body_with_limit(req_body, MAX_CODEX_REQUEST_BODY_BYTES).await?;
     let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
     let endpoint = endpoint_with_query(&uri, "/responses");
+    let peer_addr = extensions.get::<std::net::SocketAddr>().copied();
+    let mut ctx = RequestContext::new_with_peer_addr(RequestContextParams {
+        state: &state,
+        body: &body,
+        headers: &headers,
+        app_type: app_type.clone(),
+        tag,
+        app_type_str,
+        endpoint: &endpoint,
+        peer_addr,
+    })
+    .await?;
 
     let is_stream = body
         .get("stream")
@@ -1059,18 +1116,25 @@ async fn handle_responses_compact_for_app(
     let uri = parts.uri;
     let mut headers = parts.headers;
     let extensions = parts.extensions;
-    let body_bytes = req_body
-        .collect()
-        .await
-        .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
-        .to_bytes();
+    let body_bytes =
+        collect_request_body_with_limit(req_body, MAX_CODEX_REQUEST_BODY_BYTES).await?;
     let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
     let endpoint = endpoint_with_query(&uri, "/responses/compact");
+    let peer_addr = extensions.get::<std::net::SocketAddr>().copied();
+    let mut ctx = RequestContext::new_with_peer_addr(RequestContextParams {
+        state: &state,
+        body: &body,
+        headers: &headers,
+        app_type: app_type.clone(),
+        tag,
+        app_type_str,
+        endpoint: &endpoint,
+        peer_addr,
+    })
+    .await?;
 
     let is_stream = body
         .get("stream")
@@ -1905,6 +1969,17 @@ fn codex_proxy_error_json(
                 Some(*status),
             )
         }
+        ProxyError::UpstreamBodyTimeout { status, .. } => (
+            json!({
+                "error": {
+                    "message": get_error_message(error),
+                    "type": "proxy_error",
+                    "code": codex_proxy_error_code(error),
+                    "param": Value::Null,
+                }
+            }),
+            Some(*status),
+        ),
         _ => (
             json!({
                 "error": {
@@ -2016,8 +2091,10 @@ fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
         ProxyError::ConfigError(_) => "cc_switch_config_error",
         ProxyError::TransformError(_) => "cc_switch_transform_error",
         ProxyError::InvalidRequest(_) => "cc_switch_invalid_request",
+        ProxyError::RequestBodyTooLarge(_) => "cc_switch_request_body_too_large",
         ProxyError::AuthError(_) => "cc_switch_auth_error",
         ProxyError::UpstreamError { .. } => "cc_switch_upstream_error",
+        ProxyError::UpstreamBodyTimeout { .. } => "cc_switch_upstream_body_timeout",
         ProxyError::DatabaseError(_) => "cc_switch_database_error",
         ProxyError::Internal(_) => "cc_switch_internal_error",
         ProxyError::AlreadyRunning
@@ -2832,16 +2909,125 @@ async fn log_usage(
 mod tests {
     use super::{
         body_looks_like_sse, chat_sse_to_response_value, classify_body_for_diagnostics,
-        codex_proxy_error_json, responses_sse_stream_to_anthropic_message,
+        codex_proxy_error_json, collect_request_body_with_limit,
+        decode_codex_request_body_with_limit, responses_sse_stream_to_anthropic_message,
         responses_sse_to_response_value, should_use_claude_transform_streaming, transform,
         upstream_body_parse_error,
     };
     use crate::proxy::ProxyError;
+    use axum::body::Body;
+    use axum::http::header::{CONTENT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING};
     use bytes::Bytes;
+    use flate2::{write::GzEncoder, Compression};
+    use std::convert::Infallible;
+    use std::io::Write;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+
+    fn gzip_bytes(input: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(input).expect("write gzip fixture");
+        encoder.finish().expect("finish gzip fixture")
+    }
+
+    #[tokio::test]
+    async fn collect_request_body_with_limit_preserves_chunk_order() {
+        let body = Body::from_stream(futures::stream::iter([
+            Ok::<_, Infallible>(Bytes::from_static(b"ab")),
+            Ok(Bytes::from_static(b"cd")),
+            Ok(Bytes::from_static(b"ef")),
+        ]));
+
+        let collected = collect_request_body_with_limit(body, 6)
+            .await
+            .expect("chunked body at limit should pass");
+
+        assert_eq!(collected, Bytes::from_static(b"abcdef"));
+    }
+
+    #[tokio::test]
+    async fn collect_request_body_with_limit_rejects_first_overflowing_chunk() {
+        let body = Body::from_stream(futures::stream::iter([
+            Ok::<_, Infallible>(Bytes::from_static(b"abcd")),
+            Ok(Bytes::from_static(b"efg")),
+            Ok(Bytes::from_static(b"must-not-be-collected")),
+        ]));
+
+        let error = collect_request_body_with_limit(body, 6)
+            .await
+            .expect_err("seven wire bytes must exceed a six-byte limit");
+
+        assert!(matches!(error, ProxyError::RequestBodyTooLarge(7)));
+    }
+
+    #[test]
+    fn decode_codex_request_body_with_limit_rejects_decoded_gzip_overflow() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+        let compressed = gzip_bytes(&vec![b'x'; 1024]);
+        assert!(compressed.len() <= 64, "fixture must fit the wire limit");
+
+        let error = decode_codex_request_body_with_limit(&mut headers, Bytes::from(compressed), 64)
+            .expect_err("decoded gzip body must respect the limit");
+
+        assert!(matches!(error, ProxyError::RequestBodyTooLarge(65)));
+    }
+
+    #[test]
+    fn decode_codex_request_body_with_limit_strips_entity_headers_after_success() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+        headers.insert(CONTENT_LENGTH, "99".parse().unwrap());
+        headers.insert(TRANSFER_ENCODING, "chunked".parse().unwrap());
+
+        let expected = vec![b'x'; 64];
+        let compressed = gzip_bytes(&expected);
+        assert!(compressed.len() <= expected.len());
+        let decoded = decode_codex_request_body_with_limit(
+            &mut headers,
+            Bytes::from(compressed),
+            expected.len(),
+        )
+        .expect("exact decoded boundary should pass");
+
+        assert_eq!(decoded.as_ref(), expected.as_slice());
+        assert!(!headers.contains_key(CONTENT_ENCODING));
+        assert!(!headers.contains_key(CONTENT_LENGTH));
+        assert!(!headers.contains_key(TRANSFER_ENCODING));
+    }
+
+    #[test]
+    fn decode_codex_request_body_with_limit_preserves_encoding_errors() {
+        let mut malformed_headers = axum::http::HeaderMap::new();
+        malformed_headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+        let malformed = decode_codex_request_body_with_limit(
+            &mut malformed_headers,
+            Bytes::from_static(b"not-gzip"),
+            64,
+        )
+        .expect_err("malformed gzip must remain invalid request");
+        assert!(matches!(
+            malformed,
+            ProxyError::InvalidRequest(message)
+                if message.contains("Failed to decompress request body (gzip)")
+        ));
+
+        let mut unsupported_headers = axum::http::HeaderMap::new();
+        unsupported_headers.insert(CONTENT_ENCODING, "snappy".parse().unwrap());
+        let unsupported = decode_codex_request_body_with_limit(
+            &mut unsupported_headers,
+            Bytes::from_static(b"opaque"),
+            64,
+        )
+        .expect_err("unsupported encoding must remain invalid request");
+        assert!(matches!(
+            unsupported,
+            ProxyError::InvalidRequest(message)
+                if message.contains("Unsupported request content-encoding: snappy")
+        ));
+    }
 
     #[test]
     fn body_looks_like_sse_detects_unlabeled_sse_prefixes() {
@@ -3545,6 +3731,19 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n
         assert!(message.contains("upstream gateway failed"));
         assert_eq!(body["error"]["code"], 2013);
         assert_eq!(body["error"]["upstream_status"], 502);
+    }
+
+    #[test]
+    fn codex_proxy_upstream_body_timeout_keeps_status_and_error_code() {
+        let error = ProxyError::UpstreamBodyTimeout {
+            status: 503,
+            timeout_seconds: 2,
+        };
+        let body = codex_proxy_error_json("Busy Provider", "gpt-5.6-sol", "/responses", &error);
+
+        assert_eq!(body["error"]["code"], "cc_switch_upstream_body_timeout");
+        assert_eq!(body["error"]["upstream_status"], 503);
+        assert!(body["error"]["message"].as_str().unwrap().contains("2秒"));
     }
 
     #[test]

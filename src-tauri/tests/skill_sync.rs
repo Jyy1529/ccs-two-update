@@ -18,13 +18,13 @@ fn write_skill(dir: &std::path::Path, name: &str) {
 }
 
 #[cfg(unix)]
-fn symlink_dir(src: &std::path::Path, dest: &std::path::Path) {
-    std::os::unix::fs::symlink(src, dest).expect("create symlink");
+fn symlink_dir(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(src, dest)
 }
 
 #[cfg(windows)]
-fn symlink_dir(src: &std::path::Path, dest: &std::path::Path) {
-    std::os::windows::fs::symlink_dir(src, dest).expect("create symlink");
+fn symlink_dir(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(src, dest)
 }
 
 #[test]
@@ -133,8 +133,19 @@ fn sync_to_app_removes_disabled_and_orphaned_ssot_symlinks() {
 
     let opencode_skills_dir = home.join(".config").join("opencode").join("skills");
     fs::create_dir_all(&opencode_skills_dir).expect("create opencode skills dir");
-    symlink_dir(&disabled_skill, &opencode_skills_dir.join("disabled-skill"));
-    symlink_dir(&orphan_skill, &opencode_skills_dir.join("orphan-skill"));
+    let create_links = || -> std::io::Result<()> {
+        symlink_dir(&disabled_skill, &opencode_skills_dir.join("disabled-skill"))?;
+        symlink_dir(&orphan_skill, &opencode_skills_dir.join("orphan-skill"))?;
+        Ok(())
+    };
+    if let Err(error) = create_links() {
+        #[cfg(windows)]
+        if error.raw_os_error() == Some(1314) {
+            eprintln!("skipping symlink cleanup test: Windows symlink privilege is unavailable");
+            return;
+        }
+        panic!("create symlink: {error}");
+    }
 
     let state = create_test_state().expect("create test state");
     state

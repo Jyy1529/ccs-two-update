@@ -135,6 +135,14 @@ pub async fn get_config_status(
 
             Ok(ConfigStatus { exists, path })
         }
+        AppType::DeepSeek => {
+            let exists = crate::deepseek_config::config_exists();
+            let path = crate::deepseek_config::get_deepseek_dir()
+                .to_string_lossy()
+                .to_string();
+
+            Ok(ConfigStatus { exists, path })
+        }
         AppType::Pi => {
             let config_path = crate::pi_config::get_pi_models_path().map_err(|e| e.to_string())?;
             let path = crate::pi_config::get_pi_agent_dir()
@@ -167,6 +175,7 @@ pub async fn get_config_dir(app: String) -> Result<String, String> {
         AppType::OpenCode => crate::opencode_config::get_opencode_dir(),
         AppType::OpenClaw => crate::openclaw_config::get_openclaw_dir(),
         AppType::Hermes => crate::hermes_config::get_hermes_dir(),
+        AppType::DeepSeek => crate::deepseek_config::get_deepseek_dir(),
         AppType::Pi => crate::pi_config::get_pi_agent_dir().map_err(|e| e.to_string())?,
     };
 
@@ -186,6 +195,7 @@ pub async fn open_config_folder(handle: AppHandle, app: String) -> Result<bool, 
         AppType::OpenCode => crate::opencode_config::get_opencode_dir(),
         AppType::OpenClaw => crate::openclaw_config::get_openclaw_dir(),
         AppType::Hermes => crate::hermes_config::get_hermes_dir(),
+        AppType::DeepSeek => crate::deepseek_config::get_deepseek_dir(),
         AppType::Pi => crate::pi_config::get_pi_agent_dir().map_err(|e| e.to_string())?,
     };
 

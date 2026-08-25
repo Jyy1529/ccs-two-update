@@ -1,6 +1,17 @@
 use crate::error::AppError;
 use auto_launch::{AutoLaunch, AutoLaunchBuilder};
 
+#[cfg(target_os = "windows")]
+use winreg::{
+    enums::{HKEY_CURRENT_USER, KEY_SET_VALUE},
+    RegKey,
+};
+
+const APP_NAME: &str = "CC Switch";
+
+#[cfg(target_os = "windows")]
+const AUTO_LAUNCH_REGKEY: &str = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
+
 /// 获取 macOS 上的 .app bundle 路径
 /// 将 `/path/to/CC Switch.app/Contents/MacOS/CC Switch` 转换为 `/path/to/CC Switch.app`
 #[cfg(target_os = "macos")]
@@ -17,7 +28,6 @@ fn get_macos_app_bundle_path(exe_path: &std::path::Path) -> Option<std::path::Pa
 
 /// 初始化 AutoLaunch 实例
 fn get_auto_launch() -> Result<AutoLaunch, AppError> {
-    let app_name = "CC Switch";
     let exe_path =
         std::env::current_exe().map_err(|e| AppError::Message(format!("无法获取应用路径: {e}")))?;
 
@@ -32,7 +42,7 @@ fn get_auto_launch() -> Result<AutoLaunch, AppError> {
     // macOS: 使用 AppleScript 方式（默认），需要 .app bundle 路径
     // Windows/Linux: 使用注册表/XDG autostart
     let auto_launch = AutoLaunchBuilder::new()
-        .set_app_name(app_name)
+        .set_app_name(APP_NAME)
         .set_app_path(&app_path.to_string_lossy())
         .build()
         .map_err(|e| AppError::Message(format!("创建 AutoLaunch 失败: {e}")))?;
@@ -46,6 +56,10 @@ pub fn enable_auto_launch() -> Result<(), AppError> {
     auto_launch
         .enable()
         .map_err(|e| AppError::Message(format!("启用开机自启失败: {e}")))?;
+
+    #[cfg(target_os = "windows")]
+    write_windows_registration_command()?;
+
     log::info!("已启用开机自启");
     Ok(())
 }
@@ -63,15 +77,115 @@ pub fn disable_auto_launch() -> Result<(), AppError> {
 /// 检查是否已启用开机自启
 pub fn is_auto_launch_enabled() -> Result<bool, AppError> {
     let auto_launch = get_auto_launch()?;
-    auto_launch
+    let enabled = auto_launch
         .is_enabled()
-        .map_err(|e| AppError::Message(format!("检查开机自启状态失败: {e}")))
+        .map_err(|e| AppError::Message(format!("检查开机自启状态失败: {e}")))?;
+
+    #[cfg(target_os = "windows")]
+    return Ok(enabled && registration_targets_current_exe()?);
+
+    #[cfg(not(target_os = "windows"))]
+    Ok(enabled)
+}
+
+#[cfg(target_os = "windows")]
+fn quoted_registration_command(executable: &std::path::Path) -> String {
+    format!("\"{}\"", executable.to_string_lossy().replace('"', "\\\""))
+}
+
+#[cfg(target_os = "windows")]
+fn write_windows_registration_command() -> Result<(), AppError> {
+    let executable = std::env::current_exe()
+        .map_err(|error| AppError::Message(format!("无法获取应用路径: {error}")))?;
+    let run_key = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(AUTO_LAUNCH_REGKEY, KEY_SET_VALUE)
+        .map_err(|error| AppError::Message(format!("无法写入开机自启注册项: {error}")))?;
+    let command = quoted_registration_command(&executable);
+    run_key
+        .set_value(APP_NAME, &command)
+        .map_err(|error| AppError::Message(format!("无法写入开机自启命令: {error}")))
+}
+
+#[cfg(target_os = "windows")]
+fn registration_command_targets_executable(command: &str, executable: &std::path::Path) -> bool {
+    let command = command.trim();
+    let quoted = quoted_registration_command(executable);
+    command
+        .strip_prefix(&quoted)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+}
+
+#[cfg(target_os = "windows")]
+fn registration_targets_current_exe() -> Result<bool, AppError> {
+    let executable = std::env::current_exe()
+        .map_err(|error| AppError::Message(format!("无法获取应用路径: {error}")))?;
+    let run_key = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(AUTO_LAUNCH_REGKEY)
+        .map_err(|error| AppError::Message(format!("无法读取开机自启注册项: {error}")))?;
+    let command = match run_key.get_value::<String, _>(APP_NAME) {
+        Ok(command) => command,
+        Err(_) => return Ok(false),
+    };
+
+    Ok(registration_command_targets_executable(
+        &command,
+        &executable,
+    ))
+}
+
+fn should_repair_auto_launch(configured: bool, registered: bool) -> bool {
+    configured && !registered
+}
+
+pub fn reconcile_auto_launch(configured: bool) -> Result<bool, AppError> {
+    if !should_repair_auto_launch(configured, is_auto_launch_enabled()?) {
+        return Ok(false);
+    }
+
+    enable_auto_launch()?;
+    log::info!("已修复开机自启注册项");
+    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     #[allow(unused_imports)]
     use super::*;
+
+    #[test]
+    fn startup_repair_is_needed_only_for_enabled_but_missing_registration() {
+        assert!(should_repair_auto_launch(true, false));
+        assert!(!should_repair_auto_launch(true, true));
+        assert!(!should_repair_auto_launch(false, false));
+        assert!(!should_repair_auto_launch(false, true));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn startup_registration_must_target_the_current_executable() {
+        let executable = std::path::Path::new(r"D:\Code Switch\CC Switch\cc-switch.exe");
+
+        assert!(registration_command_targets_executable(
+            r#""D:\Code Switch\CC Switch\cc-switch.exe" "#,
+            executable
+        ));
+        assert!(registration_command_targets_executable(
+            r#""D:\Code Switch\CC Switch\cc-switch.exe" --silent"#,
+            executable
+        ));
+        assert!(!registration_command_targets_executable(
+            r#"D:\Old Install\cc-switch.exe"#,
+            executable
+        ));
+        assert!(!registration_command_targets_executable(
+            r"D:\Code Switch\CC Switch\cc-switch.exe ",
+            executable
+        ));
+        assert!(!registration_command_targets_executable(
+            r"D:\Code Switch\CC Switch\cc-switch.exe.bak",
+            executable
+        ));
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

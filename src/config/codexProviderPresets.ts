@@ -506,17 +506,20 @@ requires_openai_auth = true`,
   },
   {
     name: "TeamoRouter",
-    websiteUrl: "https://teamorouter.com",
+    websiteUrl: "https://teamorouter.cn",
     apiKeyUrl:
-      "https://teamorouter.com/?utm_source=cc_switch&utm_medium=referral&utm_campaign=ai_directory",
+      "https://teamorouter.cn/?utm_source=cc_switch&utm_medium=referral&utm_campaign=ai_directory",
     category: "aggregator",
     auth: generateThirdPartyAuth(""),
     config: generateThirdPartyConfig(
       "teamorouter",
-      "https://api.teamorouter.com/v1",
+      "https://api.teamorouter.cn/v1",
       "gpt-5.6-sol",
     ),
-    endpointCandidates: ["https://api.teamorouter.com/v1"],
+    endpointCandidates: [
+      "https://api.teamorouter.cn/v1",
+      "https://api.teamorouter.com/v1",
+    ],
     isPartner: true,
     partnerPromotionKey: "teamorouter",
     icon: "teamorouter",
@@ -1136,6 +1139,38 @@ requires_openai_auth = true`,
     category: "cn_official",
     icon: "deepseek",
     iconColor: "#1E88E5",
+  },
+  {
+    name: "Pi AI (Inflection)",
+    websiteUrl: "https://pi.ai",
+    apiKeyUrl: "https://aimlapi.com",
+    auth: generateThirdPartyAuth(""),
+    config: generateThirdPartyConfig(
+      "pi_inflection",
+      "https://api.aimlapi.com/v1",
+      "inflection/inflection-3-pi",
+    ),
+    endpointCandidates: ["https://api.aimlapi.com/v1"],
+    // Pi AI (Inflection) 没有直接官方 API，通过 AIML API 聚合器访问
+    // 使用 Chat Completions API，需要本地路由转换
+    apiFormat: "openai_chat",
+    modelCatalog: modelCatalog([
+      {
+        model: "inflection/inflection-3-pi",
+        displayName: "Inflection 3 Pi",
+        contextWindow: 128000,
+        inputModalities: ["text"],
+      },
+      {
+        model: "inflection/inflection-3-productivity",
+        displayName: "Inflection 3 Productivity",
+        contextWindow: 128000,
+        inputModalities: ["text"],
+      },
+    ]),
+    category: "third_party",
+    icon: "pi",
+    iconColor: "#FF6B6B",
   },
   {
     name: "Zhipu GLM",

@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { Loader2, Plus } from "lucide-react";
 import { toast } from "sonner";
@@ -37,7 +44,10 @@ interface AddProviderDialogProps {
       ensureClaudeDesktopOfficialSeed?: boolean;
       ensureGrokBuildOfficialSeed?: boolean;
     },
-  ) => Promise<void> | void;
+  ) => Promise<Provider | void> | Provider | void;
+  onRequestAddProvider?: (onCreated: (providerId: string) => void) => void;
+  escapeEnabled?: boolean;
+  appSpecificOnly?: boolean;
 }
 
 export function AddProviderDialog({
@@ -45,16 +55,22 @@ export function AddProviderDialog({
   onOpenChange,
   appId,
   onSubmit,
+  onRequestAddProvider,
+  escapeEnabled = true,
+  appSpecificOnly = false,
 }: AddProviderDialogProps) {
   const { t } = useTranslation();
+  const formId = useId();
   // OpenCode and OpenClaw don't support universal providers
   const showUniversalTab =
+    !appSpecificOnly &&
     appId !== "opencode" &&
     appId !== "openclaw" &&
     appId !== "hermes" &&
     appId !== "pi" &&
     appId !== "grokbuild" &&
-    appId !== "claude-desktop";
+    appId !== "claude-desktop" &&
+    appId !== "deepseek";
   const [activeTab, setActiveTab] = useState<"app-specific" | "universal">(
     "app-specific",
   );
@@ -370,7 +386,7 @@ export function AddProviderDialog({
         </Button>
         <Button
           type="submit"
-          form="provider-form"
+          form={formId}
           disabled={isFormSubmitting || !isFormReady}
           className="bg-primary text-primary-foreground hover:bg-primary/90"
         >
@@ -406,6 +422,7 @@ export function AddProviderDialog({
       isOpen={open}
       title={t("provider.addNewProvider")}
       onClose={handlePanelClose}
+      escapeEnabled={escapeEnabled}
       footer={footer}
       contentClassName={appId === "pi" ? "pt-3 pb-0" : "pt-3"}
     >
@@ -433,6 +450,8 @@ export function AddProviderDialog({
               onSubmittingChange={setIsFormSubmitting}
               onSubmitReadyChange={handleSubmitReadyChange}
               showButtons={false}
+              formId={formId}
+              onRequestAddProvider={onRequestAddProvider}
             />
           </TabsContent>
 
@@ -451,6 +470,8 @@ export function AddProviderDialog({
           onSubmittingChange={setIsFormSubmitting}
           onSubmitReadyChange={handleSubmitReadyChange}
           showButtons={false}
+          formId={formId}
+          onRequestAddProvider={onRequestAddProvider}
         />
       )}
 

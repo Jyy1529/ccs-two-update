@@ -378,6 +378,7 @@ command = "say"
                 grokbuild: false,
                 opencode: false,
                 hermes: false,
+                ..Default::default()
             },
             description: None,
             homepage: None,
@@ -649,7 +650,14 @@ fn switch_provider_codex_missing_auth_returns_error_and_keeps_state() {
             msg.contains("auth"),
             "expected auth missing error message, got {msg}"
         ),
-        other => panic!("expected config error, got {other:?}"),
+        AppError::Localized { key, zh, en } => {
+            assert_eq!(key, "provider.codex.auth.missing");
+            assert!(
+                zh.contains("auth") && en.contains("auth"),
+                "expected localized auth missing messages, got zh={zh}, en={en}"
+            );
+        }
+        other => panic!("expected auth configuration error, got {other:?}"),
     }
 
     let current_id = app_state

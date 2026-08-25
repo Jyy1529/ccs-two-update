@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { FormLabel } from "@/components/ui/form";
 import { Download, Info, Loader2 } from "lucide-react";
@@ -12,6 +12,7 @@ import {
   type FetchedModel,
 } from "@/lib/api/model-fetch";
 import type { ProviderCategory } from "@/types";
+import { ProviderAdvancedOptionsSection } from "./ProviderAdvancedConfig";
 
 interface EndpointCandidate {
   url: string;
@@ -46,6 +47,7 @@ interface GeminiFormFieldsProps {
 
   // Speed Test Endpoints
   speedTestEndpoints: EndpointCandidate[];
+  advancedOptionsContent?: ReactNode;
 }
 
 export function GeminiFormFields({
@@ -70,6 +72,7 @@ export function GeminiFormFields({
   model,
   onModelChange,
   speedTestEndpoints,
+  advancedOptionsContent,
 }: GeminiFormFieldsProps) {
   const { t } = useTranslation();
 
@@ -190,6 +193,12 @@ export function GeminiFormFields({
             isLoading={isFetchingModels}
           />
         </div>
+      )}
+
+      {advancedOptionsContent && (
+        <ProviderAdvancedOptionsSection>
+          {advancedOptionsContent}
+        </ProviderAdvancedOptionsSection>
       )}
 
       {/* 端点测速弹窗 */}

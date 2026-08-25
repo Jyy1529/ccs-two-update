@@ -32,6 +32,13 @@ import type { ProviderFormProps, ProviderFormValues } from "./ProviderForm";
 import { BasicFormFields } from "./BasicFormFields";
 import { CodexFormFields } from "./CodexFormFields";
 import { ProviderPresetSelector } from "./ProviderPresetSelector";
+import { ProviderAdvancedOptionsSection } from "./ProviderAdvancedConfig";
+import {
+  defaultLocalProxyRetryPolicy,
+  normalizeLocalProxyRetryPolicy,
+  ProviderRetryPolicyConfig,
+  validateLocalProxyRetryPolicy,
+} from "./ProviderRetryPolicyConfig";
 import {
   grokBuildOfficialPreset,
   grokBuildProviderPresets,
@@ -52,6 +59,10 @@ import {
 } from "@/utils/grokBuildConfig";
 import { resolveProviderIcon } from "@/utils/providerIcon";
 import { GROKBUILD_OFFICIAL_PROVIDER_ID } from "@/utils/providerCapabilities";
+import {
+  featureScopeAllows,
+  useProviderFeatureScopes,
+} from "@/lib/featureScopes";
 
 type GrokBuildProviderFormProps = Omit<ProviderFormProps, "appId">;
 
@@ -76,6 +87,7 @@ export function GrokBuildProviderForm({
   onSubmittingChange,
   initialData,
   showButtons = true,
+  formId = "provider-form",
 }: GrokBuildProviderFormProps) {
   const { t } = useTranslation();
   const isDarkMode = useDarkMode();
@@ -155,6 +167,11 @@ export function GrokBuildProviderForm({
   const [presetEndpoints, setPresetEndpoints] = useState<string[]>([]);
   const [draftCustomEndpoints, setDraftCustomEndpoints] = useState<string[]>(
     [],
+  );
+  const [localProxyRetryPolicy, setLocalProxyRetryPolicy] = useState(() =>
+    initialData?.meta?.localProxyRetryPolicy
+      ? normalizeLocalProxyRetryPolicy(initialData.meta.localProxyRetryPolicy)
+      : defaultLocalProxyRetryPolicy(),
   );
 
   const form = useForm<ProviderFormData>({
@@ -302,6 +319,22 @@ export function GrokBuildProviderForm({
 
   const handleSubmit = async (values: ProviderFormData) => {
     const name = values.name.trim();
+    const retryPolicyError = validateLocalProxyRetryPolicy(
+      localProxyRetryPolicy,
+    );
+    if (retryPolicyError) {
+      toast.error(
+        t(`providerAdvanced.retryValidation.${retryPolicyError}`, {
+          defaultValue:
+            retryPolicyError === "maxRetries"
+              ? "Additional retries must be an integer from 0 to 100."
+              : retryPolicyError === "retryDelayMs"
+                ? "Retry interval must be an integer from 1 to 60000 ms."
+                : "Choose at least one error type or enter an error message when retries are enabled.",
+        }),
+      );
+      return;
+    }
 
     // 官方条目：config 快照原样透传（新增时为空），不做自定义模型字段校验，
     // 也不重建 config —— 新增走 ensure seed，编辑只允许改名称/图标等元信息。
@@ -315,7 +348,12 @@ export function GrokBuildProviderForm({
         presetId: selectedPresetId ?? undefined,
         presetCategory: "official",
         isPartner: false,
-        meta: initialData?.meta,
+        meta: {
+          ...(initialData?.meta ?? {}),
+          localProxyRetryPolicy: normalizeLocalProxyRetryPolicy(
+            localProxyRetryPolicy,
+          ),
+        },
       });
       return;
     }
@@ -395,6 +433,9 @@ export function GrokBuildProviderForm({
       codexChatReasoning,
       customUserAgent: customUserAgent.trim() || undefined,
       localProxyRequestOverrides: requestOverrides.overrides,
+      localProxyRetryPolicy: normalizeLocalProxyRetryPolicy(
+        localProxyRetryPolicy,
+      ),
       maxOutputTokens:
         Number.isInteger(parsedMaxOutputTokens) && parsedMaxOutputTokens > 0
           ? parsedMaxOutputTokens
@@ -418,12 +459,25 @@ export function GrokBuildProviderForm({
     await onSubmit(payload);
   };
 
+  // 自动重试按「功能生效范围」设置决定是否显示（Grok Build 对应 appId=grokbuild）
+  const featureScopes = useProviderFeatureScopes();
+  const supportsLocalProxyRetry = featureScopeAllows(
+    featureScopes.localProxyRetry,
+    "grokbuild",
+  );
+  const retryAdvancedOptions = supportsLocalProxyRetry ? (
+    <ProviderRetryPolicyConfig
+      idPrefix="grokbuild-provider-retry"
+      value={localProxyRetryPolicy}
+      onChange={setLocalProxyRetryPolicy}
+    />
+  ) : undefined;
   const rawConfigError = validateGrokBuildConfig(rawConfig);
 
   return (
     <Form {...form}>
       <form
-        id="provider-form"
+        id={formId}
         onSubmit={form.handleSubmit(handleSubmit)}
         className="space-y-6 glass rounded-xl p-6 border border-white/10"
       >
@@ -493,6 +547,7 @@ export function GrokBuildProviderForm({
               onLocalProxyHeadersOverrideChange={setHeadersOverride}
               localProxyBodyOverride={bodyOverride}
               onLocalProxyBodyOverrideChange={setBodyOverride}
+              advancedOptionsContent={retryAdvancedOptions}
             />
 
             <FormItem>
@@ -539,6 +594,12 @@ export function GrokBuildProviderForm({
               )}
             </div>
           </>
+        )}
+
+        {category === "official" && (
+          <ProviderAdvancedOptionsSection>
+            {retryAdvancedOptions}
+          </ProviderAdvancedOptionsSection>
         )}
 
         <FormField

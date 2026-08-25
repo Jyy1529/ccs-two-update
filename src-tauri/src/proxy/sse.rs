@@ -4,6 +4,75 @@ pub(crate) fn strip_sse_field<'a>(line: &'a str, field: &str) -> Option<&'a str>
         .or_else(|| line.strip_prefix(&format!("{field}:")))
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct SseBlockCursor {
+    block_start: usize,
+    search_offset: usize,
+    #[cfg(test)]
+    examined_bytes: usize,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum SseScanResult<'a> {
+    Block(&'a str),
+    NeedMoreData,
+    BudgetExhausted,
+}
+
+impl SseBlockCursor {
+    pub(crate) fn next_block_budgeted<'a>(
+        &mut self,
+        buffer: &'a str,
+        remaining_budget: &mut usize,
+    ) -> SseScanResult<'a> {
+        if *remaining_budget == 0 {
+            return SseScanResult::BudgetExhausted;
+        }
+
+        let bytes = buffer.as_bytes();
+        let mut offset = self.search_offset.max(self.block_start).min(bytes.len());
+
+        while offset < bytes.len() {
+            if *remaining_budget == 0 {
+                self.search_offset = offset;
+                return SseScanResult::BudgetExhausted;
+            }
+            *remaining_budget -= 1;
+
+            #[cfg(test)]
+            {
+                self.examined_bytes += 1;
+            }
+
+            let delimiter_len = if bytes[offset..].starts_with(b"\r\n\r\n") {
+                4
+            } else if bytes[offset..].starts_with(b"\n\n") {
+                2
+            } else {
+                offset += 1;
+                continue;
+            };
+
+            let block_start = self.block_start;
+            self.block_start = offset + delimiter_len;
+            self.search_offset = self.block_start;
+            return SseScanResult::Block(&buffer[block_start..offset]);
+        }
+
+        self.search_offset = bytes.len().saturating_sub(3).max(self.block_start);
+        SseScanResult::NeedMoreData
+    }
+
+    pub(crate) fn remaining<'a>(&self, buffer: &'a str) -> &'a str {
+        &buffer[self.block_start.min(buffer.len())..]
+    }
+
+    #[cfg(test)]
+    fn examined_bytes(&self) -> usize {
+        self.examined_bytes
+    }
+}
+
 #[inline]
 pub(crate) fn take_sse_block(buffer: &mut String) -> Option<String> {
     let mut best: Option<(usize, usize)> = None;
@@ -87,7 +156,7 @@ pub(crate) fn append_utf8_safe(buffer: &mut String, remainder: &mut Vec<u8>, new
 
 #[cfg(test)]
 mod tests {
-    use super::{append_utf8_safe, strip_sse_field, take_sse_block};
+    use super::{append_utf8_safe, strip_sse_field, SseBlockCursor, SseScanResult};
 
     #[test]
     fn strip_sse_field_accepts_optional_space() {
@@ -111,25 +180,95 @@ mod tests {
     }
 
     #[test]
-    fn take_sse_block_supports_lf_delimiters() {
-        let mut buffer = "data: {\"ok\":true}\n\nrest".to_string();
+    fn sse_block_cursor_supports_lf_delimiters() {
+        let buffer = "data: {\"ok\":true}\n\nrest";
+        let mut cursor = SseBlockCursor::default();
+        let mut budget = usize::MAX;
 
         assert_eq!(
-            take_sse_block(&mut buffer),
-            Some("data: {\"ok\":true}".to_string())
+            cursor.next_block_budgeted(buffer, &mut budget),
+            SseScanResult::Block("data: {\"ok\":true}")
         );
-        assert_eq!(buffer, "rest");
+        assert_eq!(cursor.remaining(buffer), "rest");
     }
 
     #[test]
-    fn take_sse_block_supports_crlf_delimiters() {
-        let mut buffer = "data: {\"ok\":true}\r\n\r\nrest".to_string();
+    fn sse_block_cursor_supports_crlf_delimiters() {
+        let buffer = "data: {\"ok\":true}\r\n\r\nrest";
+        let mut cursor = SseBlockCursor::default();
+        let mut budget = usize::MAX;
 
         assert_eq!(
-            take_sse_block(&mut buffer),
-            Some("data: {\"ok\":true}".to_string())
+            cursor.next_block_budgeted(buffer, &mut budget),
+            SseScanResult::Block("data: {\"ok\":true}")
         );
-        assert_eq!(buffer, "rest");
+        assert_eq!(cursor.remaining(buffer), "rest");
+    }
+
+    #[test]
+    fn sse_block_cursor_finds_delimiter_split_across_appends() {
+        let mut buffer = "data: {\"ok\":true}\r\n\r".to_string();
+        let mut cursor = SseBlockCursor::default();
+        let mut budget = usize::MAX;
+
+        assert_eq!(
+            cursor.next_block_budgeted(&buffer, &mut budget),
+            SseScanResult::NeedMoreData
+        );
+        buffer.push_str("\nrest");
+        assert_eq!(
+            cursor.next_block_budgeted(&buffer, &mut budget),
+            SseScanResult::Block("data: {\"ok\":true}")
+        );
+        assert_eq!(cursor.remaining(&buffer), "rest");
+    }
+
+    #[test]
+    fn sse_block_cursor_scans_large_empty_event_batch_linearly_with_budget_exhaustion() {
+        let buffer = "\n\n".repeat(128 * 1024);
+        let mut cursor = SseBlockCursor::default();
+        let mut blocks = 0usize;
+        let mut budget_exhaustions = 0usize;
+        let mut budget = 16 * 1024;
+
+        loop {
+            match cursor.next_block_budgeted(&buffer, &mut budget) {
+                SseScanResult::Block(block) => {
+                    assert!(block.is_empty());
+                    blocks += 1;
+                }
+                SseScanResult::BudgetExhausted => {
+                    budget_exhaustions += 1;
+                    budget = 16 * 1024;
+                }
+                SseScanResult::NeedMoreData => break,
+            }
+        }
+
+        assert_eq!(blocks, 128 * 1024);
+        assert!(budget_exhaustions > 0);
+        assert!(cursor.remaining(&buffer).is_empty());
+        assert!(cursor.examined_bytes() <= buffer.len());
+    }
+
+    #[test]
+    fn sse_block_cursor_stops_at_budget_without_a_delimiter() {
+        let buffer = "x".repeat(32 * 1024);
+        let mut cursor = SseBlockCursor::default();
+        let mut budget = 16 * 1024;
+
+        assert_eq!(
+            cursor.next_block_budgeted(&buffer, &mut budget),
+            SseScanResult::BudgetExhausted
+        );
+        assert_eq!(cursor.examined_bytes(), 16 * 1024);
+
+        budget = 16 * 1024;
+        assert_eq!(
+            cursor.next_block_budgeted(&buffer, &mut budget),
+            SseScanResult::NeedMoreData
+        );
+        assert_eq!(cursor.examined_bytes(), buffer.len());
     }
 
     // ------------------------------------------------------------------

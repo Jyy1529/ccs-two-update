@@ -19,6 +19,10 @@ pub struct McpApps {
     pub opencode: bool,
     #[serde(default)]
     pub hermes: bool,
+    #[serde(default)]
+    pub deepseek: bool,
+    #[serde(default)]
+    pub pi: bool,
 }
 
 impl McpApps {
@@ -32,8 +36,8 @@ impl McpApps {
             AppType::OpenCode => self.opencode,
             AppType::OpenClaw => false, // OpenClaw doesn't support MCP
             AppType::Hermes => self.hermes,
-            AppType::Pi => false, // Pi core has no native MCP registry.
             AppType::ClaudeDesktop => false,
+            AppType::DeepSeek | AppType::Pi => false,
         }
     }
 
@@ -47,8 +51,8 @@ impl McpApps {
             AppType::OpenCode => self.opencode = enabled,
             AppType::OpenClaw => {} // OpenClaw doesn't support MCP, ignore
             AppType::Hermes => self.hermes = enabled,
-            AppType::Pi => {}            // Pi core has no native MCP registry.
             AppType::ClaudeDesktop => {} // Claude Desktop 3P provider config doesn't support MCP here
+            AppType::DeepSeek | AppType::Pi => {}
         }
     }
 
@@ -103,6 +107,8 @@ pub struct SkillApps {
     #[serde(default)]
     pub hermes: bool,
     #[serde(default)]
+    pub deepseek: bool,
+    #[serde(default)]
     pub pi: bool,
 }
 
@@ -116,9 +122,10 @@ impl SkillApps {
             AppType::GrokBuild => self.grokbuild,
             AppType::OpenCode => self.opencode,
             AppType::Hermes => self.hermes,
-            AppType::Pi => self.pi,
             AppType::OpenClaw => false, // OpenClaw doesn't support Skills
             AppType::ClaudeDesktop => false,
+            AppType::DeepSeek => self.deepseek,
+            AppType::Pi => self.pi,
         }
     }
 
@@ -131,9 +138,10 @@ impl SkillApps {
             AppType::GrokBuild => self.grokbuild = enabled,
             AppType::OpenCode => self.opencode = enabled,
             AppType::Hermes => self.hermes = enabled,
-            AppType::Pi => self.pi = enabled,
             AppType::OpenClaw => {} // OpenClaw doesn't support Skills, ignore
             AppType::ClaudeDesktop => {} // Claude Desktop 3P profiles don't use CC Switch skill sync
+            AppType::DeepSeek => self.deepseek = enabled,
+            AppType::Pi => self.pi = enabled,
         }
     }
 
@@ -158,6 +166,9 @@ impl SkillApps {
         if self.hermes {
             apps.push(AppType::Hermes);
         }
+        if self.deepseek {
+            apps.push(AppType::DeepSeek);
+        }
         if self.pi {
             apps.push(AppType::Pi);
         }
@@ -172,6 +183,7 @@ impl SkillApps {
             && !self.grokbuild
             && !self.opencode
             && !self.hermes
+            && !self.deepseek
             && !self.pi
     }
 
@@ -316,6 +328,12 @@ pub struct McpRoot {
     /// Hermes MCP 配置（实际使用 config.yaml）
     #[serde(default, skip_serializing_if = "McpConfig::is_empty")]
     pub hermes: McpConfig,
+    /// DeepSeek MCP 配置
+    #[serde(default, skip_serializing_if = "McpConfig::is_empty")]
+    pub deepseek: McpConfig,
+    /// Pi MCP 配置
+    #[serde(default, skip_serializing_if = "McpConfig::is_empty")]
+    pub pi: McpConfig,
 }
 
 impl Default for McpRoot {
@@ -332,6 +350,8 @@ impl Default for McpRoot {
             opencode: McpConfig::default(),
             openclaw: McpConfig::default(),
             hermes: McpConfig::default(),
+            deepseek: McpConfig::default(),
+            pi: McpConfig::default(),
         }
     }
 }
@@ -367,6 +387,10 @@ pub struct PromptRoot {
     pub openclaw: PromptConfig,
     #[serde(default)]
     pub hermes: PromptConfig,
+    #[serde(default)]
+    pub deepseek: PromptConfig,
+    #[serde(default)]
+    pub pi: PromptConfig,
 }
 
 use crate::config::{copy_file, get_app_config_dir, get_app_config_path, write_json_file};
@@ -391,6 +415,7 @@ pub enum AppType {
     OpenCode,
     OpenClaw,
     Hermes,
+    DeepSeek,
     Pi,
 }
 
@@ -405,6 +430,7 @@ impl AppType {
             AppType::OpenCode => "opencode",
             AppType::OpenClaw => "openclaw",
             AppType::Hermes => "hermes",
+            AppType::DeepSeek => "deepseek",
             AppType::Pi => "pi",
         }
     }
@@ -439,6 +465,7 @@ impl AppType {
             AppType::OpenCode,
             AppType::OpenClaw,
             AppType::Hermes,
+            AppType::DeepSeek,
             AppType::Pi,
         ]
         .into_iter()
@@ -459,11 +486,12 @@ impl FromStr for AppType {
             "opencode" => Ok(AppType::OpenCode),
             "openclaw" => Ok(AppType::OpenClaw),
             "hermes" => Ok(AppType::Hermes),
+            "deepseek" => Ok(AppType::DeepSeek),
             "pi" => Ok(AppType::Pi),
             other => Err(AppError::localized(
                 "unsupported_app",
-                format!("不支持的应用标识: '{other}'。可选值: claude, claude-desktop, codex, gemini, grokbuild, opencode, openclaw, hermes, pi。"),
-                format!("Unsupported app id: '{other}'. Allowed: claude, claude-desktop, codex, gemini, grokbuild, opencode, openclaw, hermes, pi."),
+                format!("不支持的应用标识: '{other}'。可选值: claude, claude-desktop, codex, gemini, grokbuild, opencode, openclaw, hermes, deepseek, pi。"),
+                format!("Unsupported app id: '{other}'. Allowed: claude, claude-desktop, codex, gemini, grokbuild, opencode, openclaw, hermes, deepseek, pi."),
             )),
         }
     }
@@ -503,7 +531,8 @@ impl CommonConfigSnippets {
             AppType::OpenCode => self.opencode.as_ref(),
             AppType::OpenClaw => self.openclaw.as_ref(),
             AppType::Hermes => self.hermes.as_ref(),
-            AppType::Pi => None,
+            // DeepSeek / Pi 暂不支持通用配置片段
+            AppType::DeepSeek | AppType::Pi => None,
         }
     }
 
@@ -518,7 +547,8 @@ impl CommonConfigSnippets {
             AppType::OpenCode => self.opencode = snippet,
             AppType::OpenClaw => self.openclaw = snippet,
             AppType::Hermes => self.hermes = snippet,
-            AppType::Pi => {}
+            // DeepSeek / Pi 暂不支持通用配置片段
+            AppType::DeepSeek | AppType::Pi => {}
         }
     }
 }
@@ -563,6 +593,8 @@ impl Default for MultiAppConfig {
         apps.insert("opencode".to_string(), ProviderManager::default());
         apps.insert("openclaw".to_string(), ProviderManager::default());
         apps.insert("hermes".to_string(), ProviderManager::default());
+        apps.insert("deepseek".to_string(), ProviderManager::default());
+        apps.insert("pi".to_string(), ProviderManager::default());
 
         Self {
             version: 2,
@@ -715,6 +747,38 @@ impl MultiAppConfig {
         }
     }
 
+    /// 获取指定客户端的 MCP 配置（不可变引用）
+    pub fn mcp_for(&self, app: &AppType) -> &McpConfig {
+        match app {
+            AppType::Claude => &self.mcp.claude,
+            AppType::ClaudeDesktop => &self.mcp.claude_desktop,
+            AppType::Codex => &self.mcp.codex,
+            AppType::Gemini => &self.mcp.gemini,
+            AppType::GrokBuild => &self.mcp.grokbuild,
+            AppType::OpenCode => &self.mcp.opencode,
+            AppType::OpenClaw => &self.mcp.openclaw,
+            AppType::Hermes => &self.mcp.hermes,
+            AppType::DeepSeek => &self.mcp.deepseek,
+            AppType::Pi => &self.mcp.pi,
+        }
+    }
+
+    /// 获取指定客户端的 MCP 配置（可变引用）
+    pub fn mcp_for_mut(&mut self, app: &AppType) -> &mut McpConfig {
+        match app {
+            AppType::Claude => &mut self.mcp.claude,
+            AppType::ClaudeDesktop => &mut self.mcp.claude_desktop,
+            AppType::Codex => &mut self.mcp.codex,
+            AppType::Gemini => &mut self.mcp.gemini,
+            AppType::GrokBuild => &mut self.mcp.grokbuild,
+            AppType::OpenCode => &mut self.mcp.opencode,
+            AppType::OpenClaw => &mut self.mcp.openclaw,
+            AppType::Hermes => &mut self.mcp.hermes,
+            AppType::DeepSeek => &mut self.mcp.deepseek,
+            AppType::Pi => &mut self.mcp.pi,
+        }
+    }
+
     /// 创建默认配置并自动导入已存在的提示词文件
     fn default_with_auto_import() -> Result<Self, AppError> {
         log::info!("首次启动，创建默认配置并检测提示词文件");
@@ -842,6 +906,7 @@ impl MultiAppConfig {
             AppType::OpenCode => &mut config.prompts.opencode.prompts,
             AppType::OpenClaw => &mut config.prompts.openclaw.prompts,
             AppType::Hermes => &mut config.prompts.hermes.prompts,
+            AppType::DeepSeek => &mut config.prompts.deepseek.prompts,
             // Pi was added after prompts moved to SQLite. Keeping it out of
             // this legacy config avoids a second, unused prompt state.
             AppType::Pi => return Ok(false),
@@ -888,7 +953,7 @@ impl MultiAppConfig {
                 AppType::OpenCode => &self.mcp.opencode.servers,
                 AppType::OpenClaw => continue, // OpenClaw MCP is still in development, skip
                 AppType::Hermes => continue,   // Hermes didn't exist in v3.6.x, skip
-                AppType::Pi => continue,       // Pi didn't exist in v3.6.x, skip
+                AppType::DeepSeek | AppType::Pi => continue, // 新应用无 v3.6.x 旧数据
             };
 
             for (id, entry) in old_servers {
@@ -1019,6 +1084,34 @@ mod tests {
             AppType::ClaudeDesktop
         );
         assert_eq!(AppType::ClaudeDesktop.as_str(), "claude-desktop");
+    }
+
+    #[test]
+    fn skill_apps_project_deepseek_and_pi() {
+        let mut apps = SkillApps::default();
+        assert!(apps.is_empty());
+
+        apps.set_enabled_for(&AppType::DeepSeek, true);
+        apps.set_enabled_for(&AppType::Pi, true);
+
+        assert!(apps.is_enabled_for(&AppType::DeepSeek));
+        assert!(apps.is_enabled_for(&AppType::Pi));
+        assert_eq!(apps.enabled_apps(), vec![AppType::DeepSeek, AppType::Pi]);
+        assert!(!apps.is_empty());
+    }
+
+    #[test]
+    fn mcp_apps_ignore_legacy_deepseek_and_pi_flags() {
+        let apps = McpApps {
+            deepseek: true,
+            pi: true,
+            ..McpApps::default()
+        };
+
+        assert!(apps.is_empty());
+        assert!(!apps.is_enabled_for(&AppType::DeepSeek));
+        assert!(!apps.is_enabled_for(&AppType::Pi));
+        assert!(apps.enabled_apps().is_empty());
     }
 
     struct TempHome {

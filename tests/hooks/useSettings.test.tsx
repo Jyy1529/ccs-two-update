@@ -256,6 +256,35 @@ describe("useSettings hook", () => {
     expect(toastErrorMock).not.toHaveBeenCalled();
   });
 
+  it("preserves an explicitly disabled provider retry switch during unrelated auto-save", async () => {
+    serverSettings = {
+      ...serverSettings,
+      providerRetryEnabled: false,
+    };
+    useSettingsQueryMock.mockReturnValue({
+      data: serverSettings,
+      isLoading: false,
+    });
+    settingsFormMock = createSettingsFormMock({
+      settings: {
+        ...serverSettings,
+        language: "zh",
+      },
+    });
+    const { result } = renderHook(() => useSettings());
+
+    await act(async () => {
+      await result.current.autoSaveSettings({ minimizeToTrayOnClose: false });
+    });
+
+    expect(mutateAsyncMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        minimizeToTrayOnClose: false,
+        providerRetryEnabled: false,
+      }),
+    );
+  });
+
   it("saves settings and flags restart when app config directory changes", async () => {
     serverSettings = {
       ...serverSettings,

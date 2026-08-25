@@ -393,6 +393,8 @@ type = "stdio"
       codex: false,
       gemini: false,
       grokbuild: false,
+      deepseek: false,
+      pi: false,
     });
     expect(onSave).toHaveBeenCalledTimes(1);
     expect(onSave).toHaveBeenCalledWith();
@@ -445,9 +447,52 @@ type = "stdio"
       opencode: false,
       openclaw: false,
       hermes: false,
+      deepseek: false,
+      pi: false,
     });
     expect(onSave).toHaveBeenCalledTimes(1);
     expect(toastErrorMock).not.toHaveBeenCalled();
+  });
+
+  it("不展示 DeepSeek 和 Pi，并清理遗留启用状态", async () => {
+    const initialData: McpServer = {
+      id: "legacy-apps",
+      name: "Legacy apps",
+      server: { type: "stdio", command: "run" },
+      apps: {
+        claude: false,
+        codex: false,
+        gemini: false,
+        grokbuild: false,
+        opencode: false,
+        openclaw: false,
+        hermes: false,
+        deepseek: true,
+        pi: true,
+      },
+    } as McpServer;
+
+    renderForm({
+      editingId: "legacy-apps",
+      initialData,
+      defaultEnabledApps: ["deepseek", "pi"],
+    });
+
+    expect(
+      screen.queryByLabelText("mcp.unifiedPanel.apps.deepseek"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("mcp.unifiedPanel.apps.pi"),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("common.save"));
+
+    await waitFor(() => expect(upsertMock).toHaveBeenCalledTimes(1));
+    const [entry] = upsertMock.mock.calls.at(-1) ?? [];
+    expect(entry.apps).toMatchObject({
+      deepseek: false,
+      pi: false,
+    });
   });
 
   it("保存失败时展示翻译后的错误并恢复按钮", async () => {

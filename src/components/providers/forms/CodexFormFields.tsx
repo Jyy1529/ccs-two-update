@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { FormLabel } from "@/components/ui/form";
@@ -53,9 +60,14 @@ import {
 import { CustomUserAgentField } from "./CustomUserAgentField";
 import { LocalProxyRequestOverridesField } from "./LocalProxyRequestOverridesField";
 import { cn } from "@/lib/utils";
+import {
+  featureScopeAllows,
+  useProviderFeatureScopes,
+} from "@/lib/featureScopes";
 import type {
   ClaudeApiKeyField,
   CodexApiFormat,
+  CodexAutoReviewMode,
   CodexCatalogModel,
   CodexChatReasoning,
   PromptCacheRoutingMode,
@@ -131,6 +143,10 @@ interface CodexFormFieldsProps {
   onCodexChatReasoningChange?: (value: CodexChatReasoning) => void;
   promptCacheRouting: PromptCacheRoutingMode;
   onPromptCacheRoutingChange: (value: PromptCacheRoutingMode) => void;
+  codexAutoReviewMode?: CodexAutoReviewMode;
+  onCodexAutoReviewModeChange?: (value: CodexAutoReviewMode) => void;
+  codexAutoReviewFallbackModel?: string;
+  onCodexAutoReviewFallbackModelChange?: (value: string) => void;
 
   // Model Catalog
   catalogModels?: CodexCatalogModel[];
@@ -146,6 +162,7 @@ interface CodexFormFieldsProps {
   onLocalProxyHeadersOverrideChange: (value: string) => void;
   localProxyBodyOverride: string;
   onLocalProxyBodyOverrideChange: (value: string) => void;
+  advancedOptionsContent?: ReactNode;
 }
 
 type CodexCatalogRow = CodexCatalogModel & { rowId: string };
@@ -173,6 +190,25 @@ function createCatalogRow(seed?: Partial<CodexCatalogModel>): CodexCatalogRow {
       : {}),
   };
 }
+
+export function buildFetchedCatalogSelection(
+  row: CodexCatalogModel,
+  model: FetchedModel,
+): Partial<CodexCatalogModel> {
+  return {
+    model: model.id,
+    displayName: row.displayName?.trim() ? row.displayName : model.id,
+    contextWindow: model.contextWindow ?? "",
+  };
+}
+
+const autoReviewModeSelectedClassName: Record<CodexAutoReviewMode, string> = {
+  native:
+    "bg-emerald-100 text-emerald-800 ring-1 ring-emerald-300 hover:bg-emerald-100 dark:bg-emerald-900/45 dark:text-emerald-200 dark:ring-emerald-700 dark:hover:bg-emerald-900/45",
+  auto: "bg-blue-100 text-blue-800 ring-1 ring-blue-300 hover:bg-blue-100 dark:bg-blue-900/45 dark:text-blue-200 dark:ring-blue-700 dark:hover:bg-blue-900/45",
+  fallback:
+    "bg-amber-100 text-amber-900 ring-1 ring-amber-300 hover:bg-amber-100 dark:bg-amber-900/45 dark:text-amber-200 dark:ring-amber-700 dark:hover:bg-amber-900/45",
+};
 
 // Compares rows (with rowId) to incoming models (without) by data fields only,
 // so both sync effects can use the same equality definition. Hidden native-profile
@@ -415,6 +451,10 @@ export function CodexFormFields({
   onCodexChatReasoningChange,
   promptCacheRouting,
   onPromptCacheRoutingChange,
+  codexAutoReviewMode = "native",
+  onCodexAutoReviewModeChange = () => {},
+  codexAutoReviewFallbackModel = "",
+  onCodexAutoReviewFallbackModelChange = () => {},
   catalogModels = [],
   onCatalogModelsChange,
   speedTestEndpoints,
@@ -424,8 +464,14 @@ export function CodexFormFields({
   onLocalProxyHeadersOverrideChange,
   localProxyBodyOverride,
   onLocalProxyBodyOverrideChange,
+  advancedOptionsContent,
 }: CodexFormFieldsProps) {
   const { t } = useTranslation();
+  const featureScopes = useProviderFeatureScopes();
+  // 审批模型路由按「功能生效范围」设置显示（Codex 专属实现）
+  const supportsAutoReviewRouting =
+    appId === "codex" &&
+    featureScopeAllows(featureScopes.autoReviewRouting, appId);
 
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
@@ -437,6 +483,7 @@ export function CodexFormFields({
   useEffect(() => {
     fetchModelsSeqRef.current += 1;
     setFetchedModels((prev) => (prev.length === 0 ? prev : []));
+    setIsFetchingModels(false);
   }, [
     codexBaseUrl,
     isFullUrl,
@@ -475,6 +522,8 @@ export function CodexFormFields({
     supportsThinking ||
     supportsEffort ||
     promptCacheRouting !== "auto" ||
+    codexAutoReviewMode !== "native" ||
+    !!codexAutoReviewFallbackModel ||
     !!maxOutputTokens;
   const [advancedExpanded, setAdvancedExpanded] = useState(
     isXaiOauthPreset ? false : hasAnyAdvancedValue,
@@ -580,7 +629,11 @@ export function CodexFormFields({
           console.warn("[XaiOAuth] Failed to fetch models:", err);
           showFetchModelsError(err, t);
         })
-        .finally(() => setIsFetchingModels(false));
+        .finally(() => {
+          if (seq === fetchModelsSeqRef.current) {
+            setIsFetchingModels(false);
+          }
+        });
       return;
     }
 
@@ -616,7 +669,11 @@ export function CodexFormFields({
         console.warn("[ModelFetch] Failed:", err);
         showFetchModelsError(err, t);
       })
-      .finally(() => setIsFetchingModels(false));
+      .finally(() => {
+        if (seq === fetchModelsSeqRef.current) {
+          setIsFetchingModels(false);
+        }
+      });
   }, [
     codexBaseUrl,
     codexApiKey,
@@ -659,6 +716,10 @@ export function CodexFormFields({
         ownedBy: t("codexConfig.modelMappingTitle", {
           defaultValue: "模型映射",
         }),
+        contextWindow:
+          typeof row.contextWindow === "number"
+            ? row.contextWindow
+            : Number.parseInt(String(row.contextWindow), 10) || null,
       });
     }
     for (const model of fetchedModels) {
@@ -870,7 +931,7 @@ export function CodexFormFields({
       )}
 
       {/* 高级选项 —— 上游格式/模型映射/思考能力/自定义 UA；预设供应商通常无需展开 */}
-      {category !== "official" && (
+      {(category !== "official" || advancedOptionsContent) && (
         <Collapsible
           open={advancedExpanded}
           onOpenChange={setAdvancedExpanded}
@@ -907,469 +968,608 @@ export function CodexFormFields({
             </p>
           )}
           <CollapsibleContent className="space-y-3 pt-3">
-            {/* 上游格式 —— Chat 需开启路由接管（走代理转换），Responses 原生直连。
+            {category !== "official" && (
+              <>
+                {/* 上游格式 —— Chat 需开启路由接管（走代理转换），Responses 原生直连。
                 沿用 shouldShowSpeedTest 门控，cloud_provider 保持不可切换；
                 xAI OAuth 托管预设格式钉死 Responses，不可切换。 */}
-            {shouldShowSpeedTest && !isXaiOauthPreset && (
-              <div className="space-y-3">
-                <div className="space-y-1.5">
-                  <FormLabel htmlFor="codex-upstream-format">
-                    {t("codexConfig.upstreamFormatLabel", {
-                      defaultValue: "上游格式",
-                    })}
-                  </FormLabel>
-                  <Select
-                    value={apiFormat}
-                    onValueChange={(value) =>
-                      onApiFormatChange(value as CodexApiFormat)
-                    }
-                  >
-                    <SelectTrigger
-                      id="codex-upstream-format"
-                      className="w-full"
-                    >
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="openai_chat">
-                        {t("codexConfig.upstreamFormatChat", {
-                          defaultValue: "Chat Completions（需开启路由）",
-                        })}
-                      </SelectItem>
-                      <SelectItem value="openai_responses">
-                        {t("codexConfig.upstreamFormatResponses", {
-                          defaultValue: "Responses（原生）",
-                        })}
-                      </SelectItem>
-                      <SelectItem value="anthropic">
-                        {t("codexConfig.upstreamFormatAnthropic", {
-                          defaultValue: "Anthropic Messages（需开启路由）",
-                        })}
-                      </SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <p className="text-xs leading-relaxed text-muted-foreground">
-                    {t("codexConfig.upstreamFormatHint", {
-                      defaultValue:
-                        "供应商原生是 Responses API 就选 Responses（直连，不转换格式）；使用 Chat Completions 协议就选 Chat；供应商只提供原生 Anthropic Messages 协议就选 Anthropic Messages。Chat 与 Anthropic Messages 均需开启路由接管才能转换为 Responses。",
-                    })}
-                  </p>
-                </div>
-
-                {isAnthropicFormat && (
-                  <div className="space-y-1.5">
-                    <FormLabel htmlFor="codex-anthropic-auth-field">
-                      {t("codexConfig.anthropicAuthFieldLabel", {
-                        defaultValue: "认证字段",
-                      })}
-                    </FormLabel>
-                    <Select
-                      value={anthropicAuthField}
-                      onValueChange={(value) =>
-                        onAnthropicAuthFieldChange(value as ClaudeApiKeyField)
-                      }
-                    >
-                      <SelectTrigger
-                        id="codex-anthropic-auth-field"
-                        className="w-full"
-                      >
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="ANTHROPIC_AUTH_TOKEN">
-                          {t("codexConfig.anthropicAuthFieldAuthToken", {
-                            defaultValue:
-                              "ANTHROPIC_AUTH_TOKEN（Authorization）",
-                          })}
-                        </SelectItem>
-                        <SelectItem value="ANTHROPIC_API_KEY">
-                          {t("codexConfig.anthropicAuthFieldApiKey", {
-                            defaultValue: "ANTHROPIC_API_KEY（x-api-key）",
-                          })}
-                        </SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <p className="text-xs leading-relaxed text-muted-foreground">
-                      {t("codexConfig.anthropicAuthFieldHint", {
-                        defaultValue:
-                          "选择网关接收 API Key 的请求头：ANTHROPIC_AUTH_TOKEN 发送 Authorization: Bearer；ANTHROPIC_API_KEY 发送 x-api-key。两者只发其一。",
-                      })}
-                    </p>
-                  </div>
-                )}
-
-                {isAnthropicFormat && (
-                  <div className="flex items-center justify-between gap-4 border-t border-border-default pt-3">
-                    <div className="space-y-1">
-                      <FormLabel>
-                        {t("codexConfig.impersonateClaudeCodeLabel", {
-                          defaultValue: "模拟 Claude Code 客户端",
+                {shouldShowSpeedTest && !isXaiOauthPreset && (
+                  <div className="space-y-3">
+                    <div className="space-y-1.5">
+                      <FormLabel htmlFor="codex-upstream-format">
+                        {t("codexConfig.upstreamFormatLabel", {
+                          defaultValue: "上游格式",
                         })}
                       </FormLabel>
+                      <Select
+                        value={apiFormat}
+                        onValueChange={(value) =>
+                          onApiFormatChange(value as CodexApiFormat)
+                        }
+                      >
+                        <SelectTrigger
+                          id="codex-upstream-format"
+                          className="w-full"
+                        >
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="openai_chat">
+                            {t("codexConfig.upstreamFormatChat", {
+                              defaultValue: "Chat Completions（需开启路由）",
+                            })}
+                          </SelectItem>
+                          <SelectItem value="openai_responses">
+                            {t("codexConfig.upstreamFormatResponses", {
+                              defaultValue: "Responses（原生）",
+                            })}
+                          </SelectItem>
+                          <SelectItem value="anthropic">
+                            {t("codexConfig.upstreamFormatAnthropic", {
+                              defaultValue: "Anthropic Messages（需开启路由）",
+                            })}
+                          </SelectItem>
+                        </SelectContent>
+                      </Select>
                       <p className="text-xs leading-relaxed text-muted-foreground">
-                        {t("codexConfig.impersonateClaudeCodeHint", {
+                        {t("codexConfig.upstreamFormatHint", {
                           defaultValue:
-                            "网关或其上游限制只能通过 Claude Code 使用时开启：伪装 User-Agent、anthropic-beta、x-app 请求头，并在系统提示首行注入 Claude Code 身份。",
+                            "供应商原生是 Responses API 就选 Responses（直连，不转换格式）；使用 Chat Completions 协议就选 Chat；供应商只提供原生 Anthropic Messages 协议就选 Anthropic Messages。Chat 与 Anthropic Messages 均需开启路由接管才能转换为 Responses。",
                         })}
                       </p>
                     </div>
-                    <Switch
-                      checked={impersonateClaudeCode}
-                      onCheckedChange={onImpersonateClaudeCodeChange}
-                      aria-label={t("codexConfig.impersonateClaudeCodeLabel", {
-                        defaultValue: "模拟 Claude Code 客户端",
-                      })}
-                    />
-                  </div>
-                )}
 
-                {isAnthropicFormat && (
-                  <div className="space-y-1.5 border-t border-border-default pt-3">
-                    <FormLabel htmlFor="codex-anthropic-max-output-tokens">
-                      {t("codexConfig.maxOutputTokensLabel", {
-                        defaultValue: "最大输出 tokens",
-                      })}
-                    </FormLabel>
-                    <Input
-                      id="codex-anthropic-max-output-tokens"
-                      type="number"
-                      min={1}
-                      inputMode="numeric"
-                      value={maxOutputTokens}
-                      onChange={(event) =>
-                        onMaxOutputTokensChange(
-                          event.target.value.replace(/[^\d]/g, ""),
-                        )
-                      }
-                      placeholder={t("codexConfig.maxOutputTokensPlaceholder", {
-                        defaultValue: "留空则使用默认 8192",
-                      })}
-                    />
-                    <p className="text-xs leading-relaxed text-muted-foreground">
-                      {isGrokBuild
-                        ? t("grokBuild.maxOutputTokensHint", {
-                            defaultValue:
-                              "默认上限 8192 容易在长回答或深度思考时被截断（stop_reason=max_tokens）。此处设置会作为 Anthropic 的 max_tokens 覆盖请求值。请勿超过该模型/网关的真实输出上限，否则可能 400。留空使用默认 8192。",
-                          })
-                        : t("codexConfig.maxOutputTokensHint", {
-                            defaultValue:
-                              "Codex 不会把 model_max_output_tokens 写进请求体，默认上限 8192 容易在长回答或深度思考时被截断（stop_reason=max_tokens）。此处设置会作为 Anthropic 的 max_tokens 覆盖请求值。请勿超过该模型/网关的真实输出上限，否则可能 400。留空使用默认 8192。",
+                    {isAnthropicFormat && (
+                      <div className="space-y-1.5">
+                        <FormLabel htmlFor="codex-anthropic-auth-field">
+                          {t("codexConfig.anthropicAuthFieldLabel", {
+                            defaultValue: "认证字段",
                           })}
-                    </p>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {isChatFormat && canEditReasoning && (
-              <div
-                className={cn(
-                  "space-y-3",
-                  shouldShowSpeedTest && "border-t border-border-default pt-3",
-                )}
-              >
-                <div className="space-y-2">
-                  <FormLabel>
-                    {t("codexConfig.promptCacheRoutingLabel", {
-                      defaultValue: "提示词缓存路由",
-                    })}
-                  </FormLabel>
-                  <Select
-                    value={promptCacheRouting}
-                    onValueChange={(value) =>
-                      onPromptCacheRoutingChange(
-                        value as PromptCacheRoutingMode,
-                      )
-                    }
-                  >
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="auto">
-                        {t("codexConfig.promptCacheRoutingAuto", {
-                          defaultValue: "自动（推荐）",
-                        })}
-                      </SelectItem>
-                      <SelectItem value="enabled">
-                        {t("codexConfig.promptCacheRoutingEnabled", {
-                          defaultValue: "开启",
-                        })}
-                      </SelectItem>
-                      <SelectItem value="disabled">
-                        {t("codexConfig.promptCacheRoutingDisabled", {
-                          defaultValue: "关闭",
-                        })}
-                      </SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <p className="text-xs leading-relaxed text-muted-foreground">
-                    {t("codexConfig.promptCacheRoutingHint", {
-                      defaultValue:
-                        "自动模式仅对已确认兼容的上游发送 prompt_cache_key；开启可用于其他兼容网关，关闭可避免严格网关因未知字段返回 400。只使用客户端提供的稳定会话 ID。",
-                    })}
-                  </p>
-                </div>
-
-                <div className="space-y-1">
-                  <FormLabel>
-                    {t("codexConfig.reasoningGroupTitle", {
-                      defaultValue: "思考能力",
-                    })}
-                  </FormLabel>
-                  <p className="text-xs leading-relaxed text-muted-foreground">
-                    {t("codexConfig.reasoningSectionHint", {
-                      defaultValue:
-                        "预设供应商已自动配置；自定义供应商会按名称/地址自动推断。仅当自动识别不准时才需手动覆盖。",
-                    })}
-                  </p>
-                </div>
-
-                <div className="flex items-center justify-between gap-4">
-                  <div className="space-y-1">
-                    <FormLabel>
-                      {t("codexConfig.reasoningModeToggle", {
-                        defaultValue: "支持思考模式",
-                      })}
-                    </FormLabel>
-                    <p className="text-xs leading-relaxed text-muted-foreground">
-                      {t("codexConfig.reasoningModeHint", {
-                        defaultValue:
-                          "上游 Chat Completions 接口支持开启或关闭 thinking 时启用。Kimi、GLM、Qwen 等通常属于这一类。",
-                      })}
-                    </p>
-                  </div>
-                  <Switch
-                    checked={supportsThinking}
-                    onCheckedChange={handleReasoningThinkingChange}
-                    aria-label={t("codexConfig.reasoningModeToggle", {
-                      defaultValue: "支持思考模式",
-                    })}
-                  />
-                </div>
-
-                <div className="flex items-center justify-between gap-4 border-t border-border-default pt-3">
-                  <div className="space-y-1">
-                    <FormLabel>
-                      {t("codexConfig.reasoningEffortToggle", {
-                        defaultValue: "支持思考等级",
-                      })}
-                    </FormLabel>
-                    <p className="text-xs leading-relaxed text-muted-foreground">
-                      {isGrokBuild
-                        ? t("grokBuild.reasoningEffortHint", {
-                            defaultValue:
-                              "上游支持 low/high/max 等思考深度控制时启用。启用后会自动启用思考模式，并把请求中的 reasoning effort 转成上游 Chat 参数。",
-                          })
-                        : t("codexConfig.reasoningEffortHint", {
-                            defaultValue:
-                              "上游支持 low/high/max 等思考深度控制时启用。启用后会自动启用思考模式，并把 Codex 的 reasoning.effort 转成上游 Chat 参数。",
-                          })}
-                    </p>
-                  </div>
-                  <Switch
-                    checked={supportsEffort}
-                    onCheckedChange={handleReasoningEffortChange}
-                    aria-label={t("codexConfig.reasoningEffortToggle", {
-                      defaultValue: "支持思考等级",
-                    })}
-                  />
-                </div>
-              </div>
-            )}
-
-            {/* 模型映射 / 模型目录 —— 与「路由接管」解耦，常驻显示（可编辑即渲染）。
-                填了才生成 catalog：Chat 模式生成兼容路由、原生 Responses 生成
-                model-catalogs.json；留空则不生成。排在自定义 UA 之前。 */}
-            {canEditCatalog && (
-              <div
-                className={cn(
-                  "space-y-4",
-                  (shouldShowSpeedTest || (isChatFormat && canEditReasoning)) &&
-                    "border-t border-border-default pt-3",
-                )}
-              >
-                <div className="space-y-1">
-                  <div className="flex items-center justify-between gap-3">
-                    <FormLabel>
-                      {t("codexConfig.modelMappingTitle", {
-                        defaultValue: "模型映射",
-                      })}
-                    </FormLabel>
-                    {renderCatalogActionButtons(
-                      handleAddCatalogRow,
-                      t("codexConfig.addCatalogModel", {
-                        defaultValue: "添加模型",
-                      }),
-                    )}
-                  </div>
-                  <p className="text-xs leading-relaxed text-muted-foreground">
-                    {t("codexConfig.modelMappingHint", {
-                      defaultValue:
-                        "选择模型角色后，CC Switch 会自动生成 Codex 兼容路由；菜单显示名可以填 DeepSeek、Kimi 等品牌模型，实际请求模型按右侧填写内容发送。",
-                    })}
-                  </p>
-                </div>
-
-                {catalogRows.length > 0 && (
-                  <div className="space-y-2">
-                    {/* 列头：md+ 显示 */}
-                    <div className="hidden grid-cols-[1fr_1fr_140px_1fr_36px] gap-2 px-1 text-xs font-medium text-muted-foreground md:grid">
-                      <span>
-                        {t("codexConfig.catalogColumnDisplay", {
-                          defaultValue: "菜单显示名",
-                        })}
-                      </span>
-                      <span>
-                        {t("codexConfig.catalogColumnModel", {
-                          defaultValue: "实际请求模型",
-                        })}
-                      </span>
-                      <span>
-                        {t("codexConfig.catalogColumnContext", {
-                          defaultValue: "上下文窗口",
-                        })}
-                      </span>
-                      <span>
-                        {t("codexConfig.catalogColumnReasoning", {
-                          defaultValue: "思考等级",
-                        })}
-                      </span>
-                      <span />
-                    </div>
-
-                    {catalogRows.map((row, index) => (
-                      <div
-                        key={row.rowId}
-                        className="grid grid-cols-1 gap-2 md:grid-cols-[1fr_1fr_140px_1fr_36px]"
-                      >
-                        <Input
-                          value={row.displayName ?? ""}
-                          onChange={(event) =>
-                            handleUpdateCatalogRow(index, {
-                              displayName: event.target.value,
-                            })
+                        </FormLabel>
+                        <Select
+                          value={anthropicAuthField}
+                          onValueChange={(value) =>
+                            onAnthropicAuthFieldChange(
+                              value as ClaudeApiKeyField,
+                            )
                           }
-                          placeholder={t(
-                            "codexConfig.catalogDisplayNamePlaceholder",
+                        >
+                          <SelectTrigger
+                            id="codex-anthropic-auth-field"
+                            className="w-full"
+                          >
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="ANTHROPIC_AUTH_TOKEN">
+                              {t("codexConfig.anthropicAuthFieldAuthToken", {
+                                defaultValue:
+                                  "ANTHROPIC_AUTH_TOKEN（Authorization）",
+                              })}
+                            </SelectItem>
+                            <SelectItem value="ANTHROPIC_API_KEY">
+                              {t("codexConfig.anthropicAuthFieldApiKey", {
+                                defaultValue: "ANTHROPIC_API_KEY（x-api-key）",
+                              })}
+                            </SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <p className="text-xs leading-relaxed text-muted-foreground">
+                          {t("codexConfig.anthropicAuthFieldHint", {
+                            defaultValue:
+                              "选择网关接收 API Key 的请求头：ANTHROPIC_AUTH_TOKEN 发送 Authorization: Bearer；ANTHROPIC_API_KEY 发送 x-api-key。两者只发其一。",
+                          })}
+                        </p>
+                      </div>
+                    )}
+
+                    {isAnthropicFormat && (
+                      <div className="flex items-center justify-between gap-4 border-t border-border-default pt-3">
+                        <div className="space-y-1">
+                          <FormLabel>
+                            {t("codexConfig.impersonateClaudeCodeLabel", {
+                              defaultValue: "模拟 Claude Code 客户端",
+                            })}
+                          </FormLabel>
+                          <p className="text-xs leading-relaxed text-muted-foreground">
+                            {t("codexConfig.impersonateClaudeCodeHint", {
+                              defaultValue:
+                                "网关或其上游限制只能通过 Claude Code 使用时开启：伪装 User-Agent、anthropic-beta、x-app 请求头，并在系统提示首行注入 Claude Code 身份。",
+                            })}
+                          </p>
+                        </div>
+                        <Switch
+                          checked={impersonateClaudeCode}
+                          onCheckedChange={onImpersonateClaudeCodeChange}
+                          aria-label={t(
+                            "codexConfig.impersonateClaudeCodeLabel",
                             {
-                              defaultValue: "例如: DeepSeek V4 Flash",
+                              defaultValue: "模拟 Claude Code 客户端",
                             },
                           )}
-                          aria-label={t("codexConfig.catalogColumnDisplay", {
-                            defaultValue: "菜单显示名",
-                          })}
                         />
-                        <div className="flex gap-1">
-                          <Input
-                            value={row.model}
-                            onChange={(event) =>
-                              handleUpdateCatalogRow(index, {
-                                model: event.target.value,
-                              })
-                            }
-                            placeholder={t(
-                              "codexConfig.catalogModelPlaceholder",
-                              {
-                                defaultValue: "例如: deepseek-v4-flash",
-                              },
-                            )}
-                            aria-label={t("codexConfig.catalogColumnModel", {
-                              defaultValue: "实际请求模型",
-                            })}
-                            className="flex-1"
-                          />
-                          {fetchedModels.length > 0 && (
-                            <ModelDropdown
-                              models={fetchedModels}
-                              onSelect={(id) =>
-                                handleUpdateCatalogRow(index, {
-                                  model: id,
-                                  displayName: row.displayName?.trim()
-                                    ? row.displayName
-                                    : id,
-                                })
-                              }
-                            />
-                          )}
-                        </div>
+                      </div>
+                    )}
+
+                    {isAnthropicFormat && (
+                      <div className="space-y-1.5 border-t border-border-default pt-3">
+                        <FormLabel htmlFor="codex-anthropic-max-output-tokens">
+                          {t("codexConfig.maxOutputTokensLabel", {
+                            defaultValue: "最大输出 tokens",
+                          })}
+                        </FormLabel>
                         <Input
+                          id="codex-anthropic-max-output-tokens"
                           type="number"
                           min={1}
                           inputMode="numeric"
-                          value={row.contextWindow ?? ""}
+                          value={maxOutputTokens}
                           onChange={(event) =>
-                            handleUpdateCatalogRow(index, {
-                              contextWindow: event.target.value.replace(
-                                /[^\d]/g,
-                                "",
-                              ),
-                            })
+                            onMaxOutputTokensChange(
+                              event.target.value.replace(/[^\d]/g, ""),
+                            )
                           }
                           placeholder={t(
-                            "codexConfig.contextWindowPlaceholder",
+                            "codexConfig.maxOutputTokensPlaceholder",
                             {
-                              defaultValue: "例如: 128000",
+                              defaultValue: "留空则使用默认 8192",
                             },
                           )}
-                          aria-label={t("codexConfig.catalogColumnContext", {
-                            defaultValue: "上下文窗口",
-                          })}
                         />
-                        <ReasoningLevelsEditor
-                          levels={row.reasoningLevels}
-                          defaultLevel={row.defaultReasoningLevel}
-                          onLevelsChange={(levels) =>
-                            handleUpdateCatalogRow(index, {
-                              reasoningLevels: levels,
-                            })
-                          }
-                          onDefaultLevelChange={(level) =>
-                            handleUpdateCatalogRow(index, {
-                              defaultReasoningLevel: level,
-                            })
-                          }
-                        />
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon"
-                          className="h-9 w-9 text-muted-foreground hover:text-destructive"
-                          onClick={() => handleRemoveCatalogRow(index)}
-                          title={t("common.delete", { defaultValue: "删除" })}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
+                        <p className="text-xs leading-relaxed text-muted-foreground">
+                          {isGrokBuild
+                            ? t("grokBuild.maxOutputTokensHint", {
+                                defaultValue:
+                                  "默认上限 8192 容易在长回答或深度思考时被截断（stop_reason=max_tokens）。此处设置会作为 Anthropic 的 max_tokens 覆盖请求值。请勿超过该模型/网关的真实输出上限，否则可能 400。留空使用默认 8192。",
+                              })
+                            : t("codexConfig.maxOutputTokensHint", {
+                                defaultValue:
+                                  "Codex 不会把 model_max_output_tokens 写进请求体，默认上限 8192 容易在长回答或深度思考时被截断（stop_reason=max_tokens）。此处设置会作为 Anthropic 的 max_tokens 覆盖请求值。请勿超过该模型/网关的真实输出上限，否则可能 400。留空使用默认 8192。",
+                              })}
+                        </p>
                       </div>
-                    ))}
+                    )}
                   </div>
                 )}
+
+                {isChatFormat && canEditReasoning && (
+                  <div
+                    className={cn(
+                      "space-y-3",
+                      shouldShowSpeedTest &&
+                        "border-t border-border-default pt-3",
+                    )}
+                  >
+                    <div className="space-y-2">
+                      <FormLabel>
+                        {t("codexConfig.promptCacheRoutingLabel", {
+                          defaultValue: "提示词缓存路由",
+                        })}
+                      </FormLabel>
+                      <Select
+                        value={promptCacheRouting}
+                        onValueChange={(value) =>
+                          onPromptCacheRoutingChange(
+                            value as PromptCacheRoutingMode,
+                          )
+                        }
+                      >
+                        <SelectTrigger>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="auto">
+                            {t("codexConfig.promptCacheRoutingAuto", {
+                              defaultValue: "自动（推荐）",
+                            })}
+                          </SelectItem>
+                          <SelectItem value="enabled">
+                            {t("codexConfig.promptCacheRoutingEnabled", {
+                              defaultValue: "开启",
+                            })}
+                          </SelectItem>
+                          <SelectItem value="disabled">
+                            {t("codexConfig.promptCacheRoutingDisabled", {
+                              defaultValue: "关闭",
+                            })}
+                          </SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <p className="text-xs leading-relaxed text-muted-foreground">
+                        {t("codexConfig.promptCacheRoutingHint", {
+                          defaultValue:
+                            "自动模式仅对已确认兼容的上游发送 prompt_cache_key；开启可用于其他兼容网关，关闭可避免严格网关因未知字段返回 400。只使用客户端提供的稳定会话 ID。",
+                        })}
+                      </p>
+                    </div>
+                    <div className="space-y-1">
+                      <FormLabel>
+                        {t("codexConfig.reasoningGroupTitle", {
+                          defaultValue: "思考能力",
+                        })}
+                      </FormLabel>
+                      <p className="text-xs leading-relaxed text-muted-foreground">
+                        {t("codexConfig.reasoningSectionHint", {
+                          defaultValue:
+                            "预设供应商已自动配置；自定义供应商会按名称/地址自动推断。仅当自动识别不准时才需手动覆盖。",
+                        })}
+                      </p>
+                    </div>
+
+                    <div className="flex items-center justify-between gap-4">
+                      <div className="space-y-1">
+                        <FormLabel>
+                          {t("codexConfig.reasoningModeToggle", {
+                            defaultValue: "支持思考模式",
+                          })}
+                        </FormLabel>
+                        <p className="text-xs leading-relaxed text-muted-foreground">
+                          {t("codexConfig.reasoningModeHint", {
+                            defaultValue:
+                              "上游 Chat Completions 接口支持开启或关闭 thinking 时启用。Kimi、GLM、Qwen 等通常属于这一类。",
+                          })}
+                        </p>
+                      </div>
+                      <Switch
+                        checked={supportsThinking}
+                        onCheckedChange={handleReasoningThinkingChange}
+                        aria-label={t("codexConfig.reasoningModeToggle", {
+                          defaultValue: "支持思考模式",
+                        })}
+                      />
+                    </div>
+
+                    <div className="flex items-center justify-between gap-4 border-t border-border-default pt-3">
+                      <div className="space-y-1">
+                        <FormLabel>
+                          {t("codexConfig.reasoningEffortToggle", {
+                            defaultValue: "支持思考等级",
+                          })}
+                        </FormLabel>
+                        <p className="text-xs leading-relaxed text-muted-foreground">
+                          {isGrokBuild
+                            ? t("grokBuild.reasoningEffortHint", {
+                                defaultValue:
+                                  "上游支持 low/high/max 等思考深度控制时启用。启用后会自动启用思考模式，并把请求中的 reasoning effort 转成上游 Chat 参数。",
+                              })
+                            : t("codexConfig.reasoningEffortHint", {
+                                defaultValue:
+                                  "上游支持 low/high/max 等思考深度控制时启用。启用后会自动启用思考模式，并把 Codex 的 reasoning.effort 转成上游 Chat 参数。",
+                              })}
+                        </p>
+                      </div>
+                      <Switch
+                        checked={supportsEffort}
+                        onCheckedChange={handleReasoningEffortChange}
+                        aria-label={t("codexConfig.reasoningEffortToggle", {
+                          defaultValue: "支持思考等级",
+                        })}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {/* 模型映射 / 模型目录 —— 与「路由接管」解耦，常驻显示（可编辑即渲染）。
+                填了才生成 catalog：Chat 模式生成兼容路由、原生 Responses 生成
+                model-catalogs.json；留空则不生成。排在自定义 UA 之前。 */}
+                {canEditCatalog && (
+                  <div
+                    className={cn(
+                      "space-y-4",
+                      (shouldShowSpeedTest ||
+                        (isChatFormat && canEditReasoning)) &&
+                        "border-t border-border-default pt-3",
+                    )}
+                  >
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between gap-3">
+                        <FormLabel>
+                          {t("codexConfig.modelMappingTitle", {
+                            defaultValue: "模型映射",
+                          })}
+                        </FormLabel>
+                        {renderCatalogActionButtons(
+                          handleAddCatalogRow,
+                          t("codexConfig.addCatalogModel", {
+                            defaultValue: "添加模型",
+                          }),
+                        )}
+                      </div>
+                      <p className="text-xs leading-relaxed text-muted-foreground">
+                        {t("codexConfig.modelMappingHint", {
+                          defaultValue:
+                            "选择模型角色后，CC Switch 会自动生成 Codex 兼容路由；菜单显示名可以填 DeepSeek、Kimi 等品牌模型，实际请求模型按右侧填写内容发送。",
+                        })}
+                      </p>
+                    </div>
+
+                    {catalogRows.length > 0 && (
+                      <div className="space-y-2">
+                        {/* 列头：md+ 显示 */}
+                        <div className="hidden grid-cols-[1fr_1fr_140px_1fr_36px] gap-2 px-1 text-xs font-medium text-muted-foreground md:grid">
+                          <span>
+                            {t("codexConfig.catalogColumnDisplay", {
+                              defaultValue: "菜单显示名",
+                            })}
+                          </span>
+                          <span>
+                            {t("codexConfig.catalogColumnModel", {
+                              defaultValue: "实际请求模型",
+                            })}
+                          </span>
+                          <span>
+                            {t("codexConfig.catalogColumnContext", {
+                              defaultValue: "上下文窗口",
+                            })}
+                          </span>
+                          <span>
+                            {t("codexConfig.catalogColumnReasoning", {
+                              defaultValue: "思考等级",
+                            })}
+                          </span>
+                          <span />
+                        </div>
+
+                        {catalogRows.map((row, index) => (
+                          <div
+                            key={row.rowId}
+                            className="grid grid-cols-1 gap-2 md:grid-cols-[1fr_1fr_140px_1fr_36px]"
+                          >
+                            <Input
+                              value={row.displayName ?? ""}
+                              onChange={(event) =>
+                                handleUpdateCatalogRow(index, {
+                                  displayName: event.target.value,
+                                })
+                              }
+                              placeholder={t(
+                                "codexConfig.catalogDisplayNamePlaceholder",
+                                {
+                                  defaultValue: "例如: DeepSeek V4 Flash",
+                                },
+                              )}
+                              aria-label={t(
+                                "codexConfig.catalogColumnDisplay",
+                                {
+                                  defaultValue: "菜单显示名",
+                                },
+                              )}
+                            />
+                            <div className="flex gap-1">
+                              <Input
+                                value={row.model}
+                                onChange={(event) =>
+                                  handleUpdateCatalogRow(index, {
+                                    model: event.target.value,
+                                  })
+                                }
+                                placeholder={t(
+                                  "codexConfig.catalogModelPlaceholder",
+                                  {
+                                    defaultValue: "例如: deepseek-v4-flash",
+                                  },
+                                )}
+                                aria-label={t(
+                                  "codexConfig.catalogColumnModel",
+                                  {
+                                    defaultValue: "实际请求模型",
+                                  },
+                                )}
+                                className="flex-1"
+                              />
+                              {fetchedModels.length > 0 && (
+                                <ModelDropdown
+                                  models={fetchedModels}
+                                  onSelect={(id) => {
+                                    const model = fetchedModels.find(
+                                      (candidate) => candidate.id === id,
+                                    );
+                                    if (model) {
+                                      handleUpdateCatalogRow(
+                                        index,
+                                        buildFetchedCatalogSelection(
+                                          row,
+                                          model,
+                                        ),
+                                      );
+                                    }
+                                  }}
+                                />
+                              )}
+                            </div>
+                            <Input
+                              type="number"
+                              min={1}
+                              inputMode="numeric"
+                              value={row.contextWindow ?? ""}
+                              onChange={(event) =>
+                                handleUpdateCatalogRow(index, {
+                                  contextWindow: event.target.value.replace(
+                                    /[^\d]/g,
+                                    "",
+                                  ),
+                                })
+                              }
+                              placeholder={t(
+                                "codexConfig.contextWindowPlaceholder",
+                                {
+                                  defaultValue: "例如: 128000",
+                                },
+                              )}
+                              aria-label={t(
+                                "codexConfig.catalogColumnContext",
+                                {
+                                  defaultValue: "上下文窗口",
+                                },
+                              )}
+                            />
+                            <ReasoningLevelsEditor
+                              levels={row.reasoningLevels}
+                              defaultLevel={row.defaultReasoningLevel}
+                              onLevelsChange={(levels) =>
+                                handleUpdateCatalogRow(index, {
+                                  reasoningLevels: levels,
+                                })
+                              }
+                              onDefaultLevelChange={(level) =>
+                                handleUpdateCatalogRow(index, {
+                                  defaultReasoningLevel: level,
+                                })
+                              }
+                            />
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              className="h-9 w-9 text-muted-foreground hover:text-destructive"
+                              onClick={() => handleRemoveCatalogRow(index)}
+                              title={t("common.delete", {
+                                defaultValue: "删除",
+                              })}
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div
+                  className={cn(
+                    "space-y-3",
+                    (shouldShowSpeedTest ||
+                      (isChatFormat && canEditReasoning) ||
+                      canEditCatalog) &&
+                      "border-t border-border-default pt-3",
+                  )}
+                >
+                  {supportsAutoReviewRouting && (
+                    <div className="space-y-3 border-b border-border-default pb-3">
+                      <div className="space-y-1.5">
+                        <FormLabel>
+                          {t("codexConfig.autoReviewModeLabel", {
+                            defaultValue: "Approval reviewer routing",
+                          })}
+                        </FormLabel>
+                        <div
+                          className="grid grid-cols-3 gap-1 rounded-md bg-muted p-1"
+                          role="radiogroup"
+                          aria-label={t("codexConfig.autoReviewModeLabel", {
+                            defaultValue: "Approval reviewer routing",
+                          })}
+                        >
+                          {(["native", "auto", "fallback"] as const).map(
+                            (mode) => (
+                              <Button
+                                key={mode}
+                                type="button"
+                                size="sm"
+                                variant="ghost"
+                                className={cn(
+                                  "font-semibold",
+                                  codexAutoReviewMode === mode
+                                    ? autoReviewModeSelectedClassName[mode]
+                                    : "text-muted-foreground",
+                                )}
+                                role="radio"
+                                aria-checked={codexAutoReviewMode === mode}
+                                data-state={
+                                  codexAutoReviewMode === mode
+                                    ? "selected"
+                                    : "unselected"
+                                }
+                                onClick={() =>
+                                  onCodexAutoReviewModeChange(mode)
+                                }
+                              >
+                                {t(
+                                  `codexConfig.autoReviewMode${
+                                    mode === "native"
+                                      ? "Native"
+                                      : mode === "auto"
+                                        ? "Auto"
+                                        : "Fallback"
+                                  }`,
+                                  {
+                                    defaultValue:
+                                      mode === "native"
+                                        ? "Native"
+                                        : mode === "auto"
+                                          ? "Auto"
+                                          : "Fallback",
+                                  },
+                                )}
+                              </Button>
+                            ),
+                          )}
+                        </div>
+                        <p className="text-xs leading-relaxed text-muted-foreground">
+                          {t("codexConfig.autoReviewModeHint", {
+                            defaultValue:
+                              "Auto first tries codex-auto-review and switches to the fallback model when unavailable.",
+                          })}
+                        </p>
+                      </div>
+
+                      {codexAutoReviewMode !== "native" && (
+                        <div className="space-y-1.5">
+                          <FormLabel htmlFor="codexAutoReviewFallbackModel">
+                            {t("codexConfig.autoReviewFallbackModelLabel", {
+                              defaultValue: "Fallback reviewer model",
+                            })}
+                          </FormLabel>
+                          <div className="flex gap-1">
+                            <Input
+                              id="codexAutoReviewFallbackModel"
+                              value={codexAutoReviewFallbackModel}
+                              onChange={(event) =>
+                                onCodexAutoReviewFallbackModelChange(
+                                  event.target.value,
+                                )
+                              }
+                              placeholder={codexModel || "gpt-5.6-sol"}
+                              className="flex-1"
+                            />
+                            {fetchedModels.length > 0 && (
+                              <ModelDropdown
+                                models={fetchedModels}
+                                onSelect={onCodexAutoReviewFallbackModelChange}
+                              />
+                            )}
+                          </div>
+                          <p className="text-xs leading-relaxed text-muted-foreground">
+                            {t("codexConfig.autoReviewFallbackModelHint", {
+                              defaultValue:
+                                "Leave empty to use this provider's default Codex model.",
+                            })}
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  <CustomUserAgentField
+                    id="codex-custom-user-agent"
+                    value={customUserAgent}
+                    onChange={onCustomUserAgentChange}
+                  />
+                  <div className="border-t border-border-default pt-3">
+                    <LocalProxyRequestOverridesField
+                      headersJson={localProxyHeadersOverride}
+                      bodyJson={localProxyBodyOverride}
+                      onHeadersJsonChange={onLocalProxyHeadersOverrideChange}
+                      onBodyJsonChange={onLocalProxyBodyOverrideChange}
+                    />
+                  </div>
+                </div>
+              </>
+            )}
+            {advancedOptionsContent && (
+              <div className="border-t border-border-default pt-3">
+                {advancedOptionsContent}
               </div>
             )}
-
-            <div
-              className={cn(
-                "space-y-3",
-                (shouldShowSpeedTest ||
-                  (isChatFormat && canEditReasoning) ||
-                  canEditCatalog) &&
-                  "border-t border-border-default pt-3",
-              )}
-            >
-              <CustomUserAgentField
-                id="codex-custom-user-agent"
-                value={customUserAgent}
-                onChange={onCustomUserAgentChange}
-              />
-              <div className="border-t border-border-default pt-3">
-                <LocalProxyRequestOverridesField
-                  headersJson={localProxyHeadersOverride}
-                  bodyJson={localProxyBodyOverride}
-                  onHeadersJsonChange={onLocalProxyHeadersOverrideChange}
-                  onBodyJsonChange={onLocalProxyBodyOverrideChange}
-                />
-              </div>
-            </div>
           </CollapsibleContent>
         </Collapsible>
       )}

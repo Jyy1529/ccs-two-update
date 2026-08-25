@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { Save } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -27,6 +34,8 @@ interface EditProviderDialogProps {
   }) => Promise<void> | void;
   appId: AppId;
   isProxyTakeover?: boolean; // 代理接管模式下不读取 live（避免显示被接管后的代理配置）
+  onRequestAddProvider?: (onCreated: (providerId: string) => void) => void;
+  escapeEnabled?: boolean;
 }
 
 export function EditProviderDialog({
@@ -36,8 +45,11 @@ export function EditProviderDialog({
   onSubmit,
   appId,
   isProxyTakeover = false,
+  onRequestAddProvider,
+  escapeEnabled = true,
 }: EditProviderDialogProps) {
   const { t } = useTranslation();
+  const formId = useId();
   const [isFormSubmitting, setIsFormSubmitting] = useState(false);
   const [authSettingsTarget, setAuthSettingsTarget] =
     useState<ManagedAuthProvider | null>(null);
@@ -275,11 +287,12 @@ export function EditProviderDialog({
       isOpen={open}
       title={t("provider.editProvider")}
       onClose={handlePanelClose}
+      escapeEnabled={escapeEnabled}
       contentClassName={appId === "pi" ? "pb-0" : undefined}
       footer={
         <Button
           type="submit"
-          form="provider-form"
+          form={formId}
           disabled={isFormSubmitting || !isFormReady}
           className="bg-primary text-primary-foreground hover:bg-primary/90"
         >
@@ -300,6 +313,8 @@ export function EditProviderDialog({
         initialData={initialData}
         showButtons={false}
         isProxyTakeover={isProxyTakeover}
+        formId={formId}
+        onRequestAddProvider={onRequestAddProvider}
       />
       <AuthSettingsPanel
         target={authSettingsTarget}

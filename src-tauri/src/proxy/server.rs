@@ -25,8 +25,11 @@ use axum::{
 };
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::sync::{oneshot, RwLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::task::JoinHandle;
 
 /// 代理服务器状态（共享）
@@ -54,9 +57,46 @@ pub struct ProxyState {
 pub struct ProxyServer {
     config: ProxyConfig,
     state: ProxyState,
-    shutdown_tx: Arc<RwLock<Option<oneshot::Sender<()>>>>,
-    /// 服务器任务句柄，用于等待服务器实际关闭
-    server_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
+    lifecycle: Mutex<ServerLifecycle>,
+    active_generation: AtomicU64,
+    stop_timeout: std::time::Duration,
+    #[cfg(test)]
+    start_barrier: Arc<RwLock<Option<Arc<tokio::sync::Barrier>>>>,
+    #[cfg(test)]
+    start_bind_pause: Arc<RwLock<Option<StopPublishPause>>>,
+    #[cfg(test)]
+    stop_publish_pause: Arc<RwLock<Option<StopPublishPause>>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct StopPublishPause {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+struct RunningServer {
+    generation: u64,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    server_handle: JoinHandle<()>,
+}
+
+enum ServerLifecycle {
+    Stopped {
+        generation: u64,
+    },
+    Running(RunningServer),
+    Stopping {
+        generation: u64,
+        result: Option<Result<(), ProxyError>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProxyServerReuseState {
+    Reusable,
+    NeedsReap,
+    Stopped,
 }
 
 impl ProxyServer {
@@ -86,16 +126,106 @@ impl ProxyServer {
         Self {
             config,
             state,
-            shutdown_tx: Arc::new(RwLock::new(None)),
-            server_handle: Arc::new(RwLock::new(None)),
+            lifecycle: Mutex::new(ServerLifecycle::Stopped { generation: 0 }),
+            active_generation: AtomicU64::new(0),
+            stop_timeout: std::time::Duration::from_secs(5),
+            #[cfg(test)]
+            start_barrier: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            start_bind_pause: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            stop_publish_pause: Arc::new(RwLock::new(None)),
         }
     }
 
-    pub async fn start(&self) -> Result<ProxyServerInfo, ProxyError> {
-        // 检查是否已在运行
-        if self.shutdown_tx.read().await.is_some() {
-            return Err(ProxyError::AlreadyRunning);
+    #[cfg(test)]
+    async fn set_start_barrier_for_test(&self, barrier: Arc<tokio::sync::Barrier>) {
+        *self.start_barrier.write().await = Some(barrier);
+    }
+
+    #[cfg(test)]
+    async fn wait_at_start_barrier_for_test(&self) {
+        let barrier = self.start_barrier.read().await.clone();
+        if let Some(barrier) = barrier {
+            barrier.wait().await;
         }
+    }
+
+    #[cfg(test)]
+    async fn set_start_bind_pause_for_test(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.start_bind_pause.write().await = Some(StopPublishPause { entered, release });
+    }
+
+    #[cfg(test)]
+    async fn wait_at_start_bind_pause_for_test(&self) {
+        let pause = self.start_bind_pause.write().await.take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_stop_publish_pause_for_test(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.stop_publish_pause.write().await = Some(StopPublishPause { entered, release });
+    }
+
+    #[cfg(test)]
+    async fn wait_at_stop_publish_pause_for_test(&self) {
+        let pause = self.stop_publish_pause.write().await.take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_stop_timeout_for_test(&mut self, timeout: std::time::Duration) {
+        self.stop_timeout = timeout;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn install_server_task_for_test(
+        &self,
+        shutdown_tx: oneshot::Sender<()>,
+        server_handle: JoinHandle<()>,
+    ) {
+        let mut lifecycle = self.lifecycle.lock().await;
+        let generation = match &*lifecycle {
+            ServerLifecycle::Stopped { generation } => generation.wrapping_add(1).max(1),
+            ServerLifecycle::Running(_) | ServerLifecycle::Stopping { .. } => {
+                panic!("test server task already installed")
+            }
+        };
+        self.active_generation.store(generation, Ordering::Release);
+        *lifecycle = ServerLifecycle::Running(RunningServer {
+            generation,
+            shutdown_tx: Some(shutdown_tx),
+            server_handle,
+        });
+        self.state.status.write().await.running = true;
+        *self.state.start_time.write().await = Some(std::time::Instant::now());
+    }
+
+    pub async fn start(&self) -> Result<ProxyServerInfo, ProxyError> {
+        #[cfg(test)]
+        self.wait_at_start_barrier_for_test().await;
+
+        let mut lifecycle = self.lifecycle.lock().await;
+        let generation = match &*lifecycle {
+            ServerLifecycle::Stopped { generation } => generation.wrapping_add(1).max(1),
+            ServerLifecycle::Running(_) | ServerLifecycle::Stopping { .. } => {
+                return Err(ProxyError::AlreadyRunning);
+            }
+        };
 
         let addr: SocketAddr =
             format!("{}:{}", self.config.listen_address, self.config.listen_port)
@@ -117,33 +247,23 @@ impl ProxyServer {
             .map_err(|e| ProxyError::BindFailed(e.to_string()))?;
         let actual_port = local_addr.port();
 
-        log::info!("[{}] 代理服务器启动于 {local_addr}", log_srv::STARTED);
+        #[cfg(test)]
+        self.wait_at_start_bind_pause_for_test().await;
 
-        // 更新全局代理端口，用于系统代理检测
-        crate::proxy::http_client::set_proxy_port(actual_port);
-
-        // 保存关闭句柄
-        *self.shutdown_tx.write().await = Some(shutdown_tx);
-
-        // 更新状态
+        // Acquire every async guard before publishing lifecycle side effects.
         let mut status = self.state.status.write().await;
-        status.running = true;
-        status.address = self.config.listen_address.clone();
-        status.port = actual_port;
-        drop(status);
-
-        // 记录启动时间
-        *self.state.start_time.write().await = Some(std::time::Instant::now());
+        let mut start_time = self.state.start_time.write().await;
 
         // 启动服务器 — 使用手动 hyper HTTP/1.1 accept loop
         // 开启 preserve_header_case 以捕获客户端请求头的原始大小写
         let state = self.state.clone();
         let handle = tokio::spawn(async move {
             let mut shutdown_rx = shutdown_rx;
+            let mut connection_tasks = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     result = listener.accept() => {
-                        let (stream, _remote_addr) = match result {
+                        let (stream, remote_addr) = match result {
                             Ok(v) => v,
                             Err(e) => {
                                 log::error!("[{SRV}] accept 失败: {e}", SRV = log_srv::ACCEPT_ERR);
@@ -153,7 +273,7 @@ impl ProxyServer {
                         };
 
                         let app = app.clone();
-                        tokio::spawn(async move {
+                        connection_tasks.spawn(async move {
                             // Peek raw TCP bytes to capture original header casing
                             // before hyper parses (and lowercases) the header names.
                             let original_cases = {
@@ -184,6 +304,7 @@ impl ProxyServer {
 
                                     // Insert our own header case map alongside hyper's internal one
                                     parts.extensions.insert(cases);
+                                    parts.extensions.insert(remote_addr);
 
                                     let body = axum::body::Body::new(body);
                                     let axum_req = http::Request::from_parts(parts, body);
@@ -201,19 +322,57 @@ impl ProxyServer {
                             }
                         });
                     }
+                    Some(result) = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                        if let Err(error) = result {
+                            if !error.is_cancelled() {
+                                log::warn!("[{SRV}] connection task failed: {error}", SRV = log_srv::TASK_ERROR);
+                            }
+                        }
+                    }
                     _ = &mut shutdown_rx => {
                         break;
                     }
                 }
             }
 
-            // 服务器停止后更新状态
-            state.status.write().await.running = false;
-            *state.start_time.write().await = None;
+            // Stop owns every accepted connection. Cancelling and draining them here
+            // guarantees an in-flight unlimited Provider retry cannot outlive stop().
+            connection_tasks.abort_all();
+            while let Some(result) = connection_tasks.join_next().await {
+                if let Err(error) = result {
+                    if !error.is_cancelled() {
+                        log::warn!(
+                            "[{SRV}] connection task failed during shutdown: {error}",
+                            SRV = log_srv::TASK_ERROR
+                        );
+                    }
+                }
+            }
+
+            // ActiveConnectionGuard releases the UI counter through a small spawned
+            // task. Wait for that RAII cleanup before publishing the stopped state.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while state.status.read().await.active_connections != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
         });
 
-        // 保存服务器任务句柄
-        *self.server_handle.write().await = Some(handle);
+        *lifecycle = ServerLifecycle::Running(RunningServer {
+            generation,
+            shutdown_tx: Some(shutdown_tx),
+            server_handle: handle,
+        });
+        status.running = true;
+        status.address = self.config.listen_address.clone();
+        status.port = actual_port;
+        *start_time = Some(std::time::Instant::now());
+        self.active_generation.store(generation, Ordering::Release);
+
+        // 更新全局代理端口，用于系统代理检测
+        crate::proxy::http_client::set_proxy_port(actual_port);
+        log::info!("[{}] 代理服务器启动于 {local_addr}", log_srv::STARTED);
 
         Ok(ProxyServerInfo {
             address: self.config.listen_address.clone(),
@@ -223,43 +382,132 @@ impl ProxyServer {
     }
 
     pub async fn stop(&self) -> Result<(), ProxyError> {
-        // 1. 发送关闭信号
-        if let Some(tx) = self.shutdown_tx.write().await.take() {
-            let _ = tx.send(());
-        } else {
-            return Err(ProxyError::NotRunning);
+        let mut lifecycle = self.lifecycle.lock().await;
+        let completed = match &mut *lifecycle {
+            ServerLifecycle::Stopped { .. } => return Err(ProxyError::NotRunning),
+            ServerLifecycle::Stopping { .. } => None,
+            ServerLifecycle::Running(running) => {
+                if let Some(shutdown_tx) = running.shutdown_tx.take() {
+                    let _ = shutdown_tx.send(());
+                }
+
+                let result =
+                    match tokio::time::timeout(self.stop_timeout, &mut running.server_handle).await
+                    {
+                        Ok(Ok(())) => {
+                            log::info!("[{}] 代理服务器已完全停止", log_srv::STOPPED);
+                            Ok(())
+                        }
+                        Ok(Err(error)) => {
+                            log::warn!("[{}] 代理服务器任务异常终止: {error}", log_srv::TASK_ERROR);
+                            Err(ProxyError::StopFailed(error.to_string()))
+                        }
+                        Err(_) => {
+                            log::warn!(
+                                "[{}] 代理服务器停止超时，强制终止任务",
+                                log_srv::STOP_TIMEOUT
+                            );
+                            running.server_handle.abort();
+                            match (&mut running.server_handle).await {
+                                Ok(()) => {}
+                                Err(error) if error.is_cancelled() => {}
+                                Err(error) => log::warn!(
+                                    "[{}] 强制终止代理服务器任务后等待失败: {error}",
+                                    log_srv::TASK_ERROR
+                                ),
+                            }
+                            Err(ProxyError::StopTimeout)
+                        }
+                    };
+
+                Some((running.generation, result))
+            }
+        };
+
+        if let Some((generation, result)) = completed {
+            *lifecycle = ServerLifecycle::Stopping {
+                generation,
+                result: Some(result),
+            };
         }
 
-        // 2. 等待服务器任务结束（带 5 秒超时保护）
-        if let Some(handle) = self.server_handle.write().await.take() {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
-                Ok(Ok(())) => {
-                    log::info!("[{}] 代理服务器已完全停止", log_srv::STOPPED);
-                    Ok(())
-                }
-                Ok(Err(e)) => {
-                    log::warn!("[{}] 代理服务器任务异常终止: {e}", log_srv::TASK_ERROR);
-                    Err(ProxyError::StopFailed(e.to_string()))
-                }
-                Err(_) => {
-                    log::warn!(
-                        "[{}] 代理服务器停止超时（5秒），强制继续",
-                        log_srv::STOP_TIMEOUT
-                    );
-                    Err(ProxyError::StopTimeout)
-                }
-            }
-        } else {
-            Ok(())
+        let generation = match &*lifecycle {
+            ServerLifecycle::Stopping { generation, .. } => *generation,
+            ServerLifecycle::Stopped { .. } | ServerLifecycle::Running(_) => unreachable!(),
+        };
+
+        #[cfg(test)]
+        self.wait_at_stop_publish_pause_for_test().await;
+
+        self.publish_stopped_if_current(generation).await;
+        match std::mem::replace(&mut *lifecycle, ServerLifecycle::Stopped { generation }) {
+            ServerLifecycle::Stopping {
+                result: Some(result),
+                ..
+            } => result,
+            ServerLifecycle::Stopping { result: None, .. }
+            | ServerLifecycle::Stopped { .. }
+            | ServerLifecycle::Running(_) => unreachable!(),
         }
     }
 
+    async fn publish_stopped_if_current(&self, generation: u64) {
+        if self.active_generation.load(Ordering::Acquire) == generation {
+            self.state.status.write().await.running = false;
+            *self.state.start_time.write().await = None;
+            let _ = self.active_generation.compare_exchange(
+                generation,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+
+    pub(crate) async fn reuse_state(&self) -> ProxyServerReuseState {
+        match &*self.lifecycle.lock().await {
+            ServerLifecycle::Stopped { .. } => ProxyServerReuseState::Stopped,
+            ServerLifecycle::Running(running)
+                if running.shutdown_tx.is_some() && !running.server_handle.is_finished() =>
+            {
+                ProxyServerReuseState::Reusable
+            }
+            ServerLifecycle::Running(_) | ServerLifecycle::Stopping { .. } => {
+                ProxyServerReuseState::NeedsReap
+            }
+        }
+    }
+
+    pub(crate) async fn is_running(&self) -> bool {
+        self.reuse_state().await == ProxyServerReuseState::Reusable
+    }
+
+    pub(crate) async fn bind_config_matches(&self, desired: &ProxyConfig) -> bool {
+        if self.reuse_state().await != ProxyServerReuseState::Reusable
+            || self.config.listen_address != desired.listen_address
+        {
+            return false;
+        }
+
+        if desired.listen_port == 0 {
+            return self.config.listen_port == 0;
+        }
+
+        self.state.status.read().await.port == desired.listen_port
+    }
+
     pub async fn get_status(&self) -> ProxyStatus {
+        let running = self.is_running().await;
         let mut status = self.state.status.read().await.clone();
+        status.running = running;
 
         // 计算运行时间
-        if let Some(start) = *self.state.start_time.read().await {
-            status.uptime_seconds = start.elapsed().as_secs();
+        if running {
+            if let Some(start) = *self.state.start_time.read().await {
+                status.uptime_seconds = start.elapsed().as_secs();
+            }
+        } else {
+            status.uptime_seconds = 0;
         }
 
         // 从 current_providers HashMap 获取每个应用类型当前正在使用的 provider
@@ -286,6 +534,17 @@ impl ProxyServer {
             app_type.to_string(),
             (provider_id.to_string(), provider_name.to_string()),
         );
+    }
+
+    pub(crate) async fn replace_active_targets(&self, targets: &[ActiveTarget]) {
+        let mut current_providers = self.state.current_providers.write().await;
+        current_providers.clear();
+        current_providers.extend(targets.iter().map(|target| {
+            (
+                target.app_type.clone(),
+                (target.provider_id.clone(), target.provider_name.clone()),
+            )
+        }));
     }
 
     fn build_router(&self) -> Router {
@@ -416,21 +675,73 @@ impl ProxyServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{Provider, ProviderMeta};
+    use crate::provider::{
+        CodexAgentRoleRouting, CodexFrontendAgentRoleOverride, LocalProxyRetryPolicy, Provider,
+        ProviderMeta, DEFAULT_LOCAL_PROXY_RETRY_MESSAGE,
+    };
     use axum::http::{header, HeaderMap, StatusCode};
+    use axum::{extract::State, response::IntoResponse, routing::post, Json};
     use serde_json::{json, Value};
-    use tokio::sync::Mutex;
+    use serial_test::serial;
+    use std::{
+        ffi::OsString,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+    use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct CompletionFlag(Arc<AtomicBool>);
+
+    impl Drop for CompletionFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct TestHome {
+        _dir: TempDir,
+        original_test_home: Option<OsString>,
+    }
+
+    impl TestHome {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("create isolated proxy test home");
+            let original_test_home = std::env::var_os("CC_SWITCH_TEST_HOME");
+            std::env::set_var("CC_SWITCH_TEST_HOME", dir.path());
+            crate::settings::reload_settings().expect("reload isolated proxy settings");
+            Self {
+                _dir: dir,
+                original_test_home,
+            }
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            match &self.original_test_home {
+                Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
+                None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
+            }
+            let _ = crate::settings::reload_settings();
+        }
+    }
 
     #[derive(Debug)]
-    struct CapturedRequest {
+    struct CapturedSearchRequest {
         path_and_query: String,
         authorization: Option<String>,
         body: Value,
     }
 
     #[tokio::test]
+    #[serial]
     async fn alpha_search_routes_forward_to_canonical_upstream() {
-        let captured = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+        let _home = TestHome::new();
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::<CapturedSearchRequest>::new()));
         let mock_app = Router::new().route(
             "/v1/alpha/search",
             post({
@@ -442,7 +753,7 @@ mod tests {
                         let body = axum::body::to_bytes(body, 1024 * 1024)
                             .await
                             .expect("read mock request body");
-                        captured.lock().await.push(CapturedRequest {
+                        captured.lock().await.push(CapturedSearchRequest {
                             path_and_query: parts
                                 .uri
                                 .path_and_query()
@@ -550,9 +861,6 @@ mod tests {
             );
         }
 
-        // Full-URL providers were the known flaw in the original PR: without a
-        // sibling-endpoint rewrite, this request would be posted back to
-        // `/v1/responses` instead of `/v1/alpha/search`.
         let mut full_url_provider = Provider::with_id(
             "alpha-search-full-url".to_string(),
             "Alpha Search Full URL".to_string(),
@@ -623,6 +931,788 @@ mod tests {
         assert_eq!(
             full_url_request.body["commands"]["search_query"][0]["q"],
             "full URL"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_concurrent_start_allows_one_running_server_task() {
+        let _home = TestHome::new();
+        let db = Arc::new(Database::memory().expect("create proxy test database"));
+        let proxy = Arc::new(ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        ));
+        proxy
+            .set_start_barrier_for_test(Arc::new(tokio::sync::Barrier::new(2)))
+            .await;
+
+        let first_proxy = proxy.clone();
+        let first = tokio::spawn(async move { first_proxy.start().await });
+        let second_proxy = proxy.clone();
+        let second = tokio::spawn(async move { second_proxy.start().await });
+        let results = [
+            first.await.expect("first start task"),
+            second.await.expect("second start task"),
+        ];
+        let successful_ports: Vec<u16> = results
+            .iter()
+            .filter_map(|result| result.as_ref().ok().map(|info| info.port))
+            .collect();
+        let already_running = results
+            .iter()
+            .filter(|result| matches!(result, Err(ProxyError::AlreadyRunning)))
+            .count();
+        let status = proxy.get_status().await;
+        proxy.stop().await.expect("stop surviving proxy task");
+
+        assert_eq!(successful_ports.len(), 1);
+        assert_eq!(already_running, 1);
+        assert!(status.running);
+        assert_eq!(status.port, successful_ports[0]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_bind_config_comparison_handles_ephemeral_port_semantics() {
+        let _home = TestHome::new();
+        let db = Arc::new(Database::memory().expect("create proxy test database"));
+        let ephemeral = ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                ..Default::default()
+            },
+            db.clone(),
+            None,
+        );
+        let ephemeral_info = ephemeral.start().await.expect("start ephemeral proxy");
+        let persisted_actual = ProxyConfig {
+            listen_port: ephemeral_info.port,
+            ..Default::default()
+        };
+        let mut another_explicit = persisted_actual.clone();
+        another_explicit.listen_port = persisted_actual.listen_port.wrapping_add(1).max(1);
+
+        assert!(
+            ephemeral
+                .bind_config_matches(&ProxyConfig {
+                    listen_port: 0,
+                    ..Default::default()
+                })
+                .await
+        );
+        assert!(ephemeral.bind_config_matches(&persisted_actual).await);
+        assert!(!ephemeral.bind_config_matches(&another_explicit).await);
+        ephemeral.stop().await.expect("stop ephemeral proxy");
+
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve fixed proxy port");
+        let fixed_port = reserved.local_addr().expect("read fixed port").port();
+        drop(reserved);
+        let fixed = ProxyServer::new(
+            ProxyConfig {
+                listen_port: fixed_port,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        fixed.start().await.expect("start fixed-port proxy");
+        assert!(
+            !fixed
+                .bind_config_matches(&ProxyConfig {
+                    listen_port: 0,
+                    ..Default::default()
+                })
+                .await,
+            "requesting a fresh ephemeral bind must restart a fixed-port listener"
+        );
+        fixed.stop().await.expect("stop fixed-port proxy");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_cancelled_start_after_bind_does_not_publish_generation() {
+        let _home = TestHome::new();
+        let db = Arc::new(Database::memory().expect("create proxy test database"));
+        let proxy = Arc::new(ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        ));
+        let bind_entered = Arc::new(tokio::sync::Notify::new());
+        let bind_release = Arc::new(tokio::sync::Notify::new());
+        proxy
+            .set_start_bind_pause_for_test(bind_entered.clone(), bind_release)
+            .await;
+
+        let starting_proxy = proxy.clone();
+        let start_task = tokio::spawn(async move { starting_proxy.start().await });
+        tokio::time::timeout(Duration::from_secs(1), bind_entered.notified())
+            .await
+            .expect("start reaches the post-bind publication window");
+        start_task.abort();
+        let start_join = start_task.await;
+
+        let status_after_cancel = proxy.get_status().await;
+        let generation_after_cancel = proxy.active_generation.load(Ordering::Acquire);
+        let retry_start = proxy.start().await;
+        if retry_start.is_ok() {
+            proxy.stop().await.expect("stop retry generation");
+        }
+
+        assert!(start_join.is_err_and(|error| error.is_cancelled()));
+        assert!(!status_after_cancel.running);
+        assert_eq!(generation_after_cancel, 0);
+        assert!(retry_start.is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_stop_timeout_reaps_old_task_before_next_generation() {
+        let _home = TestHome::new();
+        let db = Arc::new(Database::memory().expect("create proxy test database"));
+        let mut proxy = ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        proxy.stop_timeout = Duration::from_millis(200);
+        let proxy = Arc::new(proxy);
+
+        let release_old_task = Arc::new(tokio::sync::Notify::new());
+        let old_task_completed = Arc::new(AtomicBool::new(false));
+        let old_state = proxy.state.clone();
+        let old_release = release_old_task.clone();
+        let old_completed = old_task_completed.clone();
+        let old_handle = tokio::spawn(async move {
+            let _completion = CompletionFlag(old_completed);
+            old_release.notified().await;
+            old_state.status.write().await.running = false;
+            *old_state.start_time.write().await = None;
+        });
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        proxy
+            .install_server_task_for_test(shutdown_tx, old_handle)
+            .await;
+
+        let stop_result = proxy.stop().await;
+        let completed_when_stop_returned = old_task_completed.load(Ordering::SeqCst);
+        let next_start = proxy.start().await;
+
+        release_old_task.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !old_task_completed.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old task reaches a terminal state");
+        let status_after_old_task = proxy.get_status().await;
+        if next_start.is_ok() {
+            proxy.stop().await.expect("stop next proxy generation");
+        }
+
+        assert!(matches!(stop_result, Err(ProxyError::StopTimeout)));
+        assert!(
+            completed_when_stop_returned,
+            "timeout must abort and await the old server task before returning"
+        );
+        assert!(
+            next_start.is_ok(),
+            "next generation should start after timeout"
+        );
+        assert!(
+            status_after_old_task.running,
+            "an old generation must not publish running=false over the new generation"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_cancelled_stop_retains_server_task_ownership() {
+        let _home = TestHome::new();
+        let db = Arc::new(Database::memory().expect("create proxy test database"));
+        let proxy = Arc::new(ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        ));
+
+        let stop_entered = Arc::new(tokio::sync::Notify::new());
+        let release_old_task = Arc::new(tokio::sync::Notify::new());
+        let old_task_completed = Arc::new(AtomicBool::new(false));
+        let entered = stop_entered.clone();
+        let release = release_old_task.clone();
+        let completed = old_task_completed.clone();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let old_handle = tokio::spawn(async move {
+            let _completion = CompletionFlag(completed);
+            let _ = shutdown_rx.await;
+            entered.notify_one();
+            release.notified().await;
+        });
+        proxy
+            .install_server_task_for_test(shutdown_tx, old_handle)
+            .await;
+
+        let stopping_proxy = proxy.clone();
+        let stop_task = tokio::spawn(async move { stopping_proxy.stop().await });
+        tokio::time::timeout(Duration::from_secs(1), stop_entered.notified())
+            .await
+            .expect("stop sends the shutdown signal");
+        stop_task.abort();
+        let stop_join = stop_task.await;
+
+        let start_result = proxy.start().await;
+        release_old_task.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !old_task_completed.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old task completes after release");
+        let reuse_state_after_completion = proxy.reuse_state().await;
+        let running_after_completion = proxy.is_running().await;
+        proxy.stop().await.expect("retry stop reaps the owned task");
+
+        assert!(stop_join.is_err_and(|error| error.is_cancelled()));
+        assert!(matches!(start_result, Err(ProxyError::AlreadyRunning)));
+        assert_eq!(
+            reuse_state_after_completion,
+            ProxyServerReuseState::NeedsReap
+        );
+        assert!(!running_after_completion);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_cancelled_stop_after_join_ready_keeps_generation_owned() {
+        let _home = TestHome::new();
+        let db = Arc::new(Database::memory().expect("create proxy test database"));
+        let proxy = Arc::new(ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        ));
+
+        let publish_entered = Arc::new(tokio::sync::Notify::new());
+        let publish_release = Arc::new(tokio::sync::Notify::new());
+        proxy
+            .set_stop_publish_pause_for_test(publish_entered.clone(), publish_release)
+            .await;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _ = shutdown_rx.await;
+        });
+        proxy
+            .install_server_task_for_test(shutdown_tx, handle)
+            .await;
+
+        let stopping_proxy = proxy.clone();
+        let stop_task = tokio::spawn(async move { stopping_proxy.stop().await });
+        tokio::time::timeout(Duration::from_secs(1), publish_entered.notified())
+            .await
+            .expect("stop reaches the pre-publication window");
+        stop_task.abort();
+        let stop_join = stop_task.await;
+
+        let start_result = proxy.start().await;
+        let retry_stop = proxy.stop().await;
+
+        assert!(stop_join.is_err_and(|error| error.is_cancelled()));
+        assert!(matches!(start_result, Err(ProxyError::AlreadyRunning)));
+        assert!(retry_stop.is_ok());
+        assert!(!proxy.get_status().await.running);
+    }
+
+    #[derive(Clone)]
+    struct RetryUpstreamState {
+        attempts: Arc<AtomicUsize>,
+        keep_matching: Arc<AtomicBool>,
+    }
+
+    async fn retry_upstream_response(State(state): State<RetryUpstreamState>) -> impl IntoResponse {
+        state.attempts.fetch_add(1, Ordering::SeqCst);
+        if state.keep_matching.load(Ordering::SeqCst) {
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": { "message": DEFAULT_LOCAL_PROXY_RETRY_MESSAGE }
+                })),
+            )
+        } else {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({ "error": { "message": "stop test retries" } })),
+            )
+        }
+    }
+
+    async fn spawn_switchable_retry_upstream() -> (
+        String,
+        Arc<AtomicUsize>,
+        Arc<AtomicBool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let keep_matching = Arc::new(AtomicBool::new(true));
+        let app = Router::new()
+            .route("/v1/responses", post(retry_upstream_response))
+            .with_state(RetryUpstreamState {
+                attempts: attempts.clone(),
+                keep_matching: keep_matching.clone(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind retry upstream");
+        let address = listener.local_addr().expect("retry upstream address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve retry upstream");
+        });
+        (format!("http://{address}"), attempts, keep_matching, server)
+    }
+
+    async fn abort_and_join_test_task(handle: tokio::task::JoinHandle<()>) {
+        handle.abort();
+        match handle.await {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() => {}
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => panic!("test fixture task join failed: {error}"),
+        }
+    }
+
+    async fn spawn_approval_recording_upstream() -> (
+        String,
+        Arc<tokio::sync::Mutex<Vec<(http::HeaderMap, serde_json::Value)>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured_for_handler = Arc::clone(&captured);
+        let app = Router::new().route(
+            "/v1/responses",
+            post(
+                move |headers: http::HeaderMap, Json(body): Json<serde_json::Value>| {
+                    let captured = Arc::clone(&captured_for_handler);
+                    async move {
+                        captured.lock().await.push((headers, body));
+                        Json(json!({
+                            "id": "approval-success",
+                            "status": "completed",
+                            "output": []
+                        }))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind approval recording upstream");
+        let address = listener
+            .local_addr()
+            .expect("approval recording upstream address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve approval recording upstream");
+        });
+        (format!("http://{address}"), captured, server)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn accepted_loopback_socket_reaches_role_header_validation_as_loopback() {
+        let _home = TestHome::new();
+        let db = Arc::new(Database::memory().expect("create proxy test database"));
+        let proxy = ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let proxy_info = proxy.start().await.expect("start test proxy");
+        let body = br#"{"model":"gpt-5.6-sol","input":"role peer test","stream":false}"#;
+        let request = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nX-CC-Switch-Role-Route: frontend\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            proxy_info.port,
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", proxy_info.port))
+            .await
+            .expect("connect loopback client");
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("write role request");
+        client.flush().await.expect("flush role request");
+
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+            .await
+            .expect("role validation response timeout")
+            .expect("read role validation response");
+        proxy.stop().await.expect("stop test proxy");
+
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(response.contains("provided together"), "{response}");
+        assert!(!response.contains("loopback"), "{response}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn codex_auto_review_role_headers_always_use_current_provider() {
+        let _home = TestHome::new();
+        let (provider_a_url, provider_a_requests, provider_a_server) =
+            spawn_approval_recording_upstream().await;
+        let (provider_b_url, provider_b_requests, provider_b_server) =
+            spawn_approval_recording_upstream().await;
+        let db = Arc::new(Database::memory().expect("create proxy test database"));
+        let routing = CodexAgentRoleRouting {
+            enabled: Some(true),
+            frontend: Some(CodexFrontendAgentRoleOverride {
+                provider_id: Some("provider-b".to_string()),
+                upstream_model: Some("frontend-upstream".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut provider_a = Provider::with_id(
+            "provider-a".to_string(),
+            "Provider A".to_string(),
+            json!({
+                "base_url": provider_a_url,
+                "auth": { "OPENAI_API_KEY": "test-key-a" }
+            }),
+            None,
+        );
+        provider_a.meta = Some(ProviderMeta {
+            codex_agent_role_routing: Some(routing.clone()),
+            ..Default::default()
+        });
+        let provider_b = Provider::with_id(
+            "provider-b".to_string(),
+            "Provider B".to_string(),
+            json!({
+                "base_url": provider_b_url,
+                "auth": { "OPENAI_API_KEY": "test-key-b" }
+            }),
+            None,
+        );
+        db.save_provider("codex", &provider_a)
+            .expect("save current provider A");
+        db.save_provider("codex", &provider_b)
+            .expect("save frontend provider B");
+        db.set_current_provider("codex", &provider_a.id)
+            .expect("set database current provider A");
+        crate::settings::set_current_provider(
+            &crate::app_config::AppType::Codex,
+            Some(&provider_a.id),
+        )
+        .expect("set local current provider A");
+
+        let proxy = ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                ..Default::default()
+            },
+            db.clone(),
+            None,
+        );
+        let proxy_info = proxy.start().await.expect("start test proxy");
+        let token = crate::services::codex_agent_roles::create_codex_role_route_token(
+            &provider_a.id,
+            crate::services::codex_agent_roles::FRONTEND_ROLE_ROUTE_VALUE,
+            &routing,
+        );
+        let header_cases = [
+            "X-CC-Switch-Role-Route: frontend\r\n".to_string(),
+            format!(
+                "X-CC-Switch-Role-Route: frontend\r\nX-CC-Switch-Role-Owner: {}\r\nX-CC-Switch-Role-Token: {}\r\n",
+                provider_a.id, token
+            ),
+        ];
+        let body = br#"{"model":"codex-auto-review","input":"review","stream":false}"#;
+
+        for role_headers in header_cases {
+            let request = format!(
+                "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                proxy_info.port,
+                role_headers,
+                body.len(),
+                String::from_utf8_lossy(body)
+            );
+            let mut client = tokio::net::TcpStream::connect(("127.0.0.1", proxy_info.port))
+                .await
+                .expect("connect approval client");
+            client
+                .write_all(request.as_bytes())
+                .await
+                .expect("write approval request");
+            client.flush().await.expect("flush approval request");
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+                .await
+                .expect("approval response timeout")
+                .expect("read approval response");
+            let response = String::from_utf8_lossy(&response);
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        }
+
+        proxy.stop().await.expect("stop test proxy");
+        abort_and_join_test_task(provider_a_server).await;
+        abort_and_join_test_task(provider_b_server).await;
+
+        let provider_a_requests = provider_a_requests.lock().await;
+        assert_eq!(provider_a_requests.len(), 2);
+        assert_eq!(provider_b_requests.lock().await.len(), 0);
+        for (headers, body) in provider_a_requests.iter() {
+            assert_eq!(body["model"], "codex-auto-review");
+            assert!(headers.get("x-cc-switch-role-route").is_none());
+            assert!(headers.get("x-cc-switch-role-owner").is_none());
+            assert!(headers.get("x-cc-switch-role-token").is_none());
+        }
+        assert_eq!(
+            db.get_current_provider("codex")
+                .expect("read current provider")
+                .as_deref(),
+            Some("provider-a")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tcp_disconnect_cancels_unlimited_provider_retry() {
+        let _home = TestHome::new();
+        let (upstream_url, attempts, keep_matching, upstream_server) =
+            spawn_switchable_retry_upstream().await;
+        let db = Arc::new(Database::memory().expect("create proxy test database"));
+
+        let mut provider = Provider::with_id(
+            "tcp-disconnect-provider".to_string(),
+            "TCP disconnect provider".to_string(),
+            json!({
+                "base_url": upstream_url,
+                "auth": { "OPENAI_API_KEY": "test-key" }
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            local_proxy_retry_policy: Some(LocalProxyRetryPolicy {
+                enabled: Some(true),
+                max_retries: 0,
+                retry_delay_ms: 20,
+                custom_messages: vec![DEFAULT_LOCAL_PROXY_RETRY_MESSAGE.to_string()],
+                error_types: vec![],
+            }),
+            ..Default::default()
+        });
+        db.save_provider("codex", &provider)
+            .expect("save retry provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("select retry provider");
+
+        let proxy = ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let proxy_info = proxy.start().await.expect("start test proxy");
+
+        let body = br#"{"model":"gpt-5.6-sol","input":"disconnect test","stream":false}"#;
+        let request = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+            proxy_info.port,
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", proxy_info.port))
+            .await
+            .expect("connect test client");
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("write proxy request");
+        client.flush().await.expect("flush proxy request");
+
+        let retries_started = tokio::time::timeout(Duration::from_secs(2), async {
+            while attempts.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let active_before_disconnect = proxy.get_status().await.active_connections;
+
+        drop(client);
+
+        let disconnected = tokio::time::timeout(Duration::from_secs(1), async {
+            while proxy.get_status().await.active_connections != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let stopped_at = attempts.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let attempts_stable = attempts.load(Ordering::SeqCst) == stopped_at;
+        let status_after_disconnect = proxy.get_status().await;
+
+        // A failed cancellation assertion must not leak an unlimited retry task
+        // into later tests. Change the upstream response to a non-matching error
+        // so any surviving handler exits on its next attempt before cleanup.
+        keep_matching.store(false, Ordering::SeqCst);
+        let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            while proxy.get_status().await.active_connections != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        abort_and_join_test_task(upstream_server).await;
+        proxy.stop().await.expect("stop test proxy");
+
+        assert!(retries_started, "proxy should start same-provider retries");
+        assert_eq!(
+            active_before_disconnect, 1,
+            "the in-flight client request should own one active connection"
+        );
+        assert!(
+            disconnected,
+            "dropping the real TCP client must cancel the proxy handler"
+        );
+        assert!(
+            attempts_stable,
+            "client disconnect must stop creating retry attempts"
+        );
+        assert_eq!(status_after_disconnect.active_connections, 0);
+        assert_eq!(status_after_disconnect.total_requests, 1);
+        assert_eq!(status_after_disconnect.success_requests, 0);
+        assert_eq!(status_after_disconnect.failed_requests, 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_review_stopping_proxy_cancels_unlimited_provider_retry_connections() {
+        let _home = TestHome::new();
+        let (upstream_url, attempts, keep_matching, upstream_server) =
+            spawn_switchable_retry_upstream().await;
+        let db = Arc::new(Database::memory().expect("create proxy test database"));
+
+        let mut provider = Provider::with_id(
+            "proxy-stop-provider".to_string(),
+            "Proxy stop provider".to_string(),
+            json!({
+                "base_url": upstream_url,
+                "auth": { "OPENAI_API_KEY": "test-key" }
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            local_proxy_retry_policy: Some(LocalProxyRetryPolicy {
+                enabled: Some(true),
+                max_retries: 0,
+                retry_delay_ms: 20,
+                custom_messages: vec![DEFAULT_LOCAL_PROXY_RETRY_MESSAGE.to_string()],
+                error_types: vec![],
+            }),
+            ..Default::default()
+        });
+        db.save_provider("codex", &provider)
+            .expect("save retry provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("select retry provider");
+
+        let proxy = ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let proxy_info = proxy.start().await.expect("start test proxy");
+
+        let body = br#"{"model":"gpt-5.6-sol","input":"stop test","stream":false}"#;
+        let request = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+            proxy_info.port,
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", proxy_info.port))
+            .await
+            .expect("connect test client");
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("write proxy request");
+        client.flush().await.expect("flush proxy request");
+
+        let retries_started = tokio::time::timeout(Duration::from_secs(2), async {
+            while attempts.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let active_before_stop = proxy.get_status().await.active_connections;
+
+        let stop_result = proxy.stop().await;
+        let status_after_stop = proxy.get_status().await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let stopped_at = attempts.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let attempts_stable = attempts.load(Ordering::SeqCst) == stopped_at;
+
+        keep_matching.store(false, Ordering::SeqCst);
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            while proxy.get_status().await.active_connections != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        abort_and_join_test_task(upstream_server).await;
+
+        assert!(retries_started, "proxy should start same-provider retries");
+        assert_eq!(active_before_stop, 1);
+        assert!(stop_result.is_ok(), "proxy stop should succeed");
+        assert_eq!(
+            status_after_stop.active_connections, 0,
+            "stop must wait for active connection cancellation"
+        );
+        assert!(
+            attempts_stable,
+            "stop must prevent existing unlimited retry connections from issuing new attempts"
         );
     }
 }

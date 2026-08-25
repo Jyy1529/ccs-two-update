@@ -135,7 +135,7 @@ pub async fn webdav_sync_upload(state: State<'_, AppState>) -> Result<Value, Str
 #[tauri::command]
 pub async fn webdav_sync_download(state: State<'_, AppState>) -> Result<Value, String> {
     let db = state.db.clone();
-    let app_state_for_sync = state.inner().clone();
+    let state = state.inner().owned_clone();
     let mut settings = require_enabled_webdav_settings()?;
 
     // Keep the derived live configuration refresh in the same global sync
@@ -144,11 +144,7 @@ pub async fn webdav_sync_download(state: State<'_, AppState>) -> Result<Value, S
     let sync_result = run_download_with_webdav_lock(
         webdav_sync_service::download(&db, &mut settings),
         |result| async move {
-            let post_sync_result = tauri::async_runtime::spawn_blocking(move || {
-                run_post_import_sync(&app_state_for_sync)
-            })
-            .await
-            .map_err(|e| e.to_string());
+            let post_sync_result = run_post_import_sync(state).await;
             Ok((result, post_sync_result))
         },
     )

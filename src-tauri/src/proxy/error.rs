@@ -8,6 +8,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ProxyError {
+    #[error("请求体超过大小上限: {0} 字节")]
+    RequestBodyTooLarge(usize),
+
     #[error("上游响应体超过大小上限: {0} 字节")]
     ResponseBodyTooLarge(usize),
 
@@ -44,6 +47,9 @@ pub enum ProxyError {
 
     #[error("上游错误 (状态码 {status}): {body:?}")]
     UpstreamError { status: u16, body: Option<String> },
+
+    #[error("上游错误响应体读取超时 (状态码 {status}): {timeout_seconds}秒内未读取完成")]
+    UpstreamBodyTimeout { status: u16, timeout_seconds: u64 },
 
     #[error("超过最大重试次数")]
     MaxRetriesExceeded,
@@ -114,6 +120,23 @@ impl IntoResponse for ProxyError {
 
                 (http_status, error_body)
             }
+            ProxyError::UpstreamBodyTimeout {
+                status: upstream_status,
+                timeout_seconds,
+            } => {
+                let http_status =
+                    StatusCode::from_u16(*upstream_status).unwrap_or(StatusCode::BAD_GATEWAY);
+                let error_body = json!({
+                    "error": {
+                        "message": format!(
+                            "Upstream HTTP {} response body timed out after {}s",
+                            upstream_status, timeout_seconds
+                        ),
+                        "type": "upstream_body_timeout",
+                    }
+                });
+                (http_status, error_body)
+            }
             _ => {
                 let (http_status, message) = match &self {
                     ProxyError::AlreadyRunning => (StatusCode::CONFLICT, self.to_string()),
@@ -162,7 +185,12 @@ impl IntoResponse for ProxyError {
                     ProxyError::ResponseBodyTooLarge(_) => {
                         (StatusCode::BAD_GATEWAY, self.to_string())
                     }
-                    ProxyError::UpstreamError { .. } => unreachable!(),
+                    ProxyError::RequestBodyTooLarge(_) => {
+                        (StatusCode::PAYLOAD_TOO_LARGE, self.to_string())
+                    }
+                    ProxyError::UpstreamError { .. } | ProxyError::UpstreamBodyTimeout { .. } => {
+                        unreachable!()
+                    }
                 };
 
                 let error_body = json!({
@@ -208,5 +236,17 @@ pub fn categorize_error(error: &reqwest::Error) -> ErrorCategory {
         }
     } else {
         ErrorCategory::Retryable
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_body_too_large_responds_with_payload_too_large() {
+        let response = ProxyError::RequestBodyTooLarge(200 * 1024 * 1024 + 1).into_response();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

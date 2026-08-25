@@ -167,6 +167,7 @@ command = "say"
                 grokbuild: false,
                 opencode: false,
                 hermes: false,
+                ..Default::default()
             },
             description: None,
             homepage: None,
@@ -1098,6 +1099,7 @@ fn reapply_codex_official_live_resyncs_mcp_servers() {
                 grokbuild: false,
                 opencode: false,
                 hermes: false,
+                ..Default::default()
             },
             description: None,
             homepage: None,
@@ -1197,6 +1199,7 @@ fn reapply_codex_official_live_projects_mcp_despite_broken_claude_json() {
                 grokbuild: false,
                 opencode: false,
                 hermes: false,
+                ..Default::default()
             },
             description: None,
             homepage: None,
@@ -1290,6 +1293,7 @@ fn switch_codex_projects_mcp_despite_broken_claude_json() {
                 grokbuild: false,
                 opencode: false,
                 hermes: false,
+                ..Default::default()
             },
             description: None,
             homepage: None,
@@ -1354,6 +1358,7 @@ fn sync_all_enabled_reports_broken_app_but_projects_the_rest() {
                 grokbuild: false,
                 opencode: false,
                 hermes: false,
+                ..Default::default()
             },
             description: None,
             homepage: None,
@@ -2876,7 +2881,14 @@ fn provider_service_switch_codex_missing_auth_returns_error() {
             msg.contains("auth"),
             "expected auth related message, got {msg}"
         ),
-        other => panic!("expected config error, got {other:?}"),
+        AppError::Localized { key, zh, en } => {
+            assert_eq!(key, "provider.codex.auth.missing");
+            assert!(
+                zh.contains("auth") && en.contains("auth"),
+                "expected localized auth missing messages, got zh={zh}, en={en}"
+            );
+        }
+        other => panic!("expected auth configuration error, got {other:?}"),
     }
 }
 

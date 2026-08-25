@@ -67,6 +67,7 @@ import { ProfileSwitcher } from "@/components/profiles/ProfileSwitcher";
 import { ProviderList } from "@/components/providers/ProviderList";
 import { AddProviderDialog } from "@/components/providers/AddProviderDialog";
 import { EditProviderDialog } from "@/components/providers/EditProviderDialog";
+import { ProviderTransferDialog } from "@/components/providers/ProviderTransferDialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { SettingsPage } from "@/components/settings/SettingsPage";
 import { UpdateBadge } from "@/components/UpdateBadge";
@@ -185,6 +186,10 @@ function App() {
     useState<SkillsPageSource>("repos");
   const [settingsDefaultTab, setSettingsDefaultTab] = useState("general");
   const [isAddOpen, setIsAddOpen] = useState(false);
+  const [isRoleProviderAddOpen, setIsRoleProviderAddOpen] = useState(false);
+  const pendingRoleProviderCreatedRef = useRef<
+    ((providerId: string) => void) | null
+  >(null);
   const [isWindowMaximized, setIsWindowMaximized] = useState(false);
   const [mcpManagementBusy, setMcpManagementBusy] = useState(false);
   const [skillsManagementBusy, setSkillsManagementBusy] = useState(false);
@@ -246,6 +251,9 @@ function App() {
   }, [sharedFeatureApp, currentView]);
 
   const [editingProvider, setEditingProvider] = useState<Provider | null>(null);
+  const [transferProvider, setTransferProvider] = useState<Provider | null>(
+    null,
+  );
   const [usageProvider, setUsageProvider] = useState<Provider | null>(null);
   const [confirmAction, setConfirmAction] = useState<{
     provider: Provider;
@@ -360,6 +368,25 @@ function App() {
         },
       );
     }
+  };
+
+  const requestAddCodexProvider = (onCreated: (providerId: string) => void) => {
+    pendingRoleProviderCreatedRef.current = onCreated;
+    setIsRoleProviderAddOpen(true);
+  };
+
+  const handleRoleProviderOpenChange = (open: boolean) => {
+    setIsRoleProviderAddOpen(open);
+    if (!open) {
+      pendingRoleProviderCreatedRef.current = null;
+    }
+  };
+
+  const handleRoleProviderSubmit = async (
+    provider: Parameters<typeof addProvider>[0],
+  ) => {
+    const createdProvider = await addProvider(provider);
+    pendingRoleProviderCreatedRef.current?.(createdProvider.id);
   };
 
   const disableOmoMutation = useDisableCurrentOmo();
@@ -1139,6 +1166,7 @@ function App() {
                           : undefined
                       }
                       onDuplicate={handleDuplicateProvider}
+                      onTransfer={setTransferProvider}
                       onConfigureUsage={setUsageProvider}
                       onOpenWebsite={handleOpenWebsite}
                       onOpenTerminal={
@@ -1756,6 +1784,10 @@ function App() {
         onOpenChange={setIsAddOpen}
         appId={activeApp}
         onSubmit={addProvider}
+        onRequestAddProvider={
+          activeApp === "codex" ? requestAddCodexProvider : undefined
+        }
+        escapeEnabled={!isRoleProviderAddOpen}
       />
 
       <EditProviderDialog
@@ -1769,7 +1801,30 @@ function App() {
         onSubmit={handleEditProvider}
         appId={activeApp}
         isProxyTakeover={isCurrentAppTakeoverActive}
+        onRequestAddProvider={
+          activeApp === "codex" ? requestAddCodexProvider : undefined
+        }
+        escapeEnabled={!isRoleProviderAddOpen}
       />
+
+      <AddProviderDialog
+        open={isRoleProviderAddOpen}
+        onOpenChange={handleRoleProviderOpenChange}
+        appId="codex"
+        onSubmit={handleRoleProviderSubmit}
+        appSpecificOnly
+      />
+
+      {transferProvider && (
+        <ProviderTransferDialog
+          open
+          sourceApp={activeApp}
+          sourceProvider={transferProvider}
+          onOpenChange={(open) => {
+            if (!open) setTransferProvider(null);
+          }}
+        />
+      )}
 
       {effectiveUsageProvider && (
         <UsageScriptModal

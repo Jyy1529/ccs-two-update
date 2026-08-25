@@ -138,9 +138,8 @@ impl ConfigService {
             AppType::Hermes => {
                 // Hermes uses additive mode, no live sync needed
             }
-            AppType::Pi => {
-                // Pi owns its shared models/settings documents; this legacy
-                // single-provider live-sync path must not rewrite them.
+            AppType::DeepSeek | AppType::Pi => {
+                // DeepSeek / Pi 暂不写 live 配置（switch 时由 provider 服务处理）
             }
         }
 

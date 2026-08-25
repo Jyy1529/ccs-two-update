@@ -179,6 +179,21 @@
     },
     "duplicateLiveIdsLoadFailed": "读取配置中的供应商标识失败，请先修复配置后再试"
   },
+  "providerTransfer": {
+    "action": "导入到其他 Agent",
+    "title": "导入到其他 Agent",
+    "description": "选择接收该供应商的 Agent",
+    "name": "供应商名称",
+    "notes": "备注",
+    "website": "官网链接",
+    "endpoint": "API 请求地址",
+    "targets": "目标 Agent",
+    "import": "导入",
+    "success": "供应商已导入",
+    "partialSuccess": "部分 Agent 导入完成",
+    "failed": "供应商导入失败",
+    "skipped": "已跳过"
+  },
   "claudeCode": {
     "needsRouting": "需要路由",
     "noRoutingSupport": "不支持路由"
@@ -344,6 +359,23 @@
     "tabAuth": "认证",
     "tabAdvanced": "高级",
     "tabProxy": "路由",
+    "featureScopes": {
+      "title": "Provider 功能生效范围",
+      "description": "控制以下功能启用与生效的应用；未勾选的应用不显示对应配置，也不参与该功能。",
+      "codexOnlyHint": "当前仅 Codex 支持",
+      "localProxyRetry": {
+        "title": "本地代理自动重试",
+        "description": "本地代理请求失败时按 Provider 重试策略自动重试。"
+      },
+      "agentRoleRouting": {
+        "title": "前端/后端子代理模型路由",
+        "description": "前端角色可使用独立 Codex Provider，后端角色跟随当前 Provider。"
+      },
+      "autoReviewRouting": {
+        "title": "审批模型路由",
+        "description": "控制 Codex 审批请求使用原生、自动或回退模型。"
+      }
+    },
     "authCenter": {
       "title": "OAuth 认证中心",
       "description": "在 Claude Code 中使用您的其他订阅，请注意合规风险。",
@@ -364,6 +396,8 @@
         "enableFeatureDescription": "开启后，主页面顶部将显示路由和故障转移开关",
         "enableFailoverToggle": "在主页面显示故障转移开关",
         "enableFailoverToggleDescription": "开启后，主页面顶部将独立显示故障转移开关",
+        "providerRetryEnabled": "启用供应商自动重试",
+        "providerRetryEnabledDescription": "全局关闭后，所有供应商的自动重试暂时不生效，已填写的次数、间隔和触发条件保持不变。",
         "running": "运行中",
         "stopped": "已停止"
       },
@@ -498,6 +532,12 @@
       "deleteFailed": "删除失败",
       "deleteConfirmTitle": "确认删除备份",
       "deleteConfirmMessage": "此备份将被永久删除，此操作无法撤消。"
+    },
+    "postImportSync": {
+      "partialSuccess": "恢复已完成，后续同步失败",
+      "retry": "重试同步",
+      "retrySuccess": "后续同步已完成",
+      "retryFailed": "后续同步重试失败：{{error}}"
     },
     "webdavSync": {
       "title": "WebDAV 云同步",
@@ -694,6 +734,30 @@
     "silentStartup": "静默启动",
     "silentStartupDescription": "程序启动时不显示主窗口，仅在系统托盘运行",
     "autoLaunchFailed": "设置开机自启失败",
+    "codexRepair": {
+      "title": "Codex Desktop 修复",
+      "description": "检测更新后的功能状态，并按需启动管理员修复。",
+      "enabled": "Codex Desktop 健康检测",
+      "enabledDescription": "CC Switch 启动时检查 Codex Desktop 修复状态",
+      "checkNow": "立即检测",
+      "repair": "管理员修复",
+      "runtimeMissing": "修复时将下载并校验 Fast Patch runtime",
+      "checkFailed": "Codex Desktop 检测失败",
+      "launchStarted": "已请求管理员权限，请在 UAC 提示中确认",
+      "launchFailed": "无法启动管理员修复",
+      "repairRunning": "修复进行中",
+      "repairRunningDescription": "独立管理员窗口正在执行修复，请在该窗口查看进度。",
+      "confirmTitle": "启动 Codex Desktop 修复？",
+      "confirmDescription": "将先备份 Codex 配置，再请求管理员权限运行可见的独立修复窗口。Codex Desktop 可能会关闭并重新启动。",
+      "confirm": "确认修复",
+      "state": {
+        "unsupported": "当前平台不支持",
+        "notInstalled": "未安装 Codex Desktop",
+        "healthy": "状态健康",
+        "needsRepair": "需要修复",
+        "unknown": "等待检测"
+      }
+    },
     "minimizeToTray": "关闭时最小化到托盘",
     "minimizeToTrayDescription": "勾选后点击关闭按钮会隐藏到系统托盘，取消则直接退出应用。",
     "useAppWindowControls": "启用应用级窗口按钮",
@@ -789,6 +853,7 @@
     "openclawConfigDirDescription": "覆盖 OpenClaw 配置目录 (openclaw.json)。",
     "hermesConfigDir": "Hermes 配置目录",
     "hermesConfigDirDescription": "覆盖 Hermes 配置目录 (config.yaml)。",
+    "deepseekConfigDir": "DeepSeek 配置目录",
     "piConfigDir": "Pi 配置目录",
     "piConfigDirDescription": "覆盖 Pi 配置目录（models.json、指令文件、提示词、Skills 与会话）。",
     "browsePlaceholderClaude": "例如：/home/<你的用户名>/.claude",
@@ -798,6 +863,7 @@
     "browsePlaceholderOpencode": "例如：/home/<你的用户名>/.config/opencode",
     "browsePlaceholderOpenclaw": "例如：/home/<你的用户名>/.openclaw",
     "browsePlaceholderHermes": "例如：/home/<你的用户名>/.hermes",
+    "browsePlaceholderDeepSeek": "例如：/home/<你的用户名>/.dsh",
     "browsePlaceholderPi": "例如：/home/<你的用户名>/.pi/agent",
     "browseDirectory": "浏览目录",
     "resetDefault": "恢复默认目录（需保存后生效）",
@@ -819,7 +885,7 @@
     "officialWebsite": "官方网站",
     "github": "GitHub",
     "manualInstallCommands": "手动安装命令",
-    "oneClickInstallHint": "安装或升级 Claude Code / Codex / Gemini CLI / OpenCode / OpenClaw / Hermes / Pi",
+    "oneClickInstallHint": "安装或升级 Claude Code / Codex / Gemini CLI / Grok Build / OpenCode / OpenClaw / Hermes / DeepSeek Harness / Pi",
     "localEnvCheck": "本地环境检查",
     "updateAllTools": "全部升级（{{count}}）",
     "currentVersion": "当前版本",
@@ -910,6 +976,7 @@
     "opencode": "OpenCode",
     "openclaw": "OpenClaw",
     "hermes": "Hermes",
+    "deepseek": "DeepSeek",
     "pi": "Pi"
   },
   "pi": {
@@ -1330,7 +1397,7 @@
     "quickSetModels": "一键设置",
     "quickSetSuccess": "已将模型名称应用到所有角色",
     "advancedOptionsToggle": "高级选项",
-    "advancedOptionsHint": "包含 API 格式、认证字段、模型映射等配置。大多数场景下保持默认即可。",
+    "advancedOptionsHint": "包含 API 格式、认证字段、模型映射、本地代理自动重试和计费等可用配置。大多数场景下保持默认即可。",
     "categoryOfficial": "官方",
     "categoryCnOfficial": "开源官方",
     "categoryAggregation": "聚合服务",
@@ -1494,7 +1561,59 @@
     "pricingModelSourceInherit": "继承全局默认",
     "pricingModelSourceRequest": "请求模型",
     "pricingModelSourceResponse": "返回模型",
-    "pricingModelSourceHint": "选择按请求模型还是返回模型进行定价匹配"
+    "pricingModelSourceHint": "选择按请求模型还是返回模型进行定价匹配",
+    "retryPolicy": "本地代理自动重试",
+    "retryPolicyDesc": "命中配置条件时，普通模型请求会在当前供应商重试。有限次数耗尽后继续现有故障转移；无限模式会持续使用当前供应商，直到成功、错误不再匹配或请求取消。",
+    "retryProviderEnabled": "启用此供应商的自动重试",
+    "retryGlobalHint": "全局开关位于“设置 → 代理 → 高级代理配置”。",
+    "retryZeroCountHint": "无限重试已启用。持续命中的错误会一直重试当前供应商，不会进入故障转移，直到成功、错误不再匹配或请求取消。",
+    "retryMaxRetries": "额外重试次数",
+    "retryMaxRetriesHint": "启用时，0 表示无限重试；有限次数范围为 1-100。关闭供应商开关可停用重试。",
+    "retryDelayMs": "重试间隔（毫秒）",
+    "retryDelayMsHint": "每次尝试之间固定等待 1-60000 毫秒。",
+    "retryErrorTypes": "预设错误类型",
+    "retryErrorTypeRateLimit": "速率限制（HTTP 429）",
+    "retryErrorTypeOverloaded": "服务过载（HTTP 503）",
+    "retryErrorTypeServerError": "其他服务端错误（HTTP 5xx）",
+    "retryErrorTypeNetwork": "网络和超时错误",
+    "retryCustomMessages": "错误文案包含词",
+    "retryCustomMessagesHint": "每行一条，忽略大小写；仅检查错误包。",
+    "retryValidation": {
+      "maxRetries": "额外重试次数必须是 0-100 的整数。",
+      "retryDelayMs": "重试间隔必须是 1-60000 毫秒的整数。",
+      "triggerRequired": "启用重试时，请至少选择一种错误类型或填写一条错误文案。"
+    },
+    "agentRoleRouting": "前端/后端子代理模型路由",
+    "agentRoleRoutingSummary": "前端角色可使用独立 Codex Provider，后端角色继续跟随当前 Provider。",
+    "agentRoleEnabled": "启用子代理角色路由",
+    "agentRoleRoutingDesc": "前端独立路由需要 Codex 本地代理接管。Provider B 先使用自己的重试策略，耗尽后回退配置拥有者 Provider A，并保持全局当前 Provider 不变。",
+    "agentRoleFrontend": "前端子代理",
+    "agentRoleFrontendHint": "选择独立 Provider 和实际上游模型；Codex 能力元数据默认跟随主 Agent。",
+    "agentRoleFrontendProvider": "前端 Provider",
+    "agentRoleFollowCurrentProvider": "跟随当前 Provider",
+    "agentRoleUnavailableProvider": "失效 Provider",
+    "agentRoleAddProvider": "新增 Provider",
+    "agentRoleUnavailableProviderHint": "已配置的 Provider 当前不可用，运行时会回退当前 Provider。",
+    "agentRoleUpstreamModel": "前端上游模型",
+    "agentRoleUpstreamModelPlaceholder": "跟随目标 Provider 默认模型",
+    "agentRoleFetchModels": "拉取模型",
+    "agentRoleUpstreamModelHint": "该模型会实际发送给目标 Provider，支持自由填写任意模型 ID。",
+    "agentRoleCapabilityModel": "Codex 能力模型",
+    "agentRoleFollowMainAgent": "跟随主 Agent",
+    "agentRoleUnknownCapabilityModel": "该模型未出现在当前可见共享 Catalog 中，Codex 将使用 fallback 模型元数据。",
+    "agentRoleReasoning": "思考强度",
+    "agentRoleFollowMain": "跟随主 Agent",
+    "agentRoleBackend": "后端子代理",
+    "agentRoleBackendProviderHint": "后端角色固定使用配置拥有者 Provider：{{provider}}。",
+    "agentRoleCurrentProvider": "当前 Provider",
+    "agentRoleBackendModel": "后端能力模型",
+    "agentRoleOwnerDeleteBlocked": "删除此 Provider 前，请先关闭它的子代理角色路由。",
+    "agentRoleTargetDeleteBlocked": "此 Provider 正被以下前端角色配置引用：{{providers}}。",
+    "agentRoleProxyDisableBlocked": "当前子代理角色路由依赖 Codex 代理接管，请先关闭角色路由。",
+    "agentRoleLoopbackRequired": "前端子代理独立 Provider 路由要求 Codex 本地代理监听回环地址（127.0.0.1 或 ::1）。请修改监听地址后重试。",
+    "agentRoleProxyAutoEnabled": "已为前端角色路由自动启用 Codex 本地代理接管。",
+    "agentRoleSavedSwitchRequired": "角色路由配置已保存；切换到该 Provider 后将自动启用代理并生效。",
+    "agentRoleRestartRequired": "请新建 Codex 任务或重启 Codex，使托管的 Agent Role 被重新发现。"
   },
   "codexConfig": {
     "authJson": "auth.json (JSON) *",
@@ -1537,6 +1656,13 @@
     "promptCacheRoutingEnabled": "开启",
     "promptCacheRoutingDisabled": "关闭",
     "promptCacheRoutingHint": "自动模式仅对已确认兼容的上游发送 prompt_cache_key；开启可用于其他兼容网关，关闭可避免严格网关因未知字段返回 400。只使用客户端提供的稳定会话 ID。",
+    "autoReviewModeLabel": "审批模型路由",
+    "autoReviewModeNative": "原生",
+    "autoReviewModeAuto": "自动",
+    "autoReviewModeFallback": "回退",
+    "autoReviewModeHint": "自动模式会先请求 codex-auto-review，该模型不可用时切换回退模型。",
+    "autoReviewFallbackModelLabel": "回退审批模型",
+    "autoReviewFallbackModelHint": "留空时使用当前供应商的默认 Codex 模型。",
     "upstreamModelName": "上游模型名称",
     "upstreamModelNameHint": "Chat 格式下这里填写真实上游模型；路由会把 Codex 的 Responses 请求转换为 Chat Completions 并保持该模型。",
     "modelNamePlaceholder": "例如: gpt-5-codex",
@@ -1575,7 +1701,7 @@
     "reasoningEffortHint": "上游支持 low/high/max 等思考深度控制时启用。启用后会自动启用思考模式，并把 Codex 的 reasoning.effort 转成上游 Chat 参数。",
     "reasoningGroupTitle": "思考能力",
     "reasoningSectionHint": "预设供应商已自动配置；自定义供应商会按名称/地址自动推断。仅当自动识别不准时才需手动覆盖。",
-    "advancedSectionHint": "包含上游格式、模型映射、思考能力与自定义 User-Agent。使用 Chat Completions 协议的供应商需开启路由接管才能使用。",
+    "advancedSectionHint": "包含上游格式、模型映射、思考能力、自定义 User-Agent、本地代理自动重试和计费配置。使用 Chat Completions 协议的供应商需开启路由接管才能使用。",
     "noCommonConfigToApply": "通用配置片段为空或没有可写入的内容"
   },
   "geminiConfig": {
@@ -2013,7 +2139,9 @@
         "grokbuild": "Grok Build",
         "opencode": "OpenCode",
         "openclaw": "OpenClaw",
-        "hermes": "Hermes"
+        "hermes": "Hermes",
+        "deepseek": "DeepSeek",
+        "pi": "Pi"
       }
     },
     "userLevelPath": "用户级 MCP 配置路径",
@@ -2627,7 +2755,9 @@
       "codex": "Codex",
       "gemini": "Gemini",
       "opencode": "OpenCode",
-      "openclaw": "OpenClaw"
+      "openclaw": "OpenClaw",
+      "deepseek": "DeepSeek",
+      "pi": "Pi"
     },
     "installFromZip": {
       "button": "从 ZIP 安装",

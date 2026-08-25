@@ -23,13 +23,17 @@ pub fn map_proxy_error_to_status(error: &ProxyError) -> u16 {
         ProxyError::NotRunning => 503,
 
         // 上游错误：使用实际状态码
-        ProxyError::UpstreamError { status, .. } => *status,
+        ProxyError::UpstreamError { status, .. }
+        | ProxyError::UpstreamBodyTimeout { status, .. } => *status,
 
         // 超时错误：504 Gateway Timeout
         ProxyError::Timeout(_) | ProxyError::StreamIdleTimeout(_) => 504,
 
-        // 转发失败/连接失败：502 Bad Gateway
-        ProxyError::ForwardFailed(_) => 502,
+        // 转发失败/连接失败/上游响应超限：502 Bad Gateway
+        ProxyError::ForwardFailed(_) | ProxyError::ResponseBodyTooLarge(_) => 502,
+
+        // 请求体超限：413 Payload Too Large
+        ProxyError::RequestBodyTooLarge(_) => 413,
 
         // 无可用 Provider：503 Service Unavailable
         ProxyError::NoAvailableProvider => 503,
@@ -73,6 +77,10 @@ pub fn get_error_message(error: &ProxyError) -> String {
                 format!("上游错误 ({status})")
             }
         }
+        ProxyError::UpstreamBodyTimeout {
+            status,
+            timeout_seconds,
+        } => format!("上游错误响应体读取超时 ({status}): {timeout_seconds}秒"),
         ProxyError::Timeout(msg) => format!("请求超时: {msg}"),
         ProxyError::ForwardFailed(msg) => format!("转发失败: {msg}"),
         ProxyError::NoAvailableProvider => "无可用 Provider".to_string(),
@@ -106,9 +114,33 @@ mod tests {
     }
 
     #[test]
+    fn upstream_body_timeout_keeps_known_status() {
+        let error = ProxyError::UpstreamBodyTimeout {
+            status: 422,
+            timeout_seconds: 3,
+        };
+        assert_eq!(map_proxy_error_to_status(&error), 422);
+        let message = get_error_message(&error);
+        assert!(message.contains("422"));
+        assert!(message.contains("3秒"));
+    }
+
+    #[test]
     fn test_map_connection_error() {
         let error = ProxyError::ForwardFailed("Connection refused".to_string());
         assert_eq!(map_proxy_error_to_status(&error), 502);
+    }
+
+    #[test]
+    fn response_body_too_large_maps_to_bad_gateway() {
+        let error = ProxyError::ResponseBodyTooLarge(128 * 1024 * 1024 + 1);
+        assert_eq!(map_proxy_error_to_status(&error), 502);
+    }
+
+    #[test]
+    fn request_body_too_large_maps_to_payload_too_large() {
+        let error = ProxyError::RequestBodyTooLarge(200 * 1024 * 1024 + 1);
+        assert_eq!(map_proxy_error_to_status(&error), 413);
     }
 
     #[test]

@@ -5348,6 +5348,19 @@ model_catalog_json = "my-custom-catalog.json"
     }
 
     #[test]
+    fn set_catalog_json_some_reclaims_cc_switch_owned_basename() {
+        let input = r#"model_catalog_json = "/old/location/cc-switch-model-catalog.json"
+"#;
+        let catalog_path = Path::new("/tmp/cc-switch-model-catalog.json");
+        let result = set_codex_model_catalog_json_field(input, Some(catalog_path)).unwrap();
+        let parsed: toml::Value = toml::from_str(&result).unwrap();
+        assert_eq!(
+            parsed.get("model_catalog_json").and_then(|v| v.as_str()),
+            Some(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME)
+        );
+    }
+
+    #[test]
     fn resolve_catalog_finds_relative_filename() {
         let config_text = r#"model_provider = "custom"
 model_catalog_json = "cc-switch-model-catalog.json"
@@ -5414,7 +5427,13 @@ model_catalog_json = "cc-switch-model-catalog.json"
         #[cfg(unix)]
         std::os::unix::fs::symlink(&outside_dir, base_dir.join("link")).expect("symlink");
         #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&outside_dir, base_dir.join("link")).expect("symlink");
+        if let Err(error) = std::os::windows::fs::symlink_dir(&outside_dir, base_dir.join("link")) {
+            if error.raw_os_error() == Some(1314) {
+                eprintln!("skipping symlink containment test: Windows privilege 1314");
+                return;
+            }
+            panic!("symlink: {error}");
+        }
 
         let config_text = r#"model_catalog_json = "link/cc-switch-model-catalog.json"
 "#;

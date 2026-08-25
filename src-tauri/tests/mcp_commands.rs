@@ -409,6 +409,7 @@ command = "echo"
                 grokbuild: false,
                 opencode: false,
                 hermes: false,
+                ..Default::default()
             },
             description: None,
             homepage: None,
@@ -554,6 +555,7 @@ fn set_mcp_enabled_for_codex_writes_live_config() {
                 grokbuild: false,
                 opencode: false,
                 hermes: false,
+                ..Default::default()
             },
             description: None,
             homepage: None,
@@ -620,6 +622,7 @@ fn enabling_codex_mcp_skips_when_codex_dir_missing() {
                 grokbuild: false,
                 opencode: false,
                 hermes: false,
+                ..Default::default()
             },
             description: None,
             homepage: None,
@@ -666,6 +669,7 @@ fn upsert_mcp_server_disabling_app_removes_from_claude_live_config() {
                 grokbuild: false,
                 opencode: false,
                 hermes: false,
+                ..Default::default()
             },
             description: None,
             homepage: None,
@@ -701,6 +705,7 @@ fn upsert_mcp_server_disabling_app_removes_from_claude_live_config() {
                 grokbuild: false,
                 opencode: false,
                 hermes: false,
+                ..Default::default()
             },
             description: None,
             homepage: None,
@@ -716,6 +721,47 @@ fn upsert_mcp_server_disabling_app_removes_from_claude_live_config() {
         v.pointer("/mcpServers/echo").is_none(),
         "echo should be removed from Claude live config after disabling"
     );
+}
+
+#[test]
+fn upsert_mcp_server_ignores_deepseek_and_pi_mcp_flags() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+    let state = support::create_test_state().expect("create test state");
+
+    let server = McpServer {
+        id: "echo".to_string(),
+        name: "echo".to_string(),
+        server: json!({"type": "stdio", "command": "echo"}),
+        apps: McpApps {
+            deepseek: true,
+            pi: true,
+            ..Default::default()
+        },
+        description: None,
+        homepage: None,
+        docs: None,
+        tags: Vec::new(),
+    };
+
+    McpService::upsert_server(&state, server).expect("save MCP server");
+    for directory in [".deepseek", ".pi"] {
+        let path = home.join(directory).join("mcp.json");
+        assert!(
+            !path.exists(),
+            "unsupported {directory} MCP target must not create a live file"
+        );
+    }
+
+    let saved = state
+        .db
+        .get_all_mcp_servers()
+        .expect("read saved MCP servers")
+        .shift_remove("echo")
+        .expect("saved server");
+    assert!(!saved.apps.deepseek);
+    assert!(!saved.apps.pi);
 }
 
 #[test]
@@ -835,6 +881,7 @@ fn enabling_gemini_mcp_skips_when_gemini_dir_missing() {
                 grokbuild: false,
                 opencode: false,
                 hermes: false,
+                ..Default::default()
             },
             description: None,
             homepage: None,
@@ -891,6 +938,7 @@ fn enabling_claude_mcp_skips_when_claude_config_absent() {
                 grokbuild: false,
                 opencode: false,
                 hermes: false,
+                ..Default::default()
             },
             description: None,
             homepage: None,
@@ -947,6 +995,7 @@ fn explicit_default_claude_dir_keeps_default_split_mcp_path() {
                 grokbuild: false,
                 opencode: false,
                 hermes: false,
+                ..Default::default()
             },
             description: None,
             homepage: None,
@@ -1004,6 +1053,7 @@ fn custom_claude_dir_writes_mcp_inside_config_dir() {
                 grokbuild: false,
                 opencode: false,
                 hermes: false,
+                ..Default::default()
             },
             description: None,
             homepage: None,
@@ -1084,6 +1134,7 @@ fn custom_claude_dir_sync_does_not_copy_default_profile() {
                 grokbuild: false,
                 opencode: false,
                 hermes: false,
+                ..Default::default()
             },
             description: None,
             homepage: None,
@@ -1224,6 +1275,7 @@ fn sync_all_enabled_removes_known_disabled_but_preserves_unknown_live_entries() 
                 grokbuild: false,
                 opencode: false,
                 hermes: false,
+                ..Default::default()
             },
             description: None,
             homepage: None,
@@ -1247,6 +1299,7 @@ fn sync_all_enabled_removes_known_disabled_but_preserves_unknown_live_entries() 
                 grokbuild: false,
                 opencode: false,
                 hermes: false,
+                ..Default::default()
             },
             description: None,
             homepage: None,

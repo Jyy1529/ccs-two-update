@@ -21,6 +21,7 @@ interface DirectorySettingsProps {
   opencodeDir?: string;
   openclawDir?: string;
   hermesDir?: string;
+  deepseekDir?: string;
   piDir?: string;
   onDirectoryChange: (app: DirectoryAppId, value?: string) => void;
   onBrowseDirectory: (app: DirectoryAppId) => Promise<void>;
@@ -40,6 +41,7 @@ export function DirectorySettings({
   opencodeDir,
   openclawDir,
   hermesDir,
+  deepseekDir,
   piDir,
   onDirectoryChange,
   onBrowseDirectory,
@@ -175,11 +177,30 @@ export function DirectorySettings({
         />
 
         <DirectoryInput
-          label={t("settings.piConfigDir")}
+          label={t("settings.deepseekConfigDir", {
+            defaultValue: "DeepSeek 配置目录",
+          })}
+          description={undefined}
+          value={deepseekDir}
+          resolvedValue={resolvedDirs.deepseek}
+          placeholder={t("settings.browsePlaceholderDeepSeek", {
+            defaultValue: "选择 DeepSeek 配置目录",
+          })}
+          onChange={(val) => onDirectoryChange("deepseek", val)}
+          onBrowse={() => onBrowseDirectory("deepseek")}
+          onReset={() => onResetDirectory("deepseek")}
+        />
+
+        <DirectoryInput
+          label={t("settings.piConfigDir", {
+            defaultValue: "Pi 配置目录",
+          })}
           description={undefined}
           value={piDir}
           resolvedValue={resolvedDirs.pi}
-          placeholder={t("settings.browsePlaceholderPi")}
+          placeholder={t("settings.browsePlaceholderPi", {
+            defaultValue: "选择 Pi 配置目录",
+          })}
           onChange={(val) => onDirectoryChange("pi", val)}
           onBrowse={() => onBrowseDirectory("pi")}
           onReset={() => onResetDirectory("pi")}

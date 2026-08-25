@@ -46,6 +46,28 @@ export interface ClaudeDesktopDefaultRoute {
   supports1m: boolean;
 }
 
+export interface ProviderTransferRequest {
+  sourceApp: AppId;
+  sourceProviderId: string;
+  targetApps: AppId[];
+}
+
+export interface ProviderTransferPreview {
+  name: string;
+  notes?: string;
+  websiteUrl?: string;
+  baseUrl: string;
+  hasApiKey: boolean;
+}
+
+export interface ProviderTransferResult {
+  appId: AppId;
+  status: "created" | "skipped" | "failed";
+  providerId?: string;
+  providerName?: string;
+  message?: string;
+}
+
 export const providersApi = {
   async getAll(appId: AppId): Promise<Record<string, Provider>> {
     return await invoke("get_providers", { app: appId });
@@ -53,6 +75,22 @@ export const providersApi = {
 
   async getCurrent(appId: AppId): Promise<string> {
     return await invoke("get_current_provider", { app: appId });
+  },
+
+  async getTransferPreview(
+    sourceApp: AppId,
+    sourceProviderId: string,
+  ): Promise<ProviderTransferPreview> {
+    return await invoke("get_provider_transfer_preview", {
+      sourceApp,
+      sourceProviderId,
+    });
+  },
+
+  async transferToApps(
+    request: ProviderTransferRequest,
+  ): Promise<ProviderTransferResult[]> {
+    return await invoke("transfer_provider_to_apps", { request });
   },
 
   async add(

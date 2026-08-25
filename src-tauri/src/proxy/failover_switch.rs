@@ -99,12 +99,20 @@ impl FailoverSwitchManager {
 
         if let Some(app) = app_handle {
             if let Some(app_state) = app.try_state::<crate::store::AppState>() {
-                switched = app_state
-                    .proxy_service
-                    .hot_switch_provider(app_type, provider_id)
-                    .await
-                    .map_err(AppError::Message)?
-                    .logical_target_changed;
+                switched = if app_type == crate::app_config::AppType::Codex.as_str() {
+                    crate::services::codex_provider_lifecycle::switch_codex_provider_for_failover(
+                        app_state.inner().owned_clone(),
+                        provider_id.to_string(),
+                    )
+                    .await?
+                } else {
+                    app_state
+                        .proxy_service
+                        .hot_switch_provider(app_type, provider_id)
+                        .await
+                        .map_err(AppError::Message)?
+                        .logical_target_changed
+                };
 
                 if !switched {
                     return Ok(false);

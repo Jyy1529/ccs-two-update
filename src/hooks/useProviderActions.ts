@@ -93,7 +93,7 @@ export function useProviderActions(
       },
     ) => {
       const enhanced = injectCodingPlanUsageScript(activeApp, provider);
-      await addProviderMutation.mutateAsync(enhanced);
+      const createdProvider = await addProviderMutation.mutateAsync(enhanced);
 
       // OpenClaw: register models to allowlist after adding provider
       if (activeApp === "openclaw" && provider.suggestedDefaults) {
@@ -140,6 +140,8 @@ export function useProviderActions(
           );
         }
       }
+
+      return createdProvider;
     },
     [addProviderMutation, activeApp, queryClient, t],
   );

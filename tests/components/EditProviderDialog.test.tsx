@@ -55,6 +55,8 @@ vi.mock("@/components/providers/forms/ProviderForm", () => ({
     onSubmitReadyChange,
     onManageAuthAccounts,
     isProxyTakeover,
+    formId,
+    onRequestAddProvider,
   }: {
     initialData: {
       name?: string;
@@ -78,6 +80,8 @@ vi.mock("@/components/providers/forms/ProviderForm", () => ({
     onManageAuthAccounts?: (target: "codex_oauth") => void;
     isProxyTakeover?: boolean;
     appId?: string;
+    formId?: string;
+    onRequestAddProvider?: (onCreated: (providerId: string) => void) => void;
   }) => {
     useEffect(() => {
       if (onSubmitReadyChange) {
@@ -87,7 +91,7 @@ vi.mock("@/components/providers/forms/ProviderForm", () => ({
     }, [onSubmitReadyChange]);
     return (
       <form
-        id="provider-form"
+        id={formId ?? "provider-form"}
         onSubmit={(event) => {
           event.preventDefault();
           onSubmit({
@@ -123,6 +127,14 @@ vi.mock("@/components/providers/forms/ProviderForm", () => ({
         >
           manage-auth
         </button>
+        {onRequestAddProvider && (
+          <button
+            type="button"
+            onClick={() => onRequestAddProvider(() => undefined)}
+          >
+            request-role-provider
+          </button>
+        )}
       </form>
     );
   },
@@ -417,5 +429,73 @@ describe("EditProviderDialog", () => {
 
     act(() => staleCallback?.(true));
     expect(reopenedButton).toBeDisabled();
+  });
+
+  it("把角色路由的新增 Provider 请求传给内部表单", async () => {
+    const provider: Provider = {
+      id: "owner-a",
+      name: "Owner A",
+      settingsConfig: {},
+    };
+    const onRequestAddProvider = vi.fn();
+    apiMocks.getCurrent.mockResolvedValue(null);
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+        appId="codex"
+        onRequestAddProvider={onRequestAddProvider}
+      />,
+    );
+    const requestButton = await screen.findByRole("button", {
+      name: "request-role-provider",
+    });
+    fireEvent.click(requestButton);
+    expect(onRequestAddProvider).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses a unique form id for each open dialog", async () => {
+    apiMocks.getCurrent.mockResolvedValue(null);
+    const firstSubmit = vi.fn().mockResolvedValue(undefined);
+    const secondSubmit = vi.fn().mockResolvedValue(undefined);
+    const firstProvider: Provider = {
+      id: "provider-a",
+      name: "Provider A",
+      settingsConfig: {},
+    };
+    const secondProvider: Provider = {
+      id: "provider-b",
+      name: "Provider B",
+      settingsConfig: {},
+    };
+
+    render(
+      <>
+        <EditProviderDialog
+          open
+          provider={firstProvider}
+          onOpenChange={vi.fn()}
+          onSubmit={firstSubmit}
+          appId="codex"
+        />
+        <EditProviderDialog
+          open
+          provider={secondProvider}
+          onOpenChange={vi.fn()}
+          onSubmit={secondSubmit}
+          appId="codex"
+        />
+      </>,
+    );
+
+    const forms = Array.from(document.querySelectorAll("form"));
+    expect(forms).toHaveLength(2);
+    expect(forms[0]?.id).not.toBe(forms[1]?.id);
+
+    fireEvent.click(screen.getAllByRole("button", { name: "common.save" })[1]);
+    await waitFor(() => expect(secondSubmit).toHaveBeenCalledTimes(1));
+    expect(firstSubmit).not.toHaveBeenCalled();
   });
 });

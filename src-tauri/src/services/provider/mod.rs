@@ -6,6 +6,7 @@ mod endpoints;
 mod gemini_auth;
 mod live;
 mod pi;
+mod transfer;
 mod usage;
 
 use indexmap::IndexMap;
@@ -28,6 +29,7 @@ pub use live::{
     should_import_default_config_on_startup, sync_current_to_live,
     update_toml_common_config_snippet,
 };
+pub use transfer::{ProviderTransferPreview, ProviderTransferRequest, ProviderTransferResult};
 
 pub fn import_pi_providers_from_live(state: &AppState) -> Result<usize, AppError> {
     pi::import_from_live(state)
@@ -53,6 +55,11 @@ use usage::validate_usage_script;
 /// Codex official providers are safe to select during takeover: Codex keeps
 /// ownership of the active ChatGPT login and the proxy only forwards the
 /// authenticated request. Other apps' official providers retain the block.
+const CODEX_AGENT_ROLE_TARGET_DELETE_BLOCKED: &str = "codex_agent_role_target_delete_blocked";
+
+/// The built-in Codex official provider is safe to select during takeover:
+/// Codex keeps ownership of its ChatGPT login and the proxy only forwards the
+/// authenticated request. Other official providers retain the existing block.
 pub fn official_provider_supports_proxy_takeover(app_type: &AppType, provider: &Provider) -> bool {
     matches!(app_type, AppType::Codex)
         && crate::proxy::providers::is_codex_official_provider(provider)
@@ -131,9 +138,12 @@ mod tests {
     use crate::claude_desktop_config::PROFILE_ID;
     use crate::config::{get_claude_settings_path, read_json_file, write_json_file};
     use crate::database::Database;
-    use crate::provider::{AuthBinding, AuthBindingSource, ProviderMeta, UsageScript};
+    use crate::provider::{AuthBinding, AuthBindingSource};
     #[cfg(any(target_os = "macos", windows))]
     use crate::provider::{ClaudeDesktopMode, ClaudeDesktopModelRoute};
+    use crate::provider::{
+        CodexAgentRoleRouting, CodexFrontendAgentRoleOverride, ProviderMeta, UsageScript,
+    };
     use crate::proxy::types::ProxyConfig;
     use crate::store::AppState;
     use serde_json::json;
@@ -269,6 +279,31 @@ mod tests {
                  wire_api = \"chat\"\n"
             )
         })
+    }
+
+    fn codex_provider_with_role_routing(
+        id: &str,
+        enabled: bool,
+        frontend_provider_id: Option<&str>,
+    ) -> Provider {
+        let mut provider = Provider::with_id(
+            id.to_string(),
+            format!("Provider {id}"),
+            codex_settings("https://example.com/v1", "test-key"),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            codex_agent_role_routing: Some(CodexAgentRoleRouting {
+                enabled: Some(enabled),
+                frontend: Some(CodexFrontendAgentRoleOverride {
+                    provider_id: frontend_provider_id.map(str::to_string),
+                    ..Default::default()
+                }),
+                backend: None,
+            }),
+            ..Default::default()
+        });
+        provider
     }
 
     fn usage_script_with_credentials(
@@ -1327,6 +1362,531 @@ GEMINI_TIMEOUT_MS=30000
     }
 
     #[test]
+    #[serial]
+    fn invalid_switch_target_preserves_current_provider() {
+        with_test_home(|state, _| {
+            crate::settings::reload_settings().expect("reload isolated settings");
+
+            let current = Provider::with_id(
+                "current".into(),
+                "Current".into(),
+                codex_settings("https://current.example/v1", "current-key"),
+                None,
+            );
+            let invalid = Provider::with_id(
+                "invalid".into(),
+                "Invalid".into(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "invalid-key" },
+                    "config": "[invalid"
+                }),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &current)
+                .expect("save current provider");
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &invalid)
+                .expect("save invalid provider");
+            state
+                .db
+                .set_current_provider(AppType::Codex.as_str(), &current.id)
+                .expect("set database current provider");
+            crate::settings::set_current_provider(&AppType::Codex, Some(&current.id))
+                .expect("set local current provider");
+
+            ProviderService::switch(state, AppType::Codex, &invalid.id)
+                .expect_err("invalid target must fail before changing current state");
+
+            assert_eq!(
+                state
+                    .db
+                    .get_current_provider(AppType::Codex.as_str())
+                    .expect("read database current provider")
+                    .as_deref(),
+                Some(current.id.as_str())
+            );
+            assert_eq!(
+                crate::settings::get_current_provider(&AppType::Codex).as_deref(),
+                Some(current.id.as_str())
+            );
+
+            crate::settings::set_current_provider(&AppType::Codex, None)
+                .expect("clear isolated current provider");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn live_write_failure_preserves_current_provider() {
+        with_test_home(|state, _| {
+            crate::settings::reload_settings().expect("reload isolated settings");
+
+            let current = Provider::with_id(
+                "current".into(),
+                "Current".into(),
+                codex_settings("https://current.example/v1", "current-key"),
+                None,
+            );
+            let target = Provider::with_id(
+                "target".into(),
+                "Target".into(),
+                codex_settings("https://target.example/v1", "target-key"),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &current)
+                .expect("save current provider");
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &target)
+                .expect("save target provider");
+            state
+                .db
+                .set_current_provider(AppType::Codex.as_str(), &current.id)
+                .expect("set database current provider");
+            crate::settings::set_current_provider(&AppType::Codex, Some(&current.id))
+                .expect("set local current provider");
+
+            let config_path = crate::codex_config::get_codex_config_path();
+            fs::create_dir_all(&config_path).expect("make config path unwritable as a file");
+
+            ProviderService::switch(state, AppType::Codex, &target.id)
+                .expect_err("live write must fail before changing current state");
+
+            assert_eq!(
+                state
+                    .db
+                    .get_current_provider(AppType::Codex.as_str())
+                    .expect("read database current provider")
+                    .as_deref(),
+                Some(current.id.as_str())
+            );
+            assert_eq!(
+                crate::settings::get_current_provider(&AppType::Codex).as_deref(),
+                Some(current.id.as_str())
+            );
+
+            crate::settings::set_current_provider(&AppType::Codex, None)
+                .expect("clear isolated current provider");
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn codex_switch_waits_for_proxy_transaction() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload isolated settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let state = Arc::new(AppState::new(db.clone()));
+        let current = Provider::with_id(
+            "current".into(),
+            "Current".into(),
+            codex_settings("https://current.example/v1", "current-key"),
+            None,
+        );
+        let target = Provider::with_id(
+            "target".into(),
+            "Target".into(),
+            codex_settings("https://target.example/v1", "target-key"),
+            None,
+        );
+        db.save_provider(AppType::Codex.as_str(), &current)
+            .expect("save current provider");
+        db.save_provider(AppType::Codex.as_str(), &target)
+            .expect("save target provider");
+        db.set_current_provider(AppType::Codex.as_str(), &current.id)
+            .expect("set database current provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some(&current.id))
+            .expect("set local current provider");
+        crate::codex_config::write_codex_live_atomic(
+            current.settings_config.get("auth").unwrap(),
+            current
+                .settings_config
+                .get("config")
+                .and_then(Value::as_str),
+        )
+        .expect("seed current live config");
+
+        let transaction = state.proxy_service.lock_transaction().await;
+        let switching_state = Arc::clone(&state);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            let result =
+                ProviderService::switch(switching_state.as_ref(), AppType::Codex, "target");
+            let _ = done_tx.send(());
+            result
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), done_rx)
+                .await
+                .is_err()
+        );
+        drop(transaction);
+        task.await
+            .expect("join provider switch")
+            .expect("switch after transaction release");
+        assert_eq!(
+            crate::settings::get_effective_current_provider(&db, &AppType::Codex)
+                .expect("read current")
+                .as_deref(),
+            Some("target")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn codex_add_waits_for_proxy_transaction() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload isolated settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let state = Arc::new(AppState::new(db.clone()));
+        let provider = Provider::with_id(
+            "new-provider".into(),
+            "New Provider".into(),
+            codex_settings("https://new.example/v1", "new-key"),
+            None,
+        );
+
+        let transaction = state.proxy_service.lock_transaction().await;
+        let adding_state = Arc::clone(&state);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            let result =
+                ProviderService::add(adding_state.as_ref(), AppType::Codex, provider, false);
+            let _ = done_tx.send(());
+            result
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), done_rx)
+                .await
+                .is_err(),
+            "Codex add must wait for the proxy transaction"
+        );
+        assert!(db
+            .get_provider_by_id("new-provider", AppType::Codex.as_str())
+            .expect("read provider while transaction is locked")
+            .is_none());
+
+        drop(transaction);
+        task.await
+            .expect("join provider add")
+            .expect("add after transaction release");
+        assert!(db
+            .get_provider_by_id("new-provider", AppType::Codex.as_str())
+            .expect("read added provider")
+            .is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn codex_delete_waits_for_proxy_transaction() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload isolated settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let state = Arc::new(AppState::new(db.clone()));
+        let current = Provider::with_id(
+            "current".into(),
+            "Current".into(),
+            codex_settings("https://current.example/v1", "current-key"),
+            None,
+        );
+        let deleted = Provider::with_id(
+            "deleted".into(),
+            "Deleted".into(),
+            codex_settings("https://deleted.example/v1", "deleted-key"),
+            None,
+        );
+        db.save_provider(AppType::Codex.as_str(), &current)
+            .expect("save current provider");
+        db.save_provider(AppType::Codex.as_str(), &deleted)
+            .expect("save deleted provider");
+        db.set_current_provider(AppType::Codex.as_str(), &current.id)
+            .expect("set database current provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some(&current.id))
+            .expect("set local current provider");
+
+        let transaction = state.proxy_service.lock_transaction().await;
+        let deleting_state = Arc::clone(&state);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            let result =
+                ProviderService::delete(deleting_state.as_ref(), AppType::Codex, "deleted");
+            let _ = done_tx.send(());
+            result
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), done_rx)
+                .await
+                .is_err(),
+            "Codex delete must wait for the proxy transaction"
+        );
+        assert!(db
+            .get_provider_by_id("deleted", AppType::Codex.as_str())
+            .expect("read provider while transaction is locked")
+            .is_some());
+
+        drop(transaction);
+        task.await
+            .expect("join provider delete")
+            .expect("delete after transaction release");
+        assert!(db
+            .get_provider_by_id("deleted", AppType::Codex.as_str())
+            .expect("read deleted provider")
+            .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn deleting_non_current_codex_role_owner_is_allowed() {
+        with_test_home(|state, _| {
+            let owner = codex_provider_with_role_routing("owner", true, None);
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &owner)
+                .expect("save owner");
+
+            ProviderService::delete(state, AppType::Codex, &owner.id)
+                .expect("non-current role owner can be deleted");
+            assert!(state
+                .db
+                .get_provider_by_id(&owner.id, AppType::Codex.as_str())
+                .expect("read deleted owner")
+                .is_none());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn deleting_codex_frontend_target_is_blocked_by_any_saved_reference() {
+        with_test_home(|state, _| {
+            let owner = codex_provider_with_role_routing("owner", false, Some("frontend-b"));
+            let target = codex_provider_with_role_routing("frontend-b", false, None);
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &owner)
+                .expect("save owner");
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &target)
+                .expect("save target");
+
+            let error = ProviderService::delete(state, AppType::Codex, &target.id)
+                .expect_err("referenced frontend provider must be protected");
+            let payload = error
+                .to_string()
+                .strip_prefix("codex_agent_role_target_delete_blocked:")
+                .expect("target delete marker")
+                .to_string();
+            let owners: Vec<String> = serde_json::from_str(&payload).expect("owners payload");
+            assert_eq!(owners, vec!["Provider owner"]);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn deleting_codex_frontend_target_with_empty_owner_name_is_blocked_by_owner_id() {
+        with_test_home(|state, _| {
+            let mut owner =
+                codex_provider_with_role_routing("empty-name-owner", false, Some("frontend-b"));
+            owner.name = String::new();
+            let target = codex_provider_with_role_routing("frontend-b", false, None);
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &owner)
+                .expect("save empty-name owner");
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &target)
+                .expect("save target");
+
+            let error = ProviderService::delete(state, AppType::Codex, &target.id)
+                .expect_err("empty-name owner reference must protect the frontend provider");
+            let payload = error
+                .to_string()
+                .strip_prefix("codex_agent_role_target_delete_blocked:")
+                .expect("target delete marker")
+                .to_string();
+            let owners: Vec<String> = serde_json::from_str(&payload).expect("owners payload");
+            assert_eq!(owners, vec!["empty-name-owner"]);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn deleting_codex_frontend_target_with_whitespace_owner_name_is_blocked_by_owner_id() {
+        with_test_home(|state, _| {
+            let mut owner = codex_provider_with_role_routing(
+                "whitespace-name-owner",
+                false,
+                Some("frontend-b"),
+            );
+            owner.name = " \t\r\n ".to_string();
+            let target = codex_provider_with_role_routing("frontend-b", false, None);
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &owner)
+                .expect("save whitespace-name owner");
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &target)
+                .expect("save target");
+
+            let error = ProviderService::delete(state, AppType::Codex, &target.id)
+                .expect_err("whitespace-name owner reference must protect the frontend provider");
+            let payload = error
+                .to_string()
+                .strip_prefix("codex_agent_role_target_delete_blocked:")
+                .expect("target delete marker")
+                .to_string();
+            let owners: Vec<String> = serde_json::from_str(&payload).expect("owners payload");
+            assert_eq!(owners, vec!["whitespace-name-owner"]);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn deleting_universal_with_current_codex_child_is_preflighted_before_any_write() {
+        with_test_home(|state, _| {
+            let mut universal = UniversalProvider::new(
+                "universal-a".to_string(),
+                "Universal A".to_string(),
+                "custom".to_string(),
+                "https://example.com".to_string(),
+                "test-key".to_string(),
+            );
+            universal.apps.claude = true;
+            universal.apps.codex = true;
+            state
+                .db
+                .save_universal_provider(&universal)
+                .expect("save Universal provider");
+            let claude = universal.to_claude_provider().expect("Claude child");
+            let codex = universal.to_codex_provider().expect("Codex child");
+            state
+                .db
+                .save_provider(AppType::Claude.as_str(), &claude)
+                .expect("save Claude child");
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &codex)
+                .expect("save Codex child");
+            state
+                .db
+                .set_current_provider(AppType::Codex.as_str(), &codex.id)
+                .expect("set database current Codex child");
+
+            ProviderService::delete_universal(state, &universal.id)
+                .expect_err("current Codex child must block Universal deletion");
+
+            assert!(state
+                .db
+                .get_universal_provider(&universal.id)
+                .expect("read Universal provider")
+                .is_some());
+            assert!(state
+                .db
+                .get_provider_by_id(&claude.id, AppType::Claude.as_str())
+                .expect("read Claude child")
+                .is_some());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn disabling_current_universal_codex_child_is_preflighted_before_claude_sync() {
+        with_test_home(|state, _| {
+            let mut universal = UniversalProvider::new(
+                "universal-b".to_string(),
+                "Universal B Updated".to_string(),
+                "custom".to_string(),
+                "https://example.com".to_string(),
+                "test-key".to_string(),
+            );
+            universal.apps.claude = true;
+            universal.apps.codex = false;
+            state
+                .db
+                .save_universal_provider(&universal)
+                .expect("save Universal provider");
+
+            let mut claude = universal.to_claude_provider().expect("Claude child");
+            claude.name = "Claude Before Sync".to_string();
+            state
+                .db
+                .save_provider(AppType::Claude.as_str(), &claude)
+                .expect("save Claude child");
+            let codex_id = format!("universal-codex-{}", universal.id);
+            let codex = codex_provider_with_role_routing(&codex_id, false, None);
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &codex)
+                .expect("save historical Codex child");
+            crate::settings::set_current_provider(&AppType::Codex, Some(&codex_id))
+                .expect("set device current Codex child");
+
+            ProviderService::sync_universal_to_apps(state, &universal.id)
+                .expect_err("current Codex child must block disabling Codex sync");
+
+            assert_eq!(
+                state
+                    .db
+                    .get_provider_by_id(&claude.id, AppType::Claude.as_str())
+                    .expect("read Claude child")
+                    .expect("Claude child remains")
+                    .name,
+                "Claude Before Sync"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn syncing_universal_codex_child_preserves_local_meta() {
+        with_test_home(|state, _| {
+            let mut universal = UniversalProvider::new(
+                "universal-c".to_string(),
+                "Universal C".to_string(),
+                "custom".to_string(),
+                "https://example.com".to_string(),
+                "test-key".to_string(),
+            );
+            universal.apps.codex = true;
+            state
+                .db
+                .save_universal_provider(&universal)
+                .expect("save Universal provider");
+            let mut codex = universal.to_codex_provider().expect("Codex child");
+            codex.meta =
+                codex_provider_with_role_routing(&codex.id, false, Some("frontend-b")).meta;
+            let expected_meta = codex.meta.clone();
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &codex)
+                .expect("save configured Codex child");
+
+            ProviderService::sync_universal_to_apps(state, &universal.id)
+                .expect("sync Universal provider");
+
+            let synced = state
+                .db
+                .get_provider_by_id(&codex.id, AppType::Codex.as_str())
+                .expect("read synced Codex child")
+                .expect("Codex child remains");
+            assert_eq!(
+                serde_json::to_value(synced.meta).expect("serialize synced meta"),
+                serde_json::to_value(expected_meta).expect("serialize expected meta")
+            );
+        });
+    }
+
+    #[test]
     fn extract_claude_common_config_strips_all_credentials_keeps_shareable() {
         // env 混入多种凭据（Anthropic/OpenRouter/Google/OpenAI/Gemini + AWS/Vertex）
         // 与可共享配置；顶层混入非标准的 apiKey/api_key 凭据与正常设置。
@@ -1856,9 +2416,150 @@ requires_openai_auth = true
 
         state
             .proxy_service
-            .stop()
+            .stop_with_restore()
             .await
-            .expect("stop proxy service");
+            .expect("stop proxy service and restore Codex live config");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn provider_update_holds_transaction_across_db_backup_and_live() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload isolated settings");
+        let db = Arc::new(Database::memory().expect("init db"));
+        let state = Arc::new(AppState::new(db.clone()));
+        let original = Provider::with_id(
+            "p1".into(),
+            "Codex A".into(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "old-key" },
+                "config": r#"model = "old-model"
+model_provider = "custom"
+[model_providers.custom]
+name = "custom"
+base_url = "https://old.example/v1"
+wire_api = "chat"
+"#
+            }),
+            None,
+        );
+        let updated = Provider::with_id(
+            "p1".into(),
+            "Codex A".into(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "updated-key" },
+                "config": r#"model = "updated-model"
+model_provider = "custom"
+[model_providers.custom]
+name = "custom"
+base_url = "https://updated.example/v1"
+wire_api = "chat"
+"#
+            }),
+            None,
+        );
+        db.save_provider(AppType::Codex.as_str(), &original)
+            .expect("save original provider");
+        db.set_current_provider(AppType::Codex.as_str(), &original.id)
+            .expect("set database current provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some(&original.id))
+            .expect("set local current provider");
+        db.update_proxy_config(ProxyConfig {
+            live_takeover_active: true,
+            listen_port: 0,
+            ..Default::default()
+        })
+        .await
+        .expect("enable proxy takeover");
+        let mut app_proxy_config = db
+            .get_proxy_config_for_app(AppType::Codex.as_str())
+            .await
+            .expect("read Codex proxy config");
+        app_proxy_config.enabled = true;
+        db.update_proxy_config_for_app(app_proxy_config)
+            .await
+            .expect("enable Codex proxy config");
+        db.save_live_backup(
+            AppType::Codex.as_str(),
+            &serde_json::to_string(&original.settings_config).expect("serialize original backup"),
+        )
+        .await
+        .expect("seed original backup");
+        state
+            .proxy_service
+            .start()
+            .await
+            .expect("start proxy service");
+        state
+            .proxy_service
+            .sync_codex_live_from_provider_while_proxy_active(&original)
+            .await
+            .expect("seed takeover-owned Codex live");
+
+        let transaction = state.proxy_service.lock_transaction().await;
+        let updating_state = Arc::clone(&state);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            let result =
+                ProviderService::update(updating_state.as_ref(), AppType::Codex, None, updated);
+            let _ = done_tx.send(());
+            result
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), done_rx)
+                .await
+                .is_err(),
+            "provider update must wait for the proxy transaction"
+        );
+        let stored_while_locked = db
+            .get_provider_by_id("p1", AppType::Codex.as_str())
+            .expect("read provider while transaction is locked")
+            .expect("provider exists");
+        assert_eq!(
+            stored_while_locked.settings_config,
+            original.settings_config
+        );
+        let backup_while_locked = db
+            .get_live_backup(AppType::Codex.as_str())
+            .await
+            .expect("read backup while transaction is locked")
+            .expect("backup exists");
+        assert!(backup_while_locked.original_config.contains("old.example"));
+        let live_while_locked = fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read live while transaction is locked");
+        assert!(live_while_locked.contains("old-model"));
+
+        drop(transaction);
+        task.await
+            .expect("join provider update")
+            .expect("update after transaction release");
+
+        let stored_after_update = db
+            .get_provider_by_id("p1", AppType::Codex.as_str())
+            .expect("read updated provider")
+            .expect("updated provider exists");
+        assert!(stored_after_update
+            .settings_config
+            .to_string()
+            .contains("updated.example"));
+        let backup_after_update = db
+            .get_live_backup(AppType::Codex.as_str())
+            .await
+            .expect("read updated backup")
+            .expect("updated backup exists");
+        assert!(backup_after_update
+            .original_config
+            .contains("updated.example"));
+        let live_after_update = fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read updated live");
+        assert!(live_after_update.contains("updated-model"));
+
+        state
+            .proxy_service
+            .stop_with_restore()
+            .await
+            .expect("stop proxy service and restore live config");
     }
 
     #[cfg(any(target_os = "macos", windows))]
@@ -1902,6 +2603,14 @@ requires_openai_auth = true
         crate::settings::set_current_provider(&AppType::ClaudeDesktop, Some("p1"))
             .expect("set local current provider");
 
+        db.update_proxy_config(ProxyConfig {
+            live_takeover_active: true,
+            listen_port: 0,
+            ..Default::default()
+        })
+        .await
+        .expect("update proxy config");
+
         // Claude Desktop keeps backup state from takeover startup; this sentinel only
         // marks takeover as active so provider updates rewrite the 3P profile.
         db.save_live_backup("claude-desktop", "{}")
@@ -1918,7 +2627,7 @@ requires_openai_auth = true
                 .expect("update app proxy config");
         }
 
-        state
+        let proxy_info = state
             .proxy_service
             .start()
             .await
@@ -1966,7 +2675,10 @@ requires_openai_auth = true
         let profile: Value = read_json_file(&profile_path).expect("read desktop profile");
         assert_eq!(
             profile["inferenceGatewayBaseUrl"],
-            json!("http://127.0.0.1:15721/claude-desktop"),
+            json!(format!(
+                "http://127.0.0.1:{}/claude-desktop",
+                proxy_info.port
+            )),
             "desktop profile should stay pointed at the local gateway during takeover"
         );
         assert_eq!(profile["inferenceGatewayAuthScheme"], json!("bearer"));
@@ -4279,6 +4991,38 @@ impl ProviderService {
         if app_type == AppType::Pi {
             return pi::add(state, provider, add_to_live);
         }
+        let _transaction = if matches!(
+            app_type,
+            AppType::Claude | AppType::Codex | AppType::Gemini | AppType::GrokBuild
+        ) {
+            Some(futures::executor::block_on(
+                state.proxy_service.lock_transaction(),
+            ))
+        } else {
+            None
+        };
+
+        Self::add_under_proxy_transaction(state, app_type, provider, add_to_live)
+    }
+
+    /// Executes a provider add after the caller has acquired the proxy
+    /// transaction lock for proxy-managed applications.
+    pub(crate) fn add_under_proxy_transaction(
+        state: &AppState,
+        app_type: AppType,
+        provider: Provider,
+        add_to_live: bool,
+    ) -> Result<bool, AppError> {
+        let _switch_guard = if matches!(
+            app_type,
+            AppType::Claude | AppType::Codex | AppType::Gemini | AppType::GrokBuild
+        ) {
+            Some(futures::executor::block_on(
+                state.proxy_service.lock_switch_for_app(app_type.as_str()),
+            ))
+        } else {
+            None
+        };
 
         let mut provider = provider;
         // Normalize Claude model keys
@@ -4292,14 +5036,6 @@ impl ProviderService {
 
         let is_managed_codex_add = matches!(app_type, AppType::Codex)
             && Self::managed_codex_oauth_account_id(&provider).is_some();
-        let _managed_codex_add_guard = if is_managed_codex_add {
-            Some(futures::executor::block_on(
-                state.proxy_service.lock_switch_for_app(app_type.as_str()),
-            ))
-        } else {
-            None
-        };
-
         if is_managed_codex_add {
             let effective_current =
                 crate::settings::get_effective_current_provider(&state.db, &app_type)?;
@@ -4397,6 +5133,38 @@ impl ProviderService {
         if app_type == AppType::Pi {
             return pi::update(state, original_id, provider);
         }
+        let _transaction = if matches!(
+            app_type,
+            AppType::Claude | AppType::Codex | AppType::Gemini | AppType::GrokBuild
+        ) {
+            Some(futures::executor::block_on(
+                state.proxy_service.lock_transaction(),
+            ))
+        } else {
+            None
+        };
+
+        Self::update_under_proxy_transaction(state, app_type, original_id, provider)
+    }
+
+    /// Executes a provider update after the caller has acquired the proxy
+    /// transaction lock for proxy-managed applications.
+    pub(crate) fn update_under_proxy_transaction(
+        state: &AppState,
+        app_type: AppType,
+        original_id: Option<&str>,
+        provider: Provider,
+    ) -> Result<bool, AppError> {
+        let _switch_guard = if matches!(
+            app_type,
+            AppType::Claude | AppType::Gemini | AppType::GrokBuild
+        ) {
+            Some(futures::executor::block_on(
+                state.proxy_service.lock_switch_for_app(app_type.as_str()),
+            ))
+        } else {
+            None
+        };
 
         let mut provider = provider;
         let original_id = original_id.unwrap_or(provider.id.as_str()).to_string();
@@ -4735,13 +5503,14 @@ impl ProviderService {
                 if matches!(app_type, AppType::ClaudeDesktop) {
                     write_live_with_common_config_for_state(state, &app_type, &provider)?;
                 } else {
-                    let update_backup_result = futures::executor::block_on(
-                        state
-                            .proxy_service
-                            .update_live_backup_from_provider(app_type.as_str(), &provider),
-                    );
-                    update_backup_result
-                        .map_err(|e| AppError::Message(format!("更新 Live 备份失败: {e}")))?;
+                    futures::executor::block_on(
+                        state.proxy_service.update_live_backup_from_provider_inner(
+                            app_type.as_str(),
+                            &provider,
+                            None,
+                        ),
+                    )
+                    .map_err(|e| AppError::Message(format!("更新 Live 备份失败: {e}")))?;
                 }
 
                 if futures::executor::block_on(state.proxy_service.is_running()) {
@@ -4800,6 +5569,41 @@ impl ProviderService {
     pub fn delete(state: &AppState, app_type: AppType, id: &str) -> Result<(), AppError> {
         if app_type == AppType::Pi {
             return pi::delete(state, id);
+        }
+        let _transaction = if matches!(
+            app_type,
+            AppType::Claude | AppType::Codex | AppType::Gemini | AppType::GrokBuild
+        ) {
+            Some(futures::executor::block_on(
+                state.proxy_service.lock_transaction(),
+            ))
+        } else {
+            None
+        };
+
+        Self::delete_under_proxy_transaction(state, app_type, id)
+    }
+
+    /// Executes a provider delete after the caller has acquired the proxy
+    /// transaction lock for proxy-managed applications.
+    pub(crate) fn delete_under_proxy_transaction(
+        state: &AppState,
+        app_type: AppType,
+        id: &str,
+    ) -> Result<(), AppError> {
+        let _switch_guard = if matches!(
+            app_type,
+            AppType::Claude | AppType::Codex | AppType::Gemini | AppType::GrokBuild
+        ) {
+            Some(futures::executor::block_on(
+                state.proxy_service.lock_switch_for_app(app_type.as_str()),
+            ))
+        } else {
+            None
+        };
+
+        if matches!(app_type, AppType::Codex) {
+            Self::ensure_codex_provider_can_be_deleted(state, id)?;
         }
 
         // Additive mode apps - no current provider concept
@@ -4861,6 +5665,90 @@ impl ProviderService {
         }
 
         state.db.delete_provider(app_type.as_str(), id)
+    }
+
+    fn codex_frontend_provider_reference(provider: &Provider) -> Option<&str> {
+        provider
+            .meta
+            .as_ref()?
+            .codex_agent_role_routing
+            .as_ref()?
+            .frontend
+            .as_ref()?
+            .provider_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|provider_id| !provider_id.is_empty())
+    }
+
+    pub(crate) fn ensure_codex_provider_can_be_deleted(
+        state: &AppState,
+        provider_id: &str,
+    ) -> Result<(), AppError> {
+        let providers = state.db.get_all_providers(AppType::Codex.as_str())?;
+
+        let mut owners = providers
+            .values()
+            .filter(|provider| provider.id != provider_id)
+            .filter(|provider| {
+                Self::codex_frontend_provider_reference(provider) == Some(provider_id)
+            })
+            .map(|provider| {
+                let name = provider.name.trim();
+                if name.is_empty() {
+                    provider.id.clone()
+                } else {
+                    name.to_string()
+                }
+            })
+            .collect::<Vec<_>>();
+        owners.sort();
+        owners.dedup();
+
+        if !owners.is_empty() {
+            return Err(AppError::Message(format!(
+                "{CODEX_AGENT_ROLE_TARGET_DELETE_BLOCKED}:{}",
+                serde_json::json!(owners)
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn ensure_provider_is_not_current(
+        state: &AppState,
+        app_type: &AppType,
+        provider_id: &str,
+    ) -> Result<(), AppError> {
+        let local_current = crate::settings::get_current_provider(app_type);
+        let database_current = state.db.get_current_provider(app_type.as_str())?;
+        if local_current.as_deref() == Some(provider_id)
+            || database_current.as_deref() == Some(provider_id)
+        {
+            return Err(AppError::Message(
+                "无法删除当前正在使用的供应商".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn preflight_universal_child_delete(
+        state: &AppState,
+        app_type: &AppType,
+        provider_id: &str,
+    ) -> Result<(), AppError> {
+        if state
+            .db
+            .get_provider_by_id(provider_id, app_type.as_str())?
+            .is_none()
+        {
+            return Ok(());
+        }
+        Self::ensure_provider_is_not_current(state, app_type, provider_id)?;
+        if matches!(app_type, AppType::Codex) {
+            Self::ensure_codex_provider_can_be_deleted(state, provider_id)?;
+        }
+        Ok(())
     }
 
     /// Remove provider from live config only (for additive mode apps like OpenCode, OpenClaw)
@@ -4936,15 +5824,35 @@ impl ProviderService {
     /// 3. If takeover mode active: hot-switch proxy target and refresh proxy-safe Live labels
     /// 4. If normal mode:
     ///    a. **Backfill mechanism**: Backfill current live config to current provider
-    ///    b. Update local settings current_provider_xxx (device-level)
-    ///    c. Update database is_current (as default for new devices)
-    ///    d. Write target provider config to live files
+    ///    b. Write target provider config to live files
+    ///    c. Update local settings current_provider_xxx (device-level)
+    ///    d. Update database is_current (as default for new devices)
     ///    e. Sync MCP configuration
     pub fn switch(state: &AppState, app_type: AppType, id: &str) -> Result<SwitchResult, AppError> {
         if app_type == AppType::Pi {
             return pi::enable(state, id);
         }
+        let _transaction = if matches!(
+            app_type,
+            AppType::Claude | AppType::Codex | AppType::Gemini | AppType::GrokBuild
+        ) {
+            Some(futures::executor::block_on(
+                state.proxy_service.lock_transaction(),
+            ))
+        } else {
+            None
+        };
 
+        Self::switch_under_proxy_transaction(state, app_type, id)
+    }
+
+    /// Executes a provider switch after the caller has acquired the proxy
+    /// transaction lock for proxy-managed applications.
+    pub(crate) fn switch_under_proxy_transaction(
+        state: &AppState,
+        app_type: AppType,
+        id: &str,
+    ) -> Result<SwitchResult, AppError> {
         // Check if provider exists
         let providers = state.db.get_all_providers(app_type.as_str())?;
         let _provider = providers
@@ -4971,7 +5879,10 @@ impl ProviderService {
         // restore backup. Serialize them per app, then decide from the locked
         // current state so a just-started takeover cannot be overwritten by a
         // normal live write.
-        let _switch_guard = if app_type.supports_local_proxy() {
+        let _switch_guard = if matches!(
+            app_type,
+            AppType::Claude | AppType::Codex | AppType::Gemini | AppType::GrokBuild
+        ) {
             Some(futures::executor::block_on(
                 state.proxy_service.lock_switch_for_app(app_type.as_str()),
             ))
@@ -5042,6 +5953,10 @@ impl ProviderService {
         let provider = providers
             .get(id)
             .ok_or_else(|| AppError::Message(format!("供应商 {id} 不存在")))?;
+
+        // Validate before backfill or current-provider updates so an invalid
+        // target cannot partially change provider state.
+        Self::validate_provider_settings(&app_type, provider)?;
 
         // OMO ↔ OMO Slim are mutually exclusive; activating one removes the other's config file.
         if matches!(app_type, AppType::OpenCode) {
@@ -5180,19 +6095,20 @@ impl ProviderService {
                 ));
             }
         } else {
-            // Additive mode apps skip setting is_current (no such concept).
-            if !app_type.is_additive_mode() {
-                crate::settings::set_current_provider(&app_type, Some(id))?;
-                state.db.set_current_provider(app_type.as_str(), id)?;
-            }
-
-            // Sync to live (write_gemini_live handles security flag internally for Gemini).
+            // Write Live before committing current so a filesystem failure cannot
+            // leave the selected provider ahead of the configuration on disk.
             Self::write_preflighted_or_current_live(
                 state,
                 &app_type,
                 provider,
                 preflighted_provider.as_ref(),
             )?;
+
+            // Additive mode apps skip setting is_current (no such concept).
+            if !app_type.is_additive_mode() {
+                crate::settings::set_current_provider(&app_type, Some(id))?;
+                state.db.set_current_provider(app_type.as_str(), id)?;
+            }
         }
 
         // A material-less official Codex provider gets a config-only live
@@ -5540,7 +6456,7 @@ impl ProviderService {
             AppType::OpenCode => Self::extract_opencode_common_config(&provider.settings_config),
             AppType::OpenClaw => Self::extract_openclaw_common_config(&provider.settings_config),
             AppType::Hermes => Ok(String::new()), // Hermes doesn't use common config snippets
-            AppType::Pi => Ok(String::new()),
+            AppType::DeepSeek | AppType::Pi => Ok(String::new()), // 暂不支持通用配置片段
         }
     }
 
@@ -5558,7 +6474,7 @@ impl ProviderService {
             AppType::OpenCode => Self::extract_opencode_common_config(settings_config),
             AppType::OpenClaw => Self::extract_openclaw_common_config(settings_config),
             AppType::Hermes => Ok(String::new()), // Hermes doesn't use common config snippets
-            AppType::Pi => Ok(String::new()),
+            AppType::DeepSeek | AppType::Pi => Ok(String::new()), // 暂不支持通用配置片段
         }
     }
 
@@ -6324,6 +7240,9 @@ impl ProviderService {
                     ));
                 }
             }
+            AppType::DeepSeek => {
+                crate::deepseek_config::validate_provider_settings(&provider.settings_config)?;
+            }
             AppType::Pi => {
                 crate::pi_config::validate_provider_node(&provider.id, &provider.settings_config)?;
             }
@@ -6531,8 +7450,8 @@ impl ProviderService {
 
                 Ok((api_key, base_url))
             }
-            AppType::OpenClaw | AppType::Hermes | AppType::Pi => {
-                // These native formats use apiKey and baseUrl directly on the object.
+            AppType::OpenClaw | AppType::Hermes | AppType::DeepSeek | AppType::Pi => {
+                // OpenClaw/Hermes/DeepSeek/Pi use apiKey and baseUrl directly on the object
                 let api_key = provider
                     .settings_config
                     .get("apiKey")
@@ -6676,37 +7595,75 @@ impl ProviderService {
 
     /// 删除统一供应商
     pub fn delete_universal(state: &AppState, id: &str) -> Result<bool, AppError> {
-        // 获取统一供应商（用于删除生成的子供应商）
-        let provider = state.db.get_universal_provider(id)?;
-
-        // 删除统一供应商
-        state.db.delete_universal_provider(id)?;
-
-        // 删除生成的子供应商
-        if let Some(p) = provider {
-            if p.apps.claude {
-                let claude_id = format!("universal-claude-{id}");
-                let _ = state.db.delete_provider("claude", &claude_id);
-            }
-            if p.apps.codex {
-                let codex_id = format!("universal-codex-{id}");
-                let _ = state.db.delete_provider("codex", &codex_id);
-            }
-            if p.apps.gemini {
-                let gemini_id = format!("universal-gemini-{id}");
-                let _ = state.db.delete_provider("gemini", &gemini_id);
-            }
+        let _transaction = futures::executor::block_on(state.proxy_service.lock_transaction());
+        let _claude_guard = futures::executor::block_on(
+            state
+                .proxy_service
+                .lock_switch_for_app(AppType::Claude.as_str()),
+        );
+        let _codex_guard = futures::executor::block_on(
+            state
+                .proxy_service
+                .lock_switch_for_app(AppType::Codex.as_str()),
+        );
+        let _gemini_guard = futures::executor::block_on(
+            state
+                .proxy_service
+                .lock_switch_for_app(AppType::Gemini.as_str()),
+        );
+        let Some(provider) = state.db.get_universal_provider(id)? else {
+            return state.db.delete_universal_provider(id);
+        };
+        let children = [
+            (AppType::Claude, format!("universal-claude-{id}")),
+            (AppType::Codex, format!("universal-codex-{id}")),
+            (AppType::Gemini, format!("universal-gemini-{id}")),
+        ];
+        for (app_type, provider_id) in &children {
+            Self::preflight_universal_child_delete(state, app_type, provider_id)?;
         }
-
-        Ok(true)
+        for (app_type, provider_id) in &children {
+            state.db.delete_provider(app_type.as_str(), provider_id)?;
+        }
+        let deleted = state.db.delete_universal_provider(&provider.id)?;
+        Ok(deleted)
     }
 
     /// 同步统一供应商到各应用
     pub fn sync_universal_to_apps(state: &AppState, id: &str) -> Result<bool, AppError> {
+        let _transaction = futures::executor::block_on(state.proxy_service.lock_transaction());
+        let _claude_guard = futures::executor::block_on(
+            state
+                .proxy_service
+                .lock_switch_for_app(AppType::Claude.as_str()),
+        );
+        let _codex_guard = futures::executor::block_on(
+            state
+                .proxy_service
+                .lock_switch_for_app(AppType::Codex.as_str()),
+        );
+        let _gemini_guard = futures::executor::block_on(
+            state
+                .proxy_service
+                .lock_switch_for_app(AppType::Gemini.as_str()),
+        );
         let provider = state
             .db
             .get_universal_provider(id)?
             .ok_or_else(|| AppError::Message(format!("统一供应商 {id} 不存在")))?;
+
+        let claude_id = format!("universal-claude-{id}");
+        let codex_id = format!("universal-codex-{id}");
+        let gemini_id = format!("universal-gemini-{id}");
+        if provider.to_claude_provider().is_none() {
+            Self::preflight_universal_child_delete(state, &AppType::Claude, &claude_id)?;
+        }
+        if provider.to_codex_provider().is_none() {
+            Self::preflight_universal_child_delete(state, &AppType::Codex, &codex_id)?;
+        }
+        if provider.to_gemini_provider().is_none() {
+            Self::preflight_universal_child_delete(state, &AppType::Gemini, &gemini_id)?;
+        }
 
         // 同步到 Claude
         if let Some(mut claude_provider) = provider.to_claude_provider() {
@@ -6719,8 +7676,7 @@ impl ProviderService {
             state.db.save_provider("claude", &claude_provider)?;
         } else {
             // 如果禁用了 Claude，删除对应的子供应商
-            let claude_id = format!("universal-claude-{id}");
-            let _ = state.db.delete_provider("claude", &claude_id);
+            state.db.delete_provider("claude", &claude_id)?;
         }
 
         // 同步到 Codex
@@ -6730,11 +7686,11 @@ impl ProviderService {
                 let mut merged = existing.settings_config.clone();
                 Self::merge_json(&mut merged, &codex_provider.settings_config);
                 codex_provider.settings_config = merged;
+                codex_provider.meta = existing.meta;
             }
             state.db.save_provider("codex", &codex_provider)?;
         } else {
-            let codex_id = format!("universal-codex-{id}");
-            let _ = state.db.delete_provider("codex", &codex_id);
+            state.db.delete_provider("codex", &codex_id)?;
         }
 
         // 同步到 Gemini
@@ -6747,8 +7703,7 @@ impl ProviderService {
             }
             state.db.save_provider("gemini", &gemini_provider)?;
         } else {
-            let gemini_id = format!("universal-gemini-{id}");
-            let _ = state.db.delete_provider("gemini", &gemini_id);
+            state.db.delete_provider("gemini", &gemini_id)?;
         }
 
         Ok(true)

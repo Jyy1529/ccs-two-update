@@ -7,10 +7,12 @@ use crate::commands::xai_oauth::XaiOAuthState;
 use crate::error::AppError;
 use crate::provider::{ClaudeDesktopMode, Provider};
 use crate::services::{
-    EndpointLatency, ProviderService, ProviderSortUpdate, SpeedtestService, SwitchResult,
+    EndpointLatency, ProviderService, ProviderSortUpdate, ProviderTransferPreview,
+    ProviderTransferRequest, ProviderTransferResult, SpeedtestService, SwitchResult,
 };
 use crate::store::AppState;
 use std::str::FromStr;
+use std::sync::Arc;
 
 // 常量定义
 const TEMPLATE_TYPE_GITHUB_COPILOT: &str = "github_copilot";
@@ -36,51 +38,131 @@ pub fn get_current_provider(state: State<'_, AppState>, app: String) -> Result<S
 }
 
 #[tauri::command]
+pub fn get_provider_transfer_preview(
+    state: State<'_, AppState>,
+    source_app: String,
+    source_provider_id: String,
+) -> Result<ProviderTransferPreview, String> {
+    let app_type = AppType::from_str(&source_app).map_err(|e| e.to_string())?;
+    ProviderService::transfer_preview(state.inner(), app_type, &source_provider_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn transfer_provider_to_apps(
+    state: State<'_, AppState>,
+    request: ProviderTransferRequest,
+) -> Result<Vec<ProviderTransferResult>, String> {
+    transfer_provider_to_apps_inner(state.inner().owned_clone(), request)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+fn provider_transfer_targets_codex(request: &ProviderTransferRequest) -> bool {
+    request
+        .target_apps
+        .iter()
+        .any(|target| matches!(AppType::from_str(target), Ok(AppType::Codex)))
+}
+
+async fn transfer_provider_to_apps_inner(
+    state: Arc<AppState>,
+    request: ProviderTransferRequest,
+) -> Result<Vec<ProviderTransferResult>, AppError> {
+    if provider_transfer_targets_codex(&request) {
+        return crate::services::codex_provider_lifecycle::run_with_codex_provider_lifecycle_lock(
+            state,
+            "transfer Provider to Codex",
+            move |state| ProviderService::transfer_to_apps(state.as_ref(), request),
+        )
+        .await;
+    }
+
+    tokio::task::spawn_blocking(move || ProviderService::transfer_to_apps(state.as_ref(), request))
+        .await
+        .map_err(|error| {
+            AppError::Message(format!("transfer Provider operation task failed: {error}"))
+        })?
+}
+
+#[tauri::command]
 pub async fn add_provider(
-    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
     app: String,
     provider: Provider,
     #[allow(non_snake_case)] addToLive: Option<bool>,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    let add_to_live = addToLive.unwrap_or(true);
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app_handle
-            .try_state::<AppState>()
-            .ok_or_else(|| "应用状态不可用".to_string())?;
-        ProviderService::add(state.inner(), app_type, provider, add_to_live)
-            .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| format!("供应商添加任务执行失败: {e}"))?
+    if matches!(app_type, AppType::Codex) {
+        let state = state.inner().owned_clone();
+        return crate::services::codex_provider_lifecycle::run_codex_provider_mutation(
+            state,
+            "add Codex Provider",
+            move |state| {
+                ProviderService::add_under_proxy_transaction(
+                    state.as_ref(),
+                    AppType::Codex,
+                    provider,
+                    addToLive.unwrap_or(true),
+                )
+            },
+        )
+        .await
+        .map_err(|e| e.to_string());
+    }
+    ProviderService::add(state.inner(), app_type, provider, addToLive.unwrap_or(true))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn update_provider(
-    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
     app: String,
     provider: Provider,
     #[allow(non_snake_case)] originalId: Option<String>,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app_handle
-            .try_state::<AppState>()
-            .ok_or_else(|| "应用状态不可用".to_string())?;
-        ProviderService::update(state.inner(), app_type, originalId.as_deref(), provider)
-            .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| format!("供应商更新任务执行失败: {e}"))?
+    if matches!(app_type, AppType::Codex) {
+        let state = state.inner().owned_clone();
+        return crate::services::codex_provider_lifecycle::run_codex_provider_mutation(
+            state,
+            "update Codex Provider",
+            move |state| {
+                ProviderService::update_under_proxy_transaction(
+                    state.as_ref(),
+                    AppType::Codex,
+                    originalId.as_deref(),
+                    provider,
+                )
+            },
+        )
+        .await
+        .map_err(|e| e.to_string());
+    }
+    ProviderService::update(state.inner(), app_type, originalId.as_deref(), provider)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn delete_provider(
+pub async fn delete_provider(
     state: State<'_, AppState>,
     app: String,
     id: String,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    if matches!(app_type, AppType::Codex) {
+        let state = state.inner().owned_clone();
+        return crate::services::codex_provider_lifecycle::run_codex_provider_mutation(
+            state,
+            "delete Codex Provider",
+            move |state| {
+                ProviderService::delete_under_proxy_transaction(state.as_ref(), AppType::Codex, &id)
+                    .map(|_| true)
+            },
+        )
+        .await
+        .map_err(|e| e.to_string());
+    }
     ProviderService::delete(state.inner(), app_type, &id)
         .map(|_| true)
         .map_err(|e| e.to_string())
@@ -122,6 +204,22 @@ pub async fn switch_provider(
     id: String,
 ) -> Result<SwitchResult, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    if matches!(app_type, AppType::Codex) {
+        let state = app_handle
+            .try_state::<AppState>()
+            .ok_or_else(|| "应用状态不可用".to_string())?
+            .inner()
+            .owned_clone();
+        return crate::services::codex_provider_lifecycle::run_codex_provider_mutation(
+            state,
+            "switch Codex Provider",
+            move |state| {
+                ProviderService::switch_under_proxy_transaction(state.as_ref(), AppType::Codex, &id)
+            },
+        )
+        .await
+        .map_err(|e| e.to_string());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_handle
             .try_state::<AppState>()
@@ -209,8 +307,21 @@ pub fn import_default_config_test_hook(
 }
 
 #[tauri::command]
-pub fn import_default_config(state: State<'_, AppState>, app: String) -> Result<bool, String> {
+pub async fn import_default_config(
+    state: State<'_, AppState>,
+    app: String,
+) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    if matches!(app_type, AppType::Codex) {
+        let state = state.inner().owned_clone();
+        return crate::services::codex_provider_lifecycle::run_codex_provider_mutation(
+            state,
+            "import default Codex Provider",
+            move |state| import_default_config_internal(state.as_ref(), AppType::Codex),
+        )
+        .await
+        .map_err(|error| error.to_string());
+    }
     import_default_config_internal(&state, app_type).map_err(Into::into)
 }
 
@@ -957,6 +1068,146 @@ pub fn get_opencode_live_provider_ids() -> Result<Vec<String>, String> {
     crate::opencode_config::get_providers()
         .map(|providers| providers.keys().cloned().collect())
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod provider_transfer_lifecycle_tests {
+    use super::{provider_transfer_targets_codex, transfer_provider_to_apps_inner};
+    use crate::app_config::AppType;
+    use crate::database::Database;
+    use crate::error::AppError;
+    use crate::provider::Provider;
+    use crate::services::codex_provider_lifecycle::{
+        run_codex_provider_mutation, set_rollback_file_guard_pause_for_test,
+    };
+    use crate::services::ProviderTransferRequest;
+    use crate::store::AppState;
+    use serial_test::serial;
+    use std::ffi::OsString;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::time::{sleep, timeout, Duration};
+
+    struct TestHomeGuard {
+        previous: Option<OsString>,
+    }
+
+    impl TestHomeGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("CC_SWITCH_TEST_HOME");
+            std::env::set_var("CC_SWITCH_TEST_HOME", path);
+            crate::settings::reload_settings().expect("reload isolated settings");
+            Self { previous }
+        }
+    }
+
+    impl Drop for TestHomeGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
+                None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
+            }
+            let _ = crate::settings::reload_settings();
+        }
+    }
+
+    fn transfer_request(target_apps: Vec<&str>) -> ProviderTransferRequest {
+        ProviderTransferRequest {
+            source_app: AppType::Claude.as_str().to_string(),
+            source_provider_id: "source".to_string(),
+            target_apps: target_apps.into_iter().map(str::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn valid_codex_transfer_target_requires_lifecycle_serialization() {
+        assert!(provider_transfer_targets_codex(&transfer_request(vec![
+            "unsupported",
+            "codex"
+        ])));
+        assert!(!provider_transfer_targets_codex(&transfer_request(vec![
+            "unsupported",
+            "gemini"
+        ])));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn codex_transfer_waits_for_lifecycle_rollback_and_persists_after_release() {
+        let temp = TempDir::new().expect("create isolated home");
+        let _home = TestHomeGuard::set(temp.path());
+        let db = Arc::new(Database::memory().expect("initialize database"));
+        let state = Arc::new(AppState::new(Arc::clone(&db)));
+        let source = Provider::with_id(
+            "source".to_string(),
+            "Source".to_string(),
+            serde_json::json!({
+                "env": {
+                    "ANTHROPIC_AUTH_TOKEN": "test-key",
+                    "ANTHROPIC_BASE_URL": "https://api.example.com/v1"
+                }
+            }),
+            None,
+        );
+        db.save_provider(AppType::Claude.as_str(), &source)
+            .expect("save source Provider");
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        set_rollback_file_guard_pause_for_test(Arc::clone(&entered), Arc::clone(&release));
+        let mutation_state = Arc::clone(&state);
+        let mutation = tokio::spawn(async move {
+            run_codex_provider_mutation(mutation_state, "transfer race rollback", move |state| {
+                let temporary = Provider::with_id(
+                    "temporary".to_string(),
+                    "Temporary".to_string(),
+                    serde_json::json!({ "auth": {}, "config": "" }),
+                    None,
+                );
+                state
+                    .db
+                    .save_provider(AppType::Codex.as_str(), &temporary)?;
+                Err::<(), AppError>(AppError::Message("injected rollback".to_string()))
+            })
+            .await
+        });
+
+        timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("rollback reached file-guard pause");
+        let transfer_state = Arc::clone(&state);
+        let transfer = tokio::spawn(async move {
+            transfer_provider_to_apps_inner(transfer_state, transfer_request(vec!["codex"])).await
+        });
+        sleep(Duration::from_millis(100)).await;
+        assert!(
+            !transfer.is_finished(),
+            "Codex transfer entered while lifecycle rollback held the lock"
+        );
+
+        release.notify_one();
+        mutation
+            .await
+            .expect("join rollback mutation")
+            .expect_err("mutation must fail and roll back");
+        let results = timeout(Duration::from_secs(5), transfer)
+            .await
+            .expect("transfer completes after rollback")
+            .expect("join transfer")
+            .expect("transfer succeeds");
+        let imported_id = results[0]
+            .provider_id
+            .as_deref()
+            .expect("Codex Provider created");
+        assert!(db
+            .get_provider_by_id(imported_id, AppType::Codex.as_str())
+            .expect("read imported Provider")
+            .is_some());
+        assert!(db
+            .get_provider_by_id("temporary", AppType::Codex.as_str())
+            .expect("read rolled-back Provider")
+            .is_none());
+    }
 }
 
 // ============================================================================

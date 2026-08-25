@@ -605,8 +605,15 @@ impl SkillService {
                     return Ok(custom.join("skills"));
                 }
             }
+            AppType::DeepSeek => {
+                if let Some(custom) = crate::settings::get_deepseek_override_dir() {
+                    return Ok(custom.join("skills"));
+                }
+            }
             AppType::Pi => {
-                return Ok(crate::pi_config::get_pi_agent_dir()?.join("skills"));
+                if let Some(custom) = crate::settings::get_pi_override_dir() {
+                    return Ok(custom.join("skills"));
+                }
             }
         }
 
@@ -624,6 +631,7 @@ impl SkillService {
             AppType::OpenCode => home.join(".config").join("opencode").join("skills"),
             AppType::OpenClaw => home.join(".openclaw").join("skills"),
             AppType::Hermes => crate::hermes_config::get_hermes_dir().join("skills"),
+            AppType::DeepSeek => crate::deepseek_config::get_deepseek_dir().join("skills"),
             AppType::Pi => crate::pi_config::get_pi_agent_dir()?.join("skills"),
         })
     }
