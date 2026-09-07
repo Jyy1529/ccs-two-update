@@ -87,9 +87,7 @@ pub fn classify_repair_state(
 }
 
 fn codex_home() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".codex")
+    crate::config::get_home_dir().join(".codex")
 }
 
 fn health_snapshot_path(home: &Path) -> PathBuf {
@@ -125,7 +123,11 @@ fn read_repair_status(home: &Path) -> (bool, Option<String>) {
     }
 }
 
+pub(crate) fn repair_is_running() -> bool { read_repair_status(&codex_home()).0 }
+
 fn write_repair_status(home: &Path, state: &str, message: Option<&str>) -> Result<(), String> {
+    crate::app_management::require_managed(&crate::app_config::AppType::Codex).map_err(|e| e.to_string())?;
+    let _permission = crate::app_management::permit_path(home).map_err(|e| e.to_string())?;
     let state_dir = home.join("state");
     std::fs::create_dir_all(&state_dir).map_err(|error| error.to_string())?;
     let snapshot = serde_json::json!({
@@ -277,6 +279,8 @@ fn elevated_repair_command(script: &str) -> String {
 }
 
 pub fn launch_repair() -> Result<CodexRepairLaunchResult, String> {
+    crate::app_management::require_managed(&crate::app_config::AppType::Codex).map_err(|e| e.to_string())?;
+    let _permission = crate::app_management::permit_path(&codex_home()).map_err(|e| e.to_string())?;
     if !cfg!(target_os = "windows") {
         return Err("Codex Desktop repair is supported on Windows only".to_string());
     }

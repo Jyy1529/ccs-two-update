@@ -24,6 +24,8 @@ import { parseSmartMcpJson } from "@/utils/formatters";
 import { useMcpValidation } from "./useMcpValidation";
 import { useUpsertMcpServer } from "@/hooks/useMcp";
 import { FullScreenPanel } from "@/components/common/FullScreenPanel";
+import { MCP_APP_IDS } from "@/config/appConfig";
+import { useAppManagementState } from "@/lib/query/appManagement";
 
 interface McpFormModalProps {
   editingId?: string;
@@ -45,6 +47,13 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
   defaultEnabledApps = ["claude", "codex", "gemini", "grokbuild"],
 }) => {
   const { t } = useTranslation();
+  const management = useAppManagementState();
+  const canManage = (appId: AppId) =>
+    management.isSuccess &&
+    management.data.apps.some(
+      (app) => app.appId === appId && app.enabled && app.phase === "managed",
+    );
+  const hasUnmanagedApps = MCP_APP_IDS.some((appId) => !canManage(appId));
   const { formatTomlError, validateTomlConfig, validateJsonConfig } =
     useMcpValidation();
 
@@ -452,13 +461,30 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
             {isEditing ? <Save size={16} /> : <Plus size={16} />}
             {saving
               ? t("common.saving")
-              : isEditing
-                ? t("common.save")
-                : t("common.add")}
+              : hasUnmanagedApps &&
+                  MCP_APP_IDS.every(
+                    (appId) => !enabledApps[appId] || !canManage(appId),
+                  )
+                ? t("appManagement.saveDatabaseOnly")
+                : isEditing
+                  ? t("common.save")
+                  : t("common.add")}
           </Button>
         }
       >
         <div className="flex flex-col h-full gap-6">
+          {hasUnmanagedApps && (
+            <p
+              role={management.isError ? "alert" : "status"}
+              className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs"
+            >
+              {t(
+                management.isError
+                  ? "appManagement.unavailable"
+                  : "appManagement.batchHint",
+              )}
+            </p>
+          )}
           {/* 上半部分：表单字段 */}
           <div className="glass rounded-xl p-6 border border-white/10 space-y-6 flex-shrink-0">
             {/* 预设选择（仅新增时展示） */}
@@ -545,6 +571,7 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
                   <Checkbox
                     id="enable-claude"
                     checked={enabledApps.claude}
+                    disabled={!canManage("claude")}
                     onCheckedChange={(checked: boolean) =>
                       setEnabledApps({ ...enabledApps, claude: checked })
                     }
@@ -561,6 +588,7 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
                   <Checkbox
                     id="enable-codex"
                     checked={enabledApps.codex}
+                    disabled={!canManage("codex")}
                     onCheckedChange={(checked: boolean) =>
                       setEnabledApps({ ...enabledApps, codex: checked })
                     }
@@ -577,6 +605,7 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
                   <Checkbox
                     id="enable-gemini"
                     checked={enabledApps.gemini}
+                    disabled={!canManage("gemini")}
                     onCheckedChange={(checked: boolean) =>
                       setEnabledApps({ ...enabledApps, gemini: checked })
                     }
@@ -593,6 +622,7 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
                   <Checkbox
                     id="enable-grokbuild"
                     checked={enabledApps.grokbuild}
+                    disabled={!canManage("grokbuild")}
                     onCheckedChange={(checked: boolean) =>
                       setEnabledApps({ ...enabledApps, grokbuild: checked })
                     }
@@ -609,6 +639,7 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
                   <Checkbox
                     id="enable-opencode"
                     checked={enabledApps.opencode}
+                    disabled={!canManage("opencode")}
                     onCheckedChange={(checked: boolean) =>
                       setEnabledApps({ ...enabledApps, opencode: checked })
                     }
@@ -625,6 +656,7 @@ const McpFormModal: React.FC<McpFormModalProps> = ({
                   <Checkbox
                     id="enable-hermes"
                     checked={enabledApps.hermes}
+                    disabled={!canManage("hermes")}
                     onCheckedChange={(checked: boolean) =>
                       setEnabledApps({ ...enabledApps, hermes: checked })
                     }

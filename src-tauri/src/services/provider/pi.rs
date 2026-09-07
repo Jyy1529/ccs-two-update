@@ -9,6 +9,7 @@ use serde_json::Value;
 const PI_APP: &str = "pi";
 
 pub(super) fn list(state: &AppState) -> Result<IndexMap<String, Provider>, AppError> {
+    if !crate::app_management::is_managed(&AppType::Pi) { return state.db.get_all_providers(PI_APP); }
     let _guard = futures::executor::block_on(state.proxy_service.lock_switch_for_app(PI_APP));
     match crate::pi_config::read_pi_native_providers() {
         Ok(native) => {

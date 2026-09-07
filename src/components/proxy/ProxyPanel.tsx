@@ -30,6 +30,7 @@ import type { ProxyStatus } from "@/types/proxy";
 import { useTranslation } from "react-i18next";
 import { AnimatePresence, motion } from "framer-motion";
 import { extractErrorMessage } from "@/utils/errorUtils";
+import { useAppManagementState } from "@/lib/query/appManagement";
 import {
   getAppLabel,
   PROXY_APP_IDS,
@@ -50,6 +51,12 @@ export function ProxyPanel({
   isProxyPending,
 }: ProxyPanelProps) {
   const { t } = useTranslation();
+  const management = useAppManagementState();
+  const canManage = (appId: string) =>
+    management.isSuccess &&
+    management.data.apps.some(
+      (app) => app.appId === appId && app.enabled && app.phase === "managed",
+    );
   const { data: status } = useProxyStatusQuery();
   const isRunning = status?.running ?? false;
 
@@ -81,6 +88,7 @@ export function ProxyPanel({
   const { data: grokQueue = [] } = useFailoverQueue("grokbuild");
 
   const handleTakeoverChange = async (appType: string, enabled: boolean) => {
+    if (!canManage(appType)) return;
     try {
       await setTakeoverForApp.mutateAsync({ appType, enabled });
       toast.success(
@@ -295,7 +303,9 @@ export function ProxyPanel({
                           onCheckedChange={(checked) =>
                             handleTakeoverChange(appType, checked)
                           }
-                          disabled={setTakeoverForApp.isPending}
+                          disabled={
+                            setTakeoverForApp.isPending || !canManage(appType)
+                          }
                         />
                       </div>
                     );

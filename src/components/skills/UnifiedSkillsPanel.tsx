@@ -39,6 +39,7 @@ import { AppCountBar } from "@/components/common/AppCountBar";
 import { AppToggleGroup } from "@/components/common/AppToggleGroup";
 import { ListItemRow } from "@/components/common/ListItemRow";
 import { ManagementListSearch } from "@/components/common/ManagementListSearch";
+import { useAppManagementState } from "@/lib/query/appManagement";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   Dialog,
@@ -91,6 +92,14 @@ const UnifiedSkillsPanel = React.forwardRef<
     onCheckUpdatesStateChange,
   } = props;
   const { t } = useTranslation();
+  const management = useAppManagementState();
+  const disabledApps = SKILLS_APP_IDS.filter(
+    (appId) =>
+      !management.isSuccess ||
+      !management.data.apps.some(
+        (app) => app.appId === appId && app.enabled && app.phase === "managed",
+      ),
+  );
   const [confirmDialog, setConfirmDialog] = useState<{
     isOpen: boolean;
     title: string;
@@ -267,6 +276,7 @@ const UnifiedSkillsPanel = React.forwardRef<
       : null;
 
   const handleToggleApp = async (id: string, app: AppId, enabled: boolean) => {
+    if (disabledApps.includes(app)) return;
     if (!beginWrite()) return;
 
     try {
@@ -279,6 +289,7 @@ const UnifiedSkillsPanel = React.forwardRef<
   };
 
   const handleToggleAll = async (app: AppId, enabled: boolean) => {
+    if (disabledApps.includes(app)) return;
     if (!skills || !beginWrite()) return;
 
     const ids = skills
@@ -628,6 +639,7 @@ const UnifiedSkillsPanel = React.forwardRef<
             totalLabel={t("skills.installed", { count: skills?.length || 0 })}
             counts={enabledCounts}
             appIds={visibleSkillAppIds}
+            disabledApps={disabledApps}
             totalCount={skills?.length ?? 0}
             onToggleAll={handleToggleAll}
             pendingApp={pendingApp}
@@ -707,6 +719,7 @@ const UnifiedSkillsPanel = React.forwardRef<
                       updateSkillMutation.variables === skill.id
                     }
                     actionsDisabled={interactionBlocked}
+                    disabledApps={disabledApps}
                     appIds={visibleSkillAppIds}
                     onToggleApp={handleToggleApp}
                     onUninstall={() => handleUninstall(skill)}
@@ -765,6 +778,7 @@ interface InstalledSkillListItemProps {
   hasUpdate?: boolean;
   isUpdating?: boolean;
   actionsDisabled?: boolean;
+  disabledApps?: AppId[];
   onToggleApp: (id: string, app: AppId, enabled: boolean) => void;
   onUninstall: () => void;
   onUpdate?: () => void;
@@ -777,6 +791,7 @@ const InstalledSkillListItem: React.FC<InstalledSkillListItemProps> = ({
   hasUpdate,
   isUpdating,
   actionsDisabled,
+  disabledApps,
   onToggleApp,
   onUninstall,
   onUpdate,
@@ -839,6 +854,7 @@ const InstalledSkillListItem: React.FC<InstalledSkillListItemProps> = ({
       </div>
 
       <AppToggleGroup
+        disabledApps={disabledApps}
         apps={skill.apps}
         onToggle={(app, enabled) => onToggleApp(skill.id, app, enabled)}
         appIds={appIds}
@@ -1104,6 +1120,7 @@ const ImportSkillsDialog: React.FC<ImportSkillsDialogProps> = ({
                   type="checkbox"
                   checked={selected.has(skill.directory)}
                   onChange={() => toggleSelect(skill.directory)}
+                  aria-label={skill.name}
                   className="mt-1"
                 />
                 <div className="flex-1 min-w-0">

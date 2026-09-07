@@ -78,6 +78,7 @@ impl McpService {
         app: AppType,
         enabled: bool,
     ) -> Result<(), AppError> {
+        crate::app_management::require_managed(&app)?;
         if let Some(server) = state
             .db
             .update_mcp_server_app_enabled(server_id, &app, enabled)?
@@ -112,6 +113,7 @@ impl McpService {
     }
 
     fn sync_server_to_app_no_config(server: &McpServer, app: &AppType) -> Result<(), AppError> {
+        if !crate::app_management::is_managed(app) { log::info!("Skipped MCP projection for {}: unmanaged", app.as_str()); return Ok(()); }
         match app {
             AppType::Claude => {
                 mcp::sync_single_server_to_claude(&Default::default(), &server.id, &server.server)?;
@@ -172,6 +174,7 @@ impl McpService {
     }
 
     fn remove_server_from_app(_state: &AppState, id: &str, app: &AppType) -> Result<(), AppError> {
+        if !crate::app_management::is_managed(app) { return Ok(()); }
         match app {
             AppType::Claude => mcp::remove_server_from_claude(id)?,
             AppType::ClaudeDesktop => {
@@ -231,31 +234,30 @@ impl McpService {
     /// 定向重投影，避免把无关应用的失败面（如 ~/.claude.json 坏 JSON）
     /// 牵连进目标应用的关键路径。
     pub fn sync_enabled_for_app(state: &AppState, app: &AppType) -> Result<(), AppError> {
+        crate::app_management::require_managed(app)?;
         let servers = Self::get_all_servers(state)?;
         Self::project_servers_to_app(state, &servers, app)
     }
 
     fn project_servers_to_app(
-        state: &AppState,
+        _state: &AppState,
         servers: &IndexMap<String, McpServer>,
         app: &AppType,
     ) -> Result<(), AppError> {
-        if matches!(
-            app,
-            AppType::OpenClaw | AppType::ClaudeDesktop | AppType::DeepSeek | AppType::Pi
-        ) {
+        if !crate::app_management::is_managed(app) { log::info!("Skipped MCP sync for {}: unmanaged", app.as_str()); return Ok(()); }
+        if servers.is_empty() {
             return Ok(());
         }
 
-        for server in servers.values() {
-            if server.apps.is_enabled_for(app) {
-                Self::sync_server_to_app(state, server, app)?;
-            } else {
-                Self::remove_server_from_app(state, &server.id, app)?;
-            }
+        match app {
+            AppType::Claude => mcp::sync_servers_to_claude(servers),
+            AppType::Codex => mcp::sync_servers_to_codex(servers),
+            AppType::Gemini => mcp::sync_servers_to_gemini(servers),
+            AppType::GrokBuild => mcp::sync_servers_to_grokbuild(servers),
+            AppType::OpenCode => mcp::sync_servers_to_opencode(servers),
+            AppType::Hermes => mcp::sync_servers_to_hermes(servers),
+            AppType::OpenClaw | AppType::ClaudeDesktop | AppType::DeepSeek | AppType::Pi => Ok(()),
         }
-
-        Ok(())
     }
 
     // ========================================================================

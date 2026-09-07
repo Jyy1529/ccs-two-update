@@ -1,11 +1,9 @@
 import React from "react";
+import { screen, fireEvent, waitFor, act } from "@testing-library/react";
 import {
-  render,
-  screen,
-  fireEvent,
-  waitFor,
-  act,
-} from "@testing-library/react";
+  managementFixture,
+  renderManagedUi as render,
+} from "../utils/safetyTestUtils";
 import type { McpServer } from "@/types";
 import McpFormModal from "@/components/mcp/McpFormModal";
 
@@ -189,6 +187,51 @@ describe("McpFormModal", () => {
     ) as HTMLTextAreaElement;
     expect(configTextarea.value).toBe(
       '{\n  "type": "stdio",\n  "command": "preset-cmd"\n}',
+    );
+  });
+
+  it("disables an unmanaged app's apply checkbox but preserves database editing and other apps", async () => {
+    const entry: McpServer = {
+      id: "stored-server",
+      name: "Stored MCP",
+      server: { type: "stdio", command: "synthetic-tool" },
+      apps: {
+        claude: false,
+        codex: true,
+        gemini: false,
+        grokbuild: false,
+        opencode: false,
+        openclaw: false,
+        hermes: false,
+        deepseek: false,
+        pi: false,
+      },
+    };
+    render(
+      <McpFormModal
+        editingId={entry.id}
+        initialData={entry}
+        onSave={vi.fn().mockResolvedValue(undefined)}
+        onClose={vi.fn()}
+      />,
+      managementFixture({ codex: { enabled: false, phase: "unmanaged" } }),
+    );
+    expect(
+      screen.getByRole("checkbox", { name: "mcp.unifiedPanel.apps.codex" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("checkbox", { name: "mcp.unifiedPanel.apps.claude" }),
+    ).toBeEnabled();
+    fireEvent.click(
+      screen.getByRole("button", { name: "appManagement.saveDatabaseOnly" }),
+    );
+    await waitFor(() =>
+      expect(upsertMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: entry.id,
+          apps: expect.objectContaining({ codex: true }),
+        }),
+      ),
     );
   });
 

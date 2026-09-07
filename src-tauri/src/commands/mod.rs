@@ -1,4 +1,10 @@
 #![allow(non_snake_case)]
+mod app_management;
+mod config_guard;
+mod model_validation;
+pub use model_validation::*;
+pub use app_management::*;
+pub use config_guard::*;
 
 mod auth;
 mod balance;
@@ -23,6 +29,7 @@ mod plugin;
 mod profile;
 mod prompt;
 mod provider;
+mod provider_groups;
 mod proxy;
 mod session_manager;
 mod settings;
@@ -61,6 +68,7 @@ pub use plugin::*;
 pub use profile::*;
 pub use prompt::*;
 pub use provider::*;
+pub use provider_groups::*;
 pub use proxy::*;
 pub use session_manager::*;
 pub use settings::*;

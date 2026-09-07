@@ -447,7 +447,8 @@ disabled = { type = "stdio", command = "noop" }
     .expect("seed config file");
 
     let config = MultiAppConfig::default(); // 无启用项
-    cc_switch_lib::sync_enabled_to_codex(&config).expect("sync codex");
+    assert!(cc_switch_lib::sync_enabled_to_codex(&config).is_err(), "unbaselined removal requires review");
+    support::approve_configuration_conflicts(AppType::Codex, None);
 
     let text = fs::read_to_string(&path).expect("read config.toml");
     assert!(
@@ -639,6 +640,10 @@ command = "noop"
                 context.contains("config.toml"),
                 "error context should mention config path"
             );
+        }
+        cc_switch_lib::AppError::Config(message) => {
+            assert!(message.contains("bounded regular file"));
+            assert!(message.contains("config.toml"));
         }
         other => panic!("unexpected error variant: {other:?}"),
     }

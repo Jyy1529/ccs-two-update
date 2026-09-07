@@ -308,6 +308,10 @@ pub(crate) async fn reconcile_current_codex_agent_roles_under_proxy_transaction(
 async fn reconcile_current_codex_agent_roles_locked(
     state: &AppState,
 ) -> Result<CodexAgentRoleReconcileResult, AppError> {
+    if !crate::app_management::is_managed(&AppType::Codex) {
+        log::info!("Skipped Codex role reconciliation: unmanaged");
+        return Ok(reconcile_result(&CodexAgentRolePaths::default_codex_home(), false, false));
+    }
     // 功能范围关闭时视为禁用：清除已生成的角色配置
     if !crate::settings::agent_role_routing_allowed() {
         return disable_codex_agent_roles_unlocked();
@@ -464,6 +468,8 @@ fn reconcile_codex_agent_roles_at_paths(
     routing: Option<&CodexAgentRoleRouting>,
 ) -> Result<CodexAgentRoleReconcileResult, AppError> {
     let _guard = lock_role_projection()?;
+    let _permission = crate::app_management::permit_path(&paths.frontend)?;
+    crate::app_management::require_managed(&AppType::Codex)?;
     reconcile_codex_agent_roles_at_paths_locked(
         paths,
         owner_provider_id,
@@ -567,6 +573,10 @@ fn disable_codex_agent_roles_at_paths(
     paths: &CodexAgentRolePaths,
 ) -> Result<CodexAgentRoleReconcileResult, AppError> {
     let _guard = lock_role_projection()?;
+    if !crate::app_management::is_managed(&AppType::Codex) {
+        return Ok(reconcile_result(paths, false, false));
+    }
+    let _permission = crate::app_management::permit_path(&paths.frontend)?;
     disable_codex_agent_roles_at_paths_locked(paths)
 }
 
@@ -735,6 +745,8 @@ fn move_captured_role_out_of_discovery(
     quarantine: &Path,
     expected: &[u8],
 ) -> Result<(), AppError> {
+    let _permission = crate::app_management::permit_path(active)?;
+    let _destination = crate::app_management::permit_path(quarantine)?;
     match fs::rename(active, quarantine) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -906,6 +918,7 @@ fn disabled_role_copy_conflict(path: &Path) -> AppError {
 }
 
 fn create_new_role_file(path: &Path, data: &[u8]) -> Result<(), AppError> {
+    let _permission = crate::app_management::permit_path(path)?;
     use std::io::Write;
 
     let parent = path
@@ -1054,6 +1067,7 @@ fn lock_role_projection() -> Result<MutexGuard<'static, ()>, AppError> {
 #[cfg(not(windows))]
 fn atomic_write_role_file(path: &Path, data: &[u8]) -> Result<(), AppError> {
     use std::os::unix::fs::PermissionsExt;
+    let _permission = crate::app_management::permit_path(path)?;
 
     log::info!(
         "[CodexRoleRoute] Writing role config to: {}",
@@ -1100,6 +1114,7 @@ fn atomic_write_role_file(path: &Path, data: &[u8]) -> Result<(), AppError> {
 #[cfg(windows)]
 fn atomic_write_role_file(path: &Path, data: &[u8]) -> Result<(), AppError> {
     use std::fs::OpenOptions;
+    let _permission = crate::app_management::permit_path(path)?;
     use std::io::Write;
     use std::os::windows::ffi::OsStrExt;
     use std::time::{SystemTime, UNIX_EPOCH};

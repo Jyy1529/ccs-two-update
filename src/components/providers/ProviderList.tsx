@@ -1,5 +1,5 @@
 import { CSS } from "@dnd-kit/utilities";
-import { DndContext, closestCenter } from "@dnd-kit/core";
+import { DndContext, closestCenter, useDndContext } from "@dnd-kit/core";
 import {
   SortableContext,
   useSortable,
@@ -11,6 +11,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type ReactNode,
 } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { AlertTriangle, Search, X } from "lucide-react";
@@ -18,6 +19,13 @@ import { useTranslation } from "react-i18next";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import type { Provider } from "@/types";
+import { ProviderGroupSections } from "@/components/providers/ProviderGroupSections";
+import {
+  useProviderAutoGroupingQuery,
+  useProviderGroupsQuery,
+  useSetProviderAutoGroupingMutation,
+  useUpdateProviderGroupMutation,
+} from "@/lib/query/providerGroups";
 import type { AppId } from "@/lib/api";
 import { providersApi } from "@/lib/api/providers";
 import { extractErrorMessage } from "@/utils/errorUtils";
@@ -49,11 +57,15 @@ import { Button } from "@/components/ui/button";
 import { isTextEditableTarget } from "@/utils/domUtils";
 import { usePiCurrentState } from "@/lib/query/pi";
 import { isProxyAppId } from "@/config/appConfig";
+import { useAppManagement } from "@/lib/query/appManagement";
+import { AppManagementNotice } from "@/components/management/AppManagementNotice";
+import { ModelValidationDialog } from "./ModelValidationDialog";
 
 interface ProviderListProps {
   providers: Record<string, Provider>;
   currentProviderId: string;
   appId: AppId;
+  toolbarContainer?: HTMLDivElement | null;
   onSwitch: (provider: Provider) => void;
   onEdit: (provider: Provider) => void;
   onDelete: (provider: Provider) => void;
@@ -77,6 +89,7 @@ export function ProviderList({
   providers,
   currentProviderId,
   appId,
+  toolbarContainer,
   onSwitch,
   onEdit,
   onDelete,
@@ -96,11 +109,23 @@ export function ProviderList({
   onSetAsDefault,
 }: ProviderListProps) {
   const { t } = useTranslation();
+  const management = useAppManagement(appId);
+  const [validationProviderId, setValidationProviderId] = useState<
+    string | null
+  >(null);
+  useEffect(() => setValidationProviderId(null), [appId]);
   const { checkProvider, isChecking } = useStreamCheck(appId);
   const { sortedProviders, sensors, handleDragEnd } = useDragSort(
     providers,
     appId,
   );
+  const { data: providerGroups = [] } = useProviderGroupsQuery(appId);
+  const { data: autoGrouping = false, isFetching: autoGroupingLoading } =
+    useProviderAutoGroupingQuery(appId);
+  const setAutoGrouping = useSetProviderAutoGroupingMutation(appId);
+  const updateProviderGroup = useUpdateProviderGroupMutation(appId, {
+    notifySuccess: false,
+  });
 
   const { data: opencodeLiveIds } = useQuery({
     queryKey: ["opencodeLiveProviderIds"],
@@ -413,10 +438,136 @@ export function ProviderList({
     );
   }
 
+  const renderProvider = (
+    provider: Provider,
+    groupActions?: ReactNode,
+    balanceSummary?: ReactNode,
+  ) => {
+    const isOmo = provider.category === "omo";
+    const isOmoSlim = provider.category === "omo-slim";
+    const isOmoCurrent = isOmo && provider.id === (currentOmoId || "");
+    const isOmoSlimCurrent =
+      isOmoSlim && provider.id === (currentOmoSlimId || "");
+    const isHermesCurrent =
+      appId === "hermes" && hermesCurrentProviderId === provider.id;
+    const isCurrent =
+      appId === "pi"
+        ? false
+        : isOmo
+          ? isOmoCurrent
+          : isOmoSlim
+            ? isOmoSlimCurrent
+            : appId === "hermes"
+              ? isHermesCurrent
+              : provider.id === currentProviderId;
+    return (
+      <SortableProviderCard
+        key={provider.id}
+        provider={provider}
+        groupActions={groupActions}
+        balanceSummary={balanceSummary}
+        isCurrent={isCurrent}
+        appId={appId}
+        isInConfig={
+          appId === "pi"
+            ? isPiProviderInConfig(provider)
+            : isProviderInConfig(provider.id)
+        }
+        isOmo={isOmo}
+        isOmoSlim={isOmoSlim}
+        onSwitch={management.canWrite ? onSwitch : () => undefined}
+        isManagementDisabled={!management.canWrite}
+        onValidate={(item) => setValidationProviderId(item.id)}
+        onEdit={onEdit}
+        onDelete={onDelete}
+        onRemoveFromConfig={
+          management.canWrite ? onRemoveFromConfig : undefined
+        }
+        onDisableOmo={management.canWrite ? onDisableOmo : undefined}
+        onDisableOmoSlim={management.canWrite ? onDisableOmoSlim : undefined}
+        onDuplicate={onDuplicate}
+        onTransfer={onTransfer}
+        onConfigureUsage={onConfigureUsage}
+        onOpenWebsite={onOpenWebsite}
+        onOpenTerminal={onOpenTerminal}
+        onTest={handleTest}
+        isTesting={isChecking(provider.id)}
+        isProxyRunning={supportsFailover && isProxyRunning}
+        isProxyTakeover={supportsFailover && isProxyTakeover}
+        isAutoFailoverEnabled={isFailoverModeActive}
+        failoverPriority={getFailoverPriority(provider.id)}
+        isInFailoverQueue={isInFailoverQueue(provider.id)}
+        onToggleFailover={
+          supportsFailover && management.canWrite
+            ? (enabled) => handleToggleFailover(provider.id, enabled)
+            : undefined
+        }
+        activeProviderId={supportsFailover ? activeProviderId : undefined}
+        isDefaultModel={
+          appId === "hermes"
+            ? isHermesCurrent
+            : isProviderDefaultModel(provider.id)
+        }
+        isRemovalProtected={
+          appId === "pi"
+            ? false
+            : appId === "hermes"
+              ? isHermesCurrent
+              : appId === "openclaw"
+                ? isProviderDefaultModel(provider.id)
+                : false
+        }
+        isStateChangeProtected={appId === "pi" && !isPiAuthoritativeStateReady}
+        onSetAsDefault={
+          onSetAsDefault && management.canWrite
+            ? (modelId) => onSetAsDefault(provider, modelId)
+            : undefined
+        }
+      />
+    );
+  };
+
+  const renderProviderList = () => (
+    <DndContext
+      key={appId}
+      sensors={sensors}
+      collisionDetection={closestCenter}
+      onDragEnd={(event) => {
+        if (event.active.data.current?.type !== "provider-group") {
+          void handleDragEnd(event);
+        }
+      }}
+    >
+      <SortableContext
+        items={filteredProviders.map((provider) => provider.id)}
+        strategy={verticalListSortingStrategy}
+      >
+        <ProviderGroupSections
+          appId={appId}
+          toolbarContainer={toolbarContainer}
+          groups={providerGroups}
+          providers={filteredProviders}
+          allProviders={sortedProviders}
+          autoGrouping={autoGrouping}
+          autoGroupingPending={autoGroupingLoading || setAutoGrouping.isPending}
+          onAutoGroupingChange={(enabled) => setAutoGrouping.mutate(enabled)}
+          onToggleCollapsed={(group) =>
+            updateProviderGroup.mutate({
+              ...group,
+              collapsed: !group.collapsed,
+            })
+          }
+          renderProvider={renderProvider}
+        />
+      </SortableContext>
+    </DndContext>
+  );
   if (sortedProviders.length === 0) {
     return (
       <div className="mt-4 space-y-4">
+        <AppManagementNotice appId={appId} />
         {piStateErrorNotice}
+        {renderProviderList()}
         <ProviderEmptyState
           appId={appId}
           onCreate={appId === "pi" ? undefined : onCreate}
@@ -425,107 +576,21 @@ export function ProviderList({
       </div>
     );
   }
-
-  const renderProviderList = () => (
-    <DndContext
-      sensors={sensors}
-      collisionDetection={closestCenter}
-      onDragEnd={handleDragEnd}
-    >
-      <SortableContext
-        items={filteredProviders.map((provider) => provider.id)}
-        strategy={verticalListSortingStrategy}
-      >
-        <div className="space-y-3">
-          {filteredProviders.map((provider) => {
-            const isOmo = provider.category === "omo";
-            const isOmoSlim = provider.category === "omo-slim";
-            const isOmoCurrent = isOmo && provider.id === (currentOmoId || "");
-            const isOmoSlimCurrent =
-              isOmoSlim && provider.id === (currentOmoSlimId || "");
-            const isHermesCurrent =
-              appId === "hermes" && hermesCurrentProviderId === provider.id;
-            const isCurrent =
-              appId === "pi"
-                ? false
-                : isOmo
-                  ? isOmoCurrent
-                  : isOmoSlim
-                    ? isOmoSlimCurrent
-                    : appId === "hermes"
-                      ? isHermesCurrent
-                      : provider.id === currentProviderId;
-            return (
-              <SortableProviderCard
-                key={provider.id}
-                provider={provider}
-                isCurrent={isCurrent}
-                appId={appId}
-                isInConfig={
-                  appId === "pi"
-                    ? isPiProviderInConfig(provider)
-                    : isProviderInConfig(provider.id)
-                }
-                isOmo={isOmo}
-                isOmoSlim={isOmoSlim}
-                onSwitch={onSwitch}
-                onEdit={onEdit}
-                onDelete={onDelete}
-                onRemoveFromConfig={onRemoveFromConfig}
-                onDisableOmo={onDisableOmo}
-                onDisableOmoSlim={onDisableOmoSlim}
-                onDuplicate={onDuplicate}
-                onTransfer={onTransfer}
-                onConfigureUsage={onConfigureUsage}
-                onOpenWebsite={onOpenWebsite}
-                onOpenTerminal={onOpenTerminal}
-                onTest={handleTest}
-                isTesting={isChecking(provider.id)}
-                isProxyRunning={supportsFailover && isProxyRunning}
-                isProxyTakeover={supportsFailover && isProxyTakeover}
-                isAutoFailoverEnabled={isFailoverModeActive}
-                failoverPriority={getFailoverPriority(provider.id)}
-                isInFailoverQueue={isInFailoverQueue(provider.id)}
-                onToggleFailover={
-                  supportsFailover
-                    ? (enabled) => handleToggleFailover(provider.id, enabled)
-                    : undefined
-                }
-                activeProviderId={
-                  supportsFailover ? activeProviderId : undefined
-                }
-                isDefaultModel={
-                  appId === "hermes"
-                    ? isHermesCurrent
-                    : isProviderDefaultModel(provider.id)
-                }
-                isRemovalProtected={
-                  appId === "pi"
-                    ? false
-                    : appId === "hermes"
-                      ? isHermesCurrent
-                      : appId === "openclaw"
-                        ? isProviderDefaultModel(provider.id)
-                        : false
-                }
-                isStateChangeProtected={
-                  appId === "pi" && !isPiAuthoritativeStateReady
-                }
-                onSetAsDefault={
-                  onSetAsDefault
-                    ? (modelId) => onSetAsDefault(provider, modelId)
-                    : undefined
-                }
-              />
-            );
-          })}
-        </div>
-      </SortableContext>
-    </DndContext>
-  );
-
   return (
     <div className="mt-4 space-y-4">
+      <AppManagementNotice appId={appId} />
+      {validationProviderId && providers[validationProviderId] && (
+        <ModelValidationDialog
+          key={`${appId}:${validationProviderId}`}
+          open
+          appId={appId}
+          provider={providers[validationProviderId]}
+          providers={providers}
+          onOpenChange={(open) => {
+            if (!open) setValidationProviderId(null);
+          }}
+        />
+      )}
       {piStateErrorNotice}
       {claudeDesktopStatusMessages.length > 0 && (
         <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-900 dark:text-amber-200">
@@ -606,21 +671,22 @@ export function ProviderList({
         )}
       </AnimatePresence>
 
-      {filteredProviders.length === 0 ? (
+      {filteredProviders.length === 0 && (
         <div className="px-6 py-8 text-sm text-center border border-dashed rounded-lg border-border text-muted-foreground">
           {t("provider.noSearchResults", {
             defaultValue: "No providers match your search.",
           })}
         </div>
-      ) : (
-        renderProviderList()
       )}
+      <div hidden={filteredProviders.length === 0}>{renderProviderList()}</div>
     </div>
   );
 }
 
 interface SortableProviderCardProps {
   provider: Provider;
+  groupActions?: ReactNode;
+  balanceSummary?: ReactNode;
   isCurrent: boolean;
   appId: AppId;
   isInConfig: boolean;
@@ -638,6 +704,8 @@ interface SortableProviderCardProps {
   onOpenWebsite: (url: string) => void;
   onOpenTerminal?: (provider: Provider) => void;
   onTest?: (provider: Provider) => void;
+  onValidate?: (provider: Provider) => void;
+  isManagementDisabled?: boolean;
   isTesting: boolean;
   isProxyRunning: boolean;
   isProxyTakeover: boolean;
@@ -655,6 +723,8 @@ interface SortableProviderCardProps {
 
 function SortableProviderCard({
   provider,
+  groupActions,
+  balanceSummary,
   isCurrent,
   appId,
   isInConfig,
@@ -672,6 +742,8 @@ function SortableProviderCard({
   onOpenWebsite,
   onOpenTerminal,
   onTest,
+  onValidate,
+  isManagementDisabled,
   isTesting,
   isProxyRunning,
   isProxyTakeover,
@@ -685,6 +757,7 @@ function SortableProviderCard({
   isStateChangeProtected,
   onSetAsDefault,
 }: SortableProviderCardProps) {
+  const { active } = useDndContext();
   const {
     setNodeRef,
     attributes,
@@ -692,7 +765,10 @@ function SortableProviderCard({
     transform,
     transition,
     isDragging,
-  } = useSortable({ id: provider.id });
+  } = useSortable({
+    id: provider.id,
+    disabled: { droppable: active?.data.current?.type === "provider-group" },
+  });
 
   const style: CSSProperties = {
     transform: CSS.Transform.toString(transform),
@@ -703,6 +779,8 @@ function SortableProviderCard({
     <div ref={setNodeRef} style={style}>
       <ProviderCard
         provider={provider}
+        groupActions={groupActions}
+        balanceSummary={balanceSummary}
         isCurrent={isCurrent}
         appId={appId}
         isInConfig={isInConfig}
@@ -722,6 +800,8 @@ function SortableProviderCard({
         onOpenWebsite={onOpenWebsite}
         onOpenTerminal={onOpenTerminal}
         onTest={onTest}
+        onValidate={onValidate}
+        isManagementDisabled={isManagementDisabled}
         isTesting={isTesting}
         isProxyRunning={isProxyRunning}
         isProxyTakeover={isProxyTakeover}

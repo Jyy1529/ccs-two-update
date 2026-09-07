@@ -220,6 +220,7 @@ impl ConfigService {
         use crate::config::{read_json_file, write_json_file};
 
         let settings_path = crate::config::get_claude_settings_path();
+        let _permission = crate::app_management::permit_path(&settings_path)?;
         if let Some(parent) = settings_path.parent() {
             fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
         }

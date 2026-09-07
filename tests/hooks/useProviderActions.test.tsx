@@ -4,6 +4,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { useProviderActions } from "@/hooks/useProviderActions";
 import type { Provider, UsageScript } from "@/types";
+import { managementFixture } from "../utils/safetyTestUtils";
+import { APP_IDS } from "@/config/appConfig";
 
 const toastSuccessMock = vi.fn();
 const toastErrorMock = vi.fn();
@@ -93,6 +95,7 @@ interface WrapperProps {
 
 function createWrapper() {
   const queryClient = new QueryClient();
+  queryClient.setQueryData(["appManagement"], managementFixture());
 
   const wrapper = ({ children }: WrapperProps) => (
     <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
@@ -141,6 +144,39 @@ beforeEach(() => {
 });
 
 describe("useProviderActions", () => {
+  it.each(APP_IDS)(
+    "blocks %s application but permits database-only provider saves",
+    async (appId) => {
+      const { wrapper, queryClient } = createWrapper();
+      queryClient.setQueryData(
+        ["appManagement"],
+        managementFixture({ [appId]: { enabled: false, phase: "unmanaged" } }),
+      );
+      const { result } = renderHook(() => useProviderActions(appId), {
+        wrapper,
+      });
+      await act(async () => {
+        await result.current.switchProvider(createProvider());
+        await result.current.setAsDefaultModel(createProvider());
+        await result.current.addProvider({
+          name: "Database record",
+          settingsConfig: {},
+        });
+        await result.current.updateProvider(createProvider());
+      });
+      expect(switchProviderMutateAsync).not.toHaveBeenCalled();
+      expect(openclawApiSetDefaultModelMock).not.toHaveBeenCalled();
+      expect(settingsApiApplyMock).not.toHaveBeenCalled();
+      expect(addProviderMutateAsync).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "Database record", addToLive: false }),
+      );
+      expect(updateProviderMutateAsync).toHaveBeenCalledWith({
+        provider: createProvider(),
+        originalId: undefined,
+      });
+    },
+  );
+
   it("should trigger mutation when calling addProvider", async () => {
     addProviderMutateAsync.mockResolvedValueOnce(undefined);
     const { wrapper } = createWrapper();

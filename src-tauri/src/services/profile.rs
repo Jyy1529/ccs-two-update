@@ -361,6 +361,7 @@ impl ProfileService {
 
         for app in scope.apps().iter() {
             let app_str = app.as_str();
+            if !crate::app_management::is_managed(app) { warnings.push(format!("[{app_str}] skipped: local management is disabled or pending review")); continue; }
 
             // 1. 切换项目前无条件关闭当前应用的代理接管。
             // 接管态下 live 文件属于代理；用户希望切换工作目录时总是退出当前

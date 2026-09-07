@@ -17,6 +17,7 @@ pub(crate) struct ResolvedRetryPolicy {
     retry_delay_ms: u64,
     custom_messages: Vec<String>,
     error_types: Vec<LocalProxyRetryErrorType>,
+    key_pool: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -26,6 +27,16 @@ enum RetryLimit {
 }
 
 impl ResolvedRetryPolicy {
+    pub(crate) fn for_key_pool(max_retries: u32) -> Self {
+        Self {
+            retry_limit: RetryLimit::Finite(max_retries.min(MAX_RETRIES) as usize),
+            retry_delay_ms: 100,
+            custom_messages: Vec::new(),
+            error_types: Vec::new(),
+            key_pool: true,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn max_retries(&self) -> usize {
         match self.retry_limit {
@@ -70,6 +81,9 @@ impl ResolvedRetryPolicy {
     }
 
     pub(crate) fn match_error(&self, error: &ProxyError) -> Option<String> {
+        if self.key_pool {
+            return key_pool_can_failover(error).then(|| "key_pool".to_string());
+        }
         // 响应体超限是本地安全边界；禁止被自定义消息或 5xx
         // 分类再次解释为 Provider 可重试错误。
         if matches!(error, ProxyError::ResponseBodyTooLarge(_)) {
@@ -223,7 +237,47 @@ pub(crate) fn resolve_retry_policy_with_global(
             .clamp(MIN_RETRY_DELAY_MS, MAX_RETRY_DELAY_MS),
         custom_messages,
         error_types,
+        key_pool: false,
     })
+}
+
+/// A pool only changes credentials, not the endpoint or request schema.
+/// Do not fan deterministic client errors out to every key on the same host.
+pub(crate) fn key_pool_can_failover(error: &ProxyError) -> bool {
+    match error {
+        ProxyError::UpstreamError { status, body } => match *status {
+            401 | 402 | 403 | 408 | 429 | 500..=599 => true,
+            400 => body
+                .as_deref()
+                .and_then(|body| serde_json::from_str::<Value>(body).ok())
+                .and_then(|value| {
+                    value
+                        .pointer("/error/code")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .is_some_and(|code| {
+                    matches!(
+                        code.as_str(),
+                        "insufficient_quota"
+                            | "insufficient_balance"
+                            | "quota_exceeded"
+                            | "invalid_api_key"
+                            | "key_expired"
+                            | "billing_hard_limit_reached"
+                    )
+                }),
+            _ => false,
+        },
+        ProxyError::UpstreamBodyTimeout { status, .. } => {
+            !matches!(*status, 400 | 404 | 405 | 406 | 413 | 414 | 415 | 422)
+        }
+        ProxyError::Timeout(_)
+        | ProxyError::StreamIdleTimeout(_)
+        | ProxyError::ProviderUnhealthy(_) => true,
+        ProxyError::ForwardFailed(message) => is_network_forward_failure(message),
+        _ => false,
+    }
 }
 
 struct ErrorFacts {
@@ -481,6 +535,42 @@ mod tests {
             icon_color: None,
             in_failover_queue: false,
         }
+    }
+
+    #[test]
+    fn key_pool_retries_are_finite_and_only_match_credential_or_transient_failures() {
+        let no_retry = ResolvedRetryPolicy::for_key_pool(0);
+        assert!(!no_retry.is_unlimited());
+        assert!(!no_retry.allows_retry(0));
+        let retry = ResolvedRetryPolicy::for_key_pool(2);
+        assert!(retry.allows_retry(1));
+        assert!(!retry.allows_retry(2));
+        for status in [401, 402, 403, 408, 429, 500, 503, 504] {
+            assert!(retry
+                .match_error(&ProxyError::UpstreamError { status, body: None })
+                .is_some());
+        }
+        for status in [400, 404, 405, 413, 422] {
+            assert!(retry
+                .match_error(&ProxyError::UpstreamError {
+                    status,
+                    body: Some("rate limit".into())
+                })
+                .is_none());
+        }
+        assert!(key_pool_can_failover(&ProxyError::UpstreamError {
+            status: 400,
+            body: Some(json!({"error":{"code":"insufficient_quota"}}).to_string())
+        }));
+        assert!(key_pool_can_failover(&ProxyError::ForwardFailed(
+            "connection reset by peer".into()
+        )));
+        assert!(!key_pool_can_failover(&ProxyError::ForwardFailed(
+            "invalid URL".into()
+        )));
+        assert!(!key_pool_can_failover(&ProxyError::ResponseBodyTooLarge(
+            1024
+        )));
     }
 
     #[test]

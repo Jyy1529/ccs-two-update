@@ -257,7 +257,7 @@ impl RequestContext {
             .await
             .map_err(|e| ProxyError::DatabaseError(e.to_string()))?;
         // 自动重试按功能范围判定：全局开关 + 该应用是否在生效应用列表内
-        let provider_retry_enabled = crate::settings::provider_retry_allowed_for(&app_type);
+        let provider_retry_enabled = !state.db.is_diagnostic() && crate::settings::provider_retry_allowed_for(&app_type);
 
         // 从数据库读取整流器配置
         let rectifier_config = state.db.get_rectifier_config().unwrap_or_default();
@@ -301,17 +301,20 @@ impl RequestContext {
             }
             None => (None, None),
         };
-        let route_plan = match role_route_plan {
+        let route_plan = if state.db.is_diagnostic() {
+            let providers = state.db.get_all_providers(app_type_str).map_err(map_provider_selection_error)?;
+            if providers.len() != 1 { return Err(ProxyError::InvalidRequest("Diagnostic target is not uniquely pinned".into())); }
+            let mut plan = ProviderRoutePlan::standard(providers.into_values().collect(), false);
+            plan.sync_logical_target = false;
+            plan
+        } else { match role_route_plan {
             Some(plan) => plan,
-            None => {
-                let providers = state
-                    .provider_router
-                    .select_providers(app_type_str)
-                    .await
-                    .map_err(map_provider_selection_error)?;
-                ProviderRoutePlan::standard(providers, app_config.auto_failover_enabled)
-            }
-        };
+            None => state
+                .provider_router
+                .select_route_plan(app_type_str)
+                .await
+                .map_err(map_provider_selection_error)?,
+        }};
         let providers = route_plan.providers();
 
         let provider = providers

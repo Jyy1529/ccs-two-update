@@ -49,8 +49,10 @@ fn is_managed_config(content: &str) -> bool {
 }
 
 pub fn write_claude_config() -> Result<bool, AppError> {
+    crate::app_management::require_managed(&crate::app_config::AppType::Claude)?;
     // 增量写入：仅设置 primaryApiKey = "any"，保留其它字段
     let path = claude_config_path()?;
+    let _permission = crate::app_management::permit_path(&path)?;
     ensure_claude_dir_exists()?;
 
     // 尝试读取并解析为对象
@@ -80,7 +82,7 @@ pub fn write_claude_config() -> Result<bool, AppError> {
     if changed || !path.exists() {
         let serialized = serde_json::to_string_pretty(&obj)
             .map_err(|e| AppError::JsonSerialize { source: e })?;
-        fs::write(&path, format!("{serialized}\n")).map_err(|e| AppError::io(&path, e))?;
+        crate::config::atomic_write(&path, format!("{serialized}\n").as_bytes())?;
         Ok(true)
     } else {
         Ok(false)
@@ -88,7 +90,9 @@ pub fn write_claude_config() -> Result<bool, AppError> {
 }
 
 pub fn clear_claude_config() -> Result<bool, AppError> {
+    crate::app_management::require_managed(&crate::app_config::AppType::Claude)?;
     let path = claude_config_path()?;
+    let _permission = crate::app_management::permit_path(&path)?;
     if !path.exists() {
         return Ok(false);
     }
@@ -114,7 +118,7 @@ pub fn clear_claude_config() -> Result<bool, AppError> {
 
     let serialized =
         serde_json::to_string_pretty(&value).map_err(|e| AppError::JsonSerialize { source: e })?;
-    fs::write(&path, format!("{serialized}\n")).map_err(|e| AppError::io(&path, e))?;
+    crate::config::atomic_write(&path, format!("{serialized}\n").as_bytes())?;
     Ok(true)
 }
 

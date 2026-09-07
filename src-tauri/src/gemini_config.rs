@@ -218,6 +218,7 @@ pub fn write_gemini_env_atomic(map: &HashMap<String, String>) -> Result<(), AppE
 /// `serialize_env_file` 归一化——供保序的定向删除使用。
 pub fn write_gemini_env_text_atomic(content: &str) -> Result<(), AppError> {
     let path = get_gemini_env_path();
+    let _permission = crate::app_management::permit_path(&path)?;
 
     // 确保目录存在
     if let Some(parent) = path.parent() {
@@ -355,6 +356,7 @@ pub fn get_gemini_settings_path() -> PathBuf {
 /// - `selected_type`: 要设置的 selectedType 值（如 "gemini-api-key" 或 "oauth-personal"）
 fn update_selected_type(selected_type: &str) -> Result<(), AppError> {
     let settings_path = get_gemini_settings_path();
+    let _permission = crate::app_management::permit_path(&settings_path)?;
 
     // 确保目录存在
     if let Some(parent) = settings_path.parent() {

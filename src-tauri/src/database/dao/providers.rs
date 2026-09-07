@@ -280,6 +280,7 @@ impl Database {
         let tx = conn
             .transaction()
             .map_err(|e| AppError::Database(e.to_string()))?;
+        super::provider_groups::validate_pool_assignment(&tx, app_type, provider)?;
 
         let mut meta_clone = provider.meta.clone().unwrap_or_default();
         let endpoints = std::mem::take(&mut meta_clone.custom_endpoints);

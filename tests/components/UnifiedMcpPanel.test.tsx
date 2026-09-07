@@ -1,4 +1,8 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, screen, waitFor } from "@testing-library/react";
+import {
+  managementFixture,
+  renderManagedUi as render,
+} from "../utils/safetyTestUtils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import UnifiedMcpPanel from "@/components/mcp/UnifiedMcpPanel";
@@ -267,5 +271,22 @@ describe("UnifiedMcpPanel", () => {
     await waitFor(() =>
       expect(onInteractionBlockedChange).toHaveBeenCalledWith(true),
     );
+  });
+
+  it("blocks unmanaged app and bulk toggles while preserving database editing and other apps", () => {
+    mocks.serversMap = { server: makeServer("server") };
+    render(
+      <UnifiedMcpPanel onOpenChange={vi.fn()} />,
+      managementFixture({ codex: { enabled: false, phase: "unmanaged" } }),
+    );
+    expect(screen.getByRole("button", { name: "Codex" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Claude" })).toBeEnabled();
+    expect(screen.getByTitle("common.edit")).toBeEnabled();
+    const codexBulk = screen
+      .getAllByRole("checkbox")
+      .find((element) => element.textContent?.includes("Codex"));
+    expect(codexBulk).toBeDisabled();
+    fireEvent.click(codexBulk!);
+    expect(mocks.bulkToggle).not.toHaveBeenCalled();
   });
 });

@@ -200,6 +200,7 @@ pub async fn open_config_folder(handle: AppHandle, app: String) -> Result<bool, 
     };
 
     if !config_dir.exists() {
+        let _permission = crate::app_management::permit_path(&config_dir).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&config_dir).map_err(|e| format!("创建目录失败: {e}"))?;
     }
 
@@ -253,6 +254,7 @@ pub async fn open_app_config_folder(handle: AppHandle) -> Result<bool, String> {
     let config_dir = config::get_app_config_dir();
 
     if !config_dir.exists() {
+        let _permission = crate::app_management::permit_path(&config_dir).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&config_dir).map_err(|e| format!("创建目录失败: {e}"))?;
     }
 

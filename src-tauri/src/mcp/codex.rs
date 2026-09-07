@@ -5,6 +5,7 @@
 //! - 同步到 ~/.codex/config.toml
 //! - JSON 到 TOML 的转换逻辑
 
+use indexmap::IndexMap;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -415,6 +416,31 @@ fn remove_mcp_server_from_doc(doc: &mut toml_edit::DocumentMut, id: &str) {
             }
         }
     }
+}
+
+pub fn sync_servers_to_codex(servers: &IndexMap<String, McpServer>) -> Result<(), AppError> {
+    if servers.is_empty() || !should_sync_codex_mcp() {
+        return Ok(());
+    }
+    let text = crate::codex_config::read_and_validate_codex_config_text()?;
+    let mut doc = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| AppError::McpValidation(format!("解析 config.toml 失败: {error}")))?;
+    for server in servers.values() {
+        remove_mcp_server_from_doc(&mut doc, &server.id);
+        if server.apps.codex {
+            upsert_mcp_server_table(
+                &mut doc,
+                &server.id,
+                json_server_to_toml_table(&server.server)?,
+            )?;
+        }
+    }
+    let updated = doc.to_string();
+    if updated == text {
+        return Ok(());
+    }
+    crate::config::write_text_file(&crate::codex_config::get_codex_config_path(), &updated)
 }
 
 pub fn sync_single_server_to_codex(

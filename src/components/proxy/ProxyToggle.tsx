@@ -11,6 +11,7 @@ import { useProxyStatus } from "@/hooks/useProxyStatus";
 import { cn } from "@/lib/utils";
 import { useTranslation } from "react-i18next";
 import { getAppLabel, type ProxyAppId } from "@/config/appConfig";
+import { useAppManagement } from "@/lib/query/appManagement";
 
 interface ProxyToggleProps {
   className?: string;
@@ -19,6 +20,7 @@ interface ProxyToggleProps {
 
 export function ProxyToggle({ className, activeApp }: ProxyToggleProps) {
   const { t } = useTranslation();
+  const { canWrite } = useAppManagement(activeApp);
   const {
     isRunning,
     takeoverStatus,
@@ -29,6 +31,7 @@ export function ProxyToggle({ className, activeApp }: ProxyToggleProps) {
   } = useProxyStatus();
 
   const handleToggle = async (checked: boolean) => {
+    if (!canWrite) return;
     try {
       await setTakeoverForApp({ appType: activeApp, enabled: checked });
     } catch (error) {
@@ -63,7 +66,7 @@ export function ProxyToggle({ className, activeApp }: ProxyToggleProps) {
         "flex items-center gap-1 px-1.5 h-8 rounded-lg bg-muted/50 transition-all",
         className,
       )}
-      title={tooltipText}
+      title={canWrite ? tooltipText : t("appManagement.databaseOnly")}
     >
       {isPending ? (
         <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
@@ -80,7 +83,8 @@ export function ProxyToggle({ className, activeApp }: ProxyToggleProps) {
       <Switch
         checked={takeoverEnabled}
         onCheckedChange={handleToggle}
-        disabled={isPending || isInitialStatusPending}
+        disabled={isPending || isInitialStatusPending || !canWrite}
+        aria-label={t("proxy.takeover.ariaLabel", { appLabel })}
       />
     </div>
   );

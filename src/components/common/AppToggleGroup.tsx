@@ -1,4 +1,5 @@
 import React from "react";
+import { useTranslation } from "react-i18next";
 import {
   Tooltip,
   TooltipContent,
@@ -12,6 +13,7 @@ interface AppToggleGroupProps {
   onToggle: (app: AppId, enabled: boolean) => void;
   appIds?: AppId[];
   disabled?: boolean;
+  disabledApps?: AppId[];
 }
 
 export const AppToggleGroup: React.FC<AppToggleGroupProps> = ({
@@ -19,7 +21,9 @@ export const AppToggleGroup: React.FC<AppToggleGroupProps> = ({
   onToggle,
   appIds = APP_IDS,
   disabled = false,
+  disabledApps = [],
 }) => {
+  const { t } = useTranslation();
   return (
     <div className="flex items-center gap-1.5 flex-shrink-0">
       {appIds.map((app) => {
@@ -31,7 +35,7 @@ export const AppToggleGroup: React.FC<AppToggleGroupProps> = ({
               <button
                 type="button"
                 onClick={() => onToggle(app, !enabled)}
-                disabled={disabled}
+                disabled={disabled || disabledApps.includes(app)}
                 aria-label={label}
                 aria-pressed={Boolean(enabled)}
                 className={`w-7 h-7 rounded-lg flex items-center justify-center transition-all ${
@@ -45,6 +49,8 @@ export const AppToggleGroup: React.FC<AppToggleGroupProps> = ({
               <p>
                 {label}
                 {enabled ? " ✓" : ""}
+                {disabledApps.includes(app) &&
+                  ` · ${t("appManagement.phases.unmanaged")}`}
               </p>
             </TooltipContent>
           </Tooltip>

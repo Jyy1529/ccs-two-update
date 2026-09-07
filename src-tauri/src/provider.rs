@@ -87,6 +87,16 @@ impl Provider {
             || self.claude_base_url_contains("chatgpt.com/backend-api/codex")
     }
 
+    /// Third-party managed OAuth (xai_oauth, github_copilot, …): the real
+    /// credential is injected per-request by the local proxy, so the card is
+    /// keyless by design and its stored config is only an upstream snapshot.
+    /// `codex_oauth` is deliberately excluded — the official ChatGPT login
+    /// in auth.json IS its credential, so the `requires_openai_auth = true`
+    /// fallback is its correct shape, never a legacy leftover.
+    pub fn uses_proxy_injected_oauth(&self) -> bool {
+        self.is_xai_oauth() || self.is_github_copilot()
+    }
+
     /// Whether the provider form's "auth field" was explicitly set to
     /// ANTHROPIC_API_KEY. The form only persists `meta.apiKeyField` for the
     /// non-default choice, so `None` means the default ANTHROPIC_AUTH_TOKEN.
@@ -565,6 +575,26 @@ pub struct ProviderMeta {
     /// 自定义端点列表（按 URL 去重存储）
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub custom_endpoints: HashMap<String, crate::settings::CustomEndpoint>,
+    /// Optional per-application provider group membership.
+    #[serde(rename = "providerGroupId", skip_serializing_if = "Option::is_none")]
+    pub provider_group_id: Option<String>,
+    /// Explicit folder selection (including ungrouped) overrides auto grouping.
+    #[serde(
+        rename = "providerGroupManual",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub provider_group_manual: Option<bool>,
+    /// Stable order inside the assigned provider group.
+    #[serde(
+        rename = "providerGroupSortIndex",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub provider_group_sort_index: Option<usize>,
+    /// Whether this provider participates in its group's key pool.
+    #[serde(rename = "keyPoolEnabled", skip_serializing_if = "Option::is_none")]
+    pub key_pool_enabled: Option<bool>,
+    #[serde(rename = "balanceTemplateId", skip_serializing_if = "Option::is_none")]
+    pub balance_template_id: Option<String>,
     /// 是否在写入 live 时应用通用配置片段
     #[serde(
         rename = "commonConfigEnabled",
@@ -1165,6 +1195,30 @@ mod tests {
     };
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn proxy_injected_oauth_excludes_codex_oauth() {
+        let mut provider = Provider::with_id("p".to_string(), "P".to_string(), json!({}), None);
+        assert!(!provider.uses_proxy_injected_oauth());
+
+        for (provider_type, expected) in [
+            ("xai_oauth", true),
+            ("github_copilot", true),
+            // the official ChatGPT login IS this card's credential — its
+            // auth.json fallback shape must never be neutralized
+            ("codex_oauth", false),
+        ] {
+            provider.meta = Some(ProviderMeta {
+                provider_type: Some(provider_type.to_string()),
+                ..ProviderMeta::default()
+            });
+            assert_eq!(
+                provider.uses_proxy_injected_oauth(),
+                expected,
+                "{provider_type}"
+            );
+        }
+    }
 
     #[test]
     fn provider_meta_serializes_pricing_model_source() {

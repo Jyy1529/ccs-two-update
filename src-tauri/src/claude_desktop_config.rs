@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 
 #[cfg(any(target_os = "macos", windows))]
 use crate::config::get_home_dir;
-use crate::config::{atomic_write, delete_file, read_json_file, write_json_file};
+use crate::config::{atomic_write, delete_file, read_json_file};
+#[cfg(test)]
+use crate::config::write_json_file;
 use crate::database::Database;
 use crate::database::CLAUDE_DESKTOP_OFFICIAL_PROVIDER_ID;
 use crate::error::AppError;
@@ -126,8 +128,25 @@ struct InferenceModelSpec {
 }
 
 pub fn apply_provider(db: &Database, provider: &Provider) -> Result<(), AppError> {
+    crate::app_management::require_managed(&crate::app_config::AppType::ClaudeDesktop)?;
     let paths = current_platform_paths()?;
     apply_provider_to_paths(db, provider, &paths)
+}
+
+pub(crate) fn management_files() -> Result<Vec<PathBuf>, AppError> {
+    if !is_supported_platform() { return Ok(Vec::new()); }
+    let paths = current_platform_paths()?;
+    Ok(vec![paths.normal_config_path, paths.threep_config_path, paths.profile_path, paths.meta_path])
+}
+
+pub(crate) fn management_roots() -> Result<Vec<PathBuf>, AppError> {
+    let mut roots = vec![get_home_dir().join(".claude-desktop")];
+    for path in management_files()? {
+        if let Some(parent) = path.parent() {
+            if !roots.iter().any(|root| root == parent) { roots.push(parent.to_path_buf()); }
+        }
+    }
+    Ok(roots)
 }
 
 pub fn get_status(db: &Database, proxy_running: bool) -> Result<ClaudeDesktopStatus, AppError> {
@@ -964,6 +983,9 @@ fn with_rollback<F>(paths: &ClaudeDesktopPaths, op: F) -> Result<(), AppError>
 where
     F: FnOnce(&ClaudeDesktopPaths) -> Result<(), AppError>,
 {
+    if current_platform_paths().is_ok_and(|current| current.normal_config_path == paths.normal_config_path) {
+        return op(paths);
+    }
     let snapshots = snapshot_files(paths)?;
     match op(paths) {
         Ok(()) => Ok(()),
@@ -1010,25 +1032,44 @@ fn apply_provider_to_paths_inner(
         }
     };
 
-    write_deployment_mode(&paths.normal_config_path, "3p")?;
-    write_deployment_mode(&paths.threep_config_path, "3p")?;
-    write_json_file(&paths.profile_path, &profile)?;
-    write_meta(&paths.meta_path, Some(PROFILE_ID))?;
+    let values = [
+        (paths.normal_config_path.clone(), deployment_mode_value(&paths.normal_config_path, "3p")?),
+        (paths.threep_config_path.clone(), deployment_mode_value(&paths.threep_config_path, "3p")?),
+        (paths.profile_path.clone(), profile),
+        (paths.meta_path.clone(), meta_value(&paths.meta_path, Some(PROFILE_ID))?),
+    ];
+    let files = values.into_iter().map(|(path, value)| serde_json::to_vec_pretty(&value).map(|bytes| (path, Some(bytes))).map_err(|source| AppError::JsonSerialize { source })).collect::<Result<Vec<_>, _>>()?;
+    commit_at_paths(paths, &files)
+}
+
+fn commit_at_paths(paths: &ClaudeDesktopPaths, files: &[(PathBuf, Option<Vec<u8>>)]) -> Result<(), AppError> {
+    if current_platform_paths().is_ok_and(|current| current.normal_config_path == paths.normal_config_path) {
+        crate::services::config_guard::commit_file_changes(&crate::app_config::AppType::ClaudeDesktop, files)?;
+    } else {
+        // Explicit paths are used by isolated adapter fixtures. Native calls
+        // always use the registered bundle above.
+        for (path, bytes) in files {
+            match bytes {
+                Some(bytes) => atomic_write(path, bytes)?,
+                None => delete_file(path)?,
+            }
+        }
+    }
 
     Ok(())
 }
 
 fn restore_official_at_paths_inner(paths: &ClaudeDesktopPaths) -> Result<(), AppError> {
-    write_deployment_mode(&paths.normal_config_path, "1p")?;
-    write_deployment_mode(&paths.threep_config_path, "1p")?;
-    remove_cc_switch_enterprise_config(&paths.threep_config_path)?;
-
-    if paths.profile_path.exists() {
-        delete_file(&paths.profile_path)?;
-    }
-    write_meta(&paths.meta_path, None)?;
-
-    Ok(())
+    let mut threep = deployment_mode_value(&paths.threep_config_path, "1p")?;
+    remove_cc_switch_enterprise_fields(&mut threep);
+    let values = [
+        (paths.normal_config_path.clone(), deployment_mode_value(&paths.normal_config_path, "1p")?),
+        (paths.threep_config_path.clone(), threep),
+        (paths.meta_path.clone(), meta_value(&paths.meta_path, None)?),
+    ];
+    let mut files = values.into_iter().map(|(path, value)| serde_json::to_vec_pretty(&value).map(|bytes| (path, Some(bytes))).map_err(|source| AppError::JsonSerialize { source })).collect::<Result<Vec<_>, _>>()?;
+    files.push((paths.profile_path.clone(), None));
+    commit_at_paths(paths, &files)
 }
 
 fn build_gateway_profile(
@@ -1091,6 +1132,7 @@ fn snapshot_files(paths: &ClaudeDesktopPaths) -> Result<Vec<FileSnapshot>, AppEr
 
 fn restore_snapshots(snapshots: &[FileSnapshot]) -> Result<(), AppError> {
     for snapshot in snapshots {
+        let _permission = crate::app_management::permit_path(&snapshot.path)?;
         match &snapshot.content {
             Some(content) => {
                 if let Some(parent) = snapshot.path.parent() {
@@ -1106,7 +1148,7 @@ fn restore_snapshots(snapshots: &[FileSnapshot]) -> Result<(), AppError> {
     Ok(())
 }
 
-fn write_deployment_mode(path: &Path, mode: &str) -> Result<(), AppError> {
+fn deployment_mode_value(path: &Path, mode: &str) -> Result<Value, AppError> {
     let mut value = read_json_or_empty(path)?;
     if !value.is_object() {
         value = json!({});
@@ -1117,23 +1159,18 @@ fn write_deployment_mode(path: &Path, mode: &str) -> Result<(), AppError> {
             Value::String(mode.to_string()),
         );
     }
-    write_json_file(path, &value)
+    Ok(value)
 }
 
-fn remove_cc_switch_enterprise_config(path: &Path) -> Result<(), AppError> {
-    if !path.exists() {
-        return Ok(());
-    }
-
-    let mut value = read_json_or_empty(path)?;
+fn remove_cc_switch_enterprise_fields(value: &mut Value) {
     let Some(obj) = value.as_object_mut() else {
-        return Ok(());
+        return;
     };
     let Some(enterprise) = obj
         .get_mut("enterpriseConfig")
         .and_then(Value::as_object_mut)
     else {
-        return Ok(());
+        return;
     };
 
     for key in [
@@ -1149,11 +1186,14 @@ fn remove_cc_switch_enterprise_config(path: &Path) -> Result<(), AppError> {
     if enterprise.is_empty() {
         obj.remove("enterpriseConfig");
     }
-
-    write_json_file(path, &value)
 }
 
+#[cfg(test)]
 fn write_meta(path: &Path, applied_profile_id: Option<&str>) -> Result<(), AppError> {
+    write_json_file(path, &meta_value(path, applied_profile_id)?)
+}
+
+fn meta_value(path: &Path, applied_profile_id: Option<&str>) -> Result<Value, AppError> {
     let mut value = read_json_or_empty(path)?;
     if !value.is_object() {
         value = json!({});
@@ -1195,7 +1235,7 @@ fn write_meta(path: &Path, applied_profile_id: Option<&str>) -> Result<(), AppEr
     }
 
     obj.insert("entries".to_string(), Value::Array(entries));
-    write_json_file(path, &value)
+    Ok(value)
 }
 
 fn read_applied_id(path: &Path) -> Option<String> {
@@ -1249,6 +1289,9 @@ fn macos_paths_from_home(home: &Path) -> ClaudeDesktopPaths {
 
 #[cfg(windows)]
 fn windows_local_app_data_dir() -> PathBuf {
+    if std::env::var_os("CC_SWITCH_TEST_HOME").is_some() {
+        return get_home_dir().join("AppData/Local");
+    }
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| get_home_dir().join("AppData").join("Local"))
@@ -2177,6 +2220,52 @@ mod tests {
         assert_eq!(threep["deploymentMode"], json!("1p"));
         assert!(!paths.profile_path.exists());
         assert!(meta.get("appliedId").is_none());
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn safety_native_desktop_official_restore_and_backup_use_one_protected_bundle() {
+        use crate::{app_config::AppType, services::config_guard};
+        let home = crate::app_management::tests::TestHome::new();
+        let paths = current_platform_paths().unwrap();
+        assert!(paths.normal_config_path.starts_with(home.dir.path()));
+        let db = test_db();
+        apply_provider_to_paths(&db, &direct_provider("native"), &paths).unwrap();
+        let before = snapshot_files(&paths).unwrap();
+        restore_official_at_paths(&paths).unwrap();
+        assert!(!paths.profile_path.exists());
+        for path in [&paths.normal_config_path, &paths.threep_config_path] {
+            assert_eq!(read_json_file::<Value>(path).unwrap()["deploymentMode"], "1p");
+        }
+        let meta: Value = read_json_file(&paths.meta_path).unwrap();
+        assert!(meta.get("appliedId").is_none());
+        assert_eq!(meta["entries"], json!([]));
+        let state = config_guard::get_state(&AppType::ClaudeDesktop).unwrap();
+        let backup = state.backups.iter().find(|backup| backup.path == paths.profile_path.display().to_string() && backup.after_revision == "missing").unwrap();
+        assert_eq!(state.backups.iter().filter(|item| item.group_id == backup.group_id).count(), 4);
+        let preview = config_guard::preview_restore(&AppType::ClaudeDesktop, &backup.id).unwrap();
+        config_guard::apply(&preview.id, "apply_ccs", None).unwrap();
+        for snapshot in &before { assert_eq!(fs::read(&snapshot.path).unwrap(), *snapshot.content.as_ref().unwrap()); }
+        let file = config_guard::get_state(&AppType::ClaudeDesktop).unwrap().files.into_iter().find(|file| file.path == paths.profile_path.display().to_string()).unwrap();
+        config_guard::set_protection(&AppType::ClaudeDesktop, &file.id, vec!["/inferenceGatewayApiKey".into()], false, &file.revision).unwrap();
+        assert!(restore_official_at_paths(&paths).is_err());
+        for snapshot in before { assert_eq!(fs::read(snapshot.path).unwrap(), snapshot.content.unwrap()); }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn safety_native_desktop_failed_profile_delete_rolls_back_mode_and_metadata() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+        let _home = crate::app_management::tests::TestHome::new();
+        let paths = current_platform_paths().unwrap();
+        apply_provider_to_paths(&test_db(), &direct_provider("native"), &paths).unwrap();
+        let before = snapshot_files(&paths).unwrap();
+        let held = fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&paths.profile_path).unwrap();
+        let error = restore_official_at_paths(&paths).unwrap_err();
+        drop(held);
+        assert!(error.to_string().contains("rollback: completed"));
+        for snapshot in before { assert_eq!(fs::read(snapshot.path).unwrap(), snapshot.content.unwrap()); }
     }
 
     #[test]

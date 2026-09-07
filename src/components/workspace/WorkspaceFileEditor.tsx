@@ -5,6 +5,8 @@ import { Button } from "@/components/ui/button";
 import MarkdownEditor from "@/components/MarkdownEditor";
 import { FullScreenPanel } from "@/components/common/FullScreenPanel";
 import { workspaceApi } from "@/lib/api/workspace";
+import { useAppManagement } from "@/lib/query/appManagement";
+import { AppManagementNotice } from "@/components/management/AppManagementNotice";
 
 interface WorkspaceFileEditorProps {
   filename: string;
@@ -18,6 +20,7 @@ const WorkspaceFileEditor: React.FC<WorkspaceFileEditorProps> = ({
   onClose,
 }) => {
   const { t } = useTranslation();
+  const { canWrite } = useAppManagement("openclaw");
   const [content, setContent] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -52,6 +55,7 @@ const WorkspaceFileEditor: React.FC<WorkspaceFileEditorProps> = ({
   }, [isOpen, filename, t]);
 
   const handleSave = useCallback(async () => {
+    if (!canWrite) return;
     setSaving(true);
     try {
       await workspaceApi.writeFile(filename, content);
@@ -62,7 +66,7 @@ const WorkspaceFileEditor: React.FC<WorkspaceFileEditorProps> = ({
     } finally {
       setSaving(false);
     }
-  }, [filename, content, t]);
+  }, [filename, content, canWrite, t]);
 
   return (
     <FullScreenPanel
@@ -70,11 +74,12 @@ const WorkspaceFileEditor: React.FC<WorkspaceFileEditorProps> = ({
       title={t("workspace.editing", { filename })}
       onClose={onClose}
       footer={
-        <Button onClick={handleSave} disabled={saving || loading}>
+        <Button onClick={handleSave} disabled={saving || loading || !canWrite}>
           {saving ? t("common.saving") : t("common.save")}
         </Button>
       }
     >
+      <AppManagementNotice appId="openclaw" />
       {loading ? (
         <div className="flex items-center justify-center h-64 text-muted-foreground">
           {t("prompts.loading")}

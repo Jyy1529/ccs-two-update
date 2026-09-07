@@ -216,9 +216,26 @@ impl PreOutputDeadline {
     }
 }
 
+fn codex_bearer_access_token(headers: &http::HeaderMap) -> Option<&str> {
+    let authorization = headers
+        .get(http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .trim();
+    let mut parts = authorization.split_whitespace();
+    let scheme = parts.next()?;
+    let token = parts.next()?;
+    if !scheme.eq_ignore_ascii_case("bearer") || token.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some(token)
+}
+
 fn validate_codex_official_authorization(
     headers: &http::HeaderMap,
     provider: &Provider,
+    expected_chatgpt_account_id: Option<&str>,
+    managed_session_matches: Option<bool>,
 ) -> Result<(), ProxyError> {
     let authorization = headers
         .get(http::header::AUTHORIZATION)
@@ -232,19 +249,21 @@ fn validate_codex_official_authorization(
             "已切换到 OpenAI 官方供应商，请重启 Codex 或新建会话以加载官方登录配置".to_string(),
         )),
         Some(_) => {
-            let expected_account_id = provider
+            let managed_account_id = provider
                 .meta
                 .as_ref()
                 .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
                 .map(|account_id| account_id.trim().to_string())
                 .filter(|account_id| !account_id.is_empty());
-            if let Some(expected_account_id) = expected_account_id {
+            if managed_account_id.is_some() {
                 let request_account_id = headers
                     .get("chatgpt-account-id")
                     .and_then(|value| value.to_str().ok())
                     .map(str::trim)
                     .filter(|account_id| !account_id.is_empty());
-                if request_account_id != Some(expected_account_id.as_str()) {
+                if request_account_id != expected_chatgpt_account_id
+                    || managed_session_matches != Some(true)
+                {
                     return Err(ProxyError::AuthError(
                         "当前 Codex 会话未加载所选 ChatGPT 账号，请重启 Codex 或新建会话后重试"
                             .to_string(),
@@ -349,6 +368,7 @@ pub struct RequestForwarder {
     /// 全局 Provider 自动重试开关的请求级快照。
     provider_retry_enabled: bool,
     sync_logical_target: bool,
+    key_pool_retries: std::collections::HashMap<String, u32>,
     bypass_single_provider_circuit_breaker: bool,
     outbound_model_overrides: std::collections::HashMap<String, String>,
     role_route_owner_id: Option<String>,
@@ -446,6 +466,7 @@ impl RequestForwarder {
             max_attempts,
             provider_retry_enabled,
             sync_logical_target: true,
+            key_pool_retries: std::collections::HashMap::new(),
             bypass_single_provider_circuit_breaker: true,
             outbound_model_overrides: std::collections::HashMap::new(),
             role_route_owner_id: None,
@@ -458,6 +479,7 @@ impl RequestForwarder {
         plan: &crate::proxy::provider_router::ProviderRoutePlan,
     ) -> Self {
         self.sync_logical_target = plan.sync_logical_target;
+        self.key_pool_retries = plan.key_pool_retries.clone();
         self.bypass_single_provider_circuit_breaker = plan.bypass_single_provider_circuit_breaker;
         self.outbound_model_overrides = plan
             .attempts
@@ -518,10 +540,11 @@ impl RequestForwarder {
 
     async fn record_success_result(
         &self,
-        provider_id: &str,
+        provider: &Provider,
         app_type: &str,
         provider_permit: &mut Option<ProviderRequestPermit>,
     ) {
+        let provider_id = &provider.id;
         if provider_permit
             .as_ref()
             .is_some_and(|permit| permit.used_half_open_permit())
@@ -529,7 +552,7 @@ impl RequestForwarder {
             if let Err(e) = self
                 .record_half_open_result_cancellation_safe(
                     provider_permit,
-                    provider_id,
+                    provider,
                     app_type,
                     true,
                     None,
@@ -545,10 +568,11 @@ impl RequestForwarder {
 
         let router = self.router.clone();
         let provider_id = provider_id.to_string();
+        let provider = provider.clone();
         let app_type = app_type.to_string();
         tokio::spawn(async move {
             if let Err(e) = router
-                .record_result(&provider_id, &app_type, false, true, None)
+                .record_result_for_provider(&provider, &app_type, false, true, None)
                 .await
             {
                 log::warn!(
@@ -561,15 +585,16 @@ impl RequestForwarder {
     async fn record_deferred_role_stream_result(
         router: &Arc<ProviderRouter>,
         proxy_status: &Arc<RwLock<ProxyStatus>>,
-        provider_id: &str,
+        provider: &Provider,
         app_type: &str,
         used_half_open_permit: bool,
         terminal_error: Option<String>,
     ) {
+        let provider_id = &provider.id;
         let succeeded = terminal_error.is_none();
         if let Err(error) = router
-            .record_result(
-                provider_id,
+            .record_result_for_provider(
+                provider,
                 app_type,
                 used_half_open_permit,
                 succeeded,
@@ -623,6 +648,7 @@ impl RequestForwarder {
         let router = Arc::clone(&self.router);
         let proxy_status = Arc::clone(&self.status);
         let provider_id = provider.id.clone();
+        let provider = provider.clone();
         let app_type = app_type.to_string();
         let mut permit = provider_permit.take();
         let role_owner_provider_id = self.role_route_owner_id.clone();
@@ -655,7 +681,7 @@ impl RequestForwarder {
                                 Self::record_deferred_role_stream_result(
                                     &router,
                                     &proxy_status,
-                                    &provider_id,
+                                    &provider,
                                     &app_type,
                                     used_half_open_permit,
                                     terminal_error.clone(),
@@ -692,7 +718,7 @@ impl RequestForwarder {
                         Self::record_deferred_role_stream_result(
                             &router,
                             &proxy_status,
-                            &provider_id,
+                            &provider,
                             &app_type,
                             used_half_open_permit,
                             terminal_error.clone(),
@@ -752,7 +778,7 @@ impl RequestForwarder {
             Self::record_deferred_role_stream_result(
                 &router,
                 &proxy_status,
-                &provider_id,
+                &provider,
                 &app_type,
                 used_half_open_permit,
                 terminal_error,
@@ -799,7 +825,7 @@ impl RequestForwarder {
         );
 
         if !stream_result_deferred {
-            self.record_success_result(&provider.id, app_type_str, provider_permit)
+            self.record_success_result(provider, app_type_str, provider_permit)
                 .await;
 
             {
@@ -987,22 +1013,22 @@ impl RequestForwarder {
     async fn record_half_open_result_cancellation_safe(
         &self,
         provider_permit: &mut Option<ProviderRequestPermit>,
-        provider_id: &str,
+        provider: &Provider,
         app_type: &str,
         success: bool,
         error_msg: Option<String>,
     ) -> Result<(), crate::error::AppError> {
         let permit = provider_permit.take();
         let router = self.router.clone();
-        let provider_id = provider_id.to_string();
+        let provider = provider.clone();
         let app_type = app_type.to_string();
         tokio::spawn(async move {
             let used_half_open_permit = permit
                 .map(ProviderRequestPermit::into_used_half_open_permit)
                 .unwrap_or(false);
             router
-                .record_result(
-                    &provider_id,
+                .record_result_for_provider(
+                    &provider,
                     &app_type,
                     used_half_open_permit,
                     success,
@@ -1034,7 +1060,8 @@ impl RequestForwarder {
     ) -> Option<ForwardError> {
         // Provider 错误：本家上游/网络确实出问题，下一家 provider 可能可用 → 继续故障转移。
         // 客户端错误：整流后请求仍违法，下一家也修不好 → 直接返回。
-        let is_provider_error = provider_retry_exhausted_with_match
+        let is_provider_error = (provider_retry_exhausted_with_match
+            && !self.key_pool_retries.contains_key(&provider.id))
             || self.categorize_proxy_error(&retry_err, provider) == ErrorCategory::Retryable;
 
         if is_provider_error {
@@ -1044,7 +1071,7 @@ impl RequestForwarder {
             {
                 self.record_half_open_result_cancellation_safe(
                     provider_permit,
-                    &provider.id,
+                    provider,
                     app_type_str,
                     false,
                     Some(retry_err.to_string()),
@@ -1052,8 +1079,8 @@ impl RequestForwarder {
                 .await
             } else {
                 self.router
-                    .record_result(
-                        &provider.id,
+                    .record_result_for_provider(
+                        provider,
                         app_type_str,
                         false,
                         false,
@@ -1104,6 +1131,24 @@ impl RequestForwarder {
         extensions: Extensions,
         providers: Vec<Provider>,
     ) -> Result<ForwardResult, ForwardError> {
+        if extensions.get::<super::diagnostic::DiagnosticContext>().is_some() {
+            let provider = providers.first().filter(|_| providers.len() == 1).ok_or_else(|| ForwardError {
+                error: ProxyError::InvalidRequest("Diagnostic forwarding requires exactly one pinned provider".into()), provider: None,
+            })?;
+            let adapter = get_adapter(app_type).ok_or_else(|| ForwardError {
+                error: ProxyError::ConfigError("Application has no forwarding adapter".into()), provider: None,
+            })?;
+            let mut provider_body = body;
+            if self.optimizer_config.enabled && is_bedrock_provider(provider) {
+                if self.optimizer_config.thinking_optimizer { super::thinking_optimizer::optimize(&mut provider_body, &self.optimizer_config); }
+                if self.optimizer_config.cache_injection { super::cache_injector::inject(&mut provider_body, &self.optimizer_config); }
+            }
+            // The real transform/send function, without production routing,
+            // fallback, rectifier retries, key-pool rotation or success hooks.
+            return self.forward(app_type, &method, provider, endpoint, &provider_body, &headers, &extensions, adapter.as_ref()).await
+                .map(|(response, claude_api_format, outbound_model, _)| ForwardResult { response, provider: provider.clone(), claude_api_format, outbound_model, connection_guard: None })
+                .map_err(|error| ForwardError { error, provider: Some(provider.clone()) });
+        }
         let guard = ActiveConnectionGuard::acquire(self.status.clone()).await;
         {
             let mut s = self.status.write().await;
@@ -1241,7 +1286,12 @@ impl RequestForwarder {
                 &provider_body,
                 provider,
                 self.provider_retry_enabled,
-            );
+            )
+            .or_else(|| {
+                self.key_pool_retries.get(&provider.id).map(|retries| {
+                    super::provider_retry::ResolvedRetryPolicy::for_key_pool(*retries)
+                })
+            });
             if let Some(owner_provider_id) = self.role_route_owner_id.as_deref() {
                 let outbound_model = provider_body
                     .get("model")
@@ -1651,7 +1701,9 @@ impl RequestForwarder {
                     // 先分类错误，决定是否计入 provider 健康度
                     // —— NonRetryable / ClientAbort 是客户端层错误，无论换哪家 provider 都会被拒绝，
                     //    不应污染熔断器和数据库健康度（与 release_permit_neutral 同语义）。
-                    let category = if provider_retry_exhausted_with_match {
+                    let category = if provider_retry_exhausted_with_match
+                        && !self.key_pool_retries.contains_key(&provider.id)
+                    {
                         ErrorCategory::Retryable
                     } else {
                         self.categorize_proxy_error(&e, provider)
@@ -1666,7 +1718,7 @@ impl RequestForwarder {
                             {
                                 self.record_half_open_result_cancellation_safe(
                                     &mut provider_permit,
-                                    &provider.id,
+                                    provider,
                                     app_type_str,
                                     false,
                                     Some(e.to_string()),
@@ -1674,8 +1726,8 @@ impl RequestForwarder {
                                 .await
                             } else {
                                 self.router
-                                    .record_result(
-                                        &provider.id,
+                                    .record_result_for_provider(
+                                        provider,
                                         app_type_str,
                                         false,
                                         false,
@@ -1820,7 +1872,45 @@ impl RequestForwarder {
             && super::providers::is_codex_official_provider(provider);
 
         if codex_official_auth_passthrough {
-            validate_codex_official_authorization(headers, provider)?;
+            let (expected_chatgpt_account_id, managed_session_matches) = match provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
+            {
+                Some(local_account_id) => {
+                    let app_handle = self.app_handle.as_ref().ok_or_else(|| {
+                        ProxyError::AuthError("Codex OAuth 认证不可用（无 AppHandle）".to_string())
+                    })?;
+                    let codex_state = app_handle.state::<CodexOAuthState>();
+                    let chatgpt_account_id = codex_state
+                        .0
+                        .chatgpt_account_id_for_account(&local_account_id)
+                        .await
+                        .map_err(|error| {
+                            ProxyError::AuthError(format!("Codex OAuth 账号解析失败: {error}"))
+                        })?;
+                    let session_matches = match codex_bearer_access_token(headers) {
+                        Some(access_token) => {
+                            crate::codex_config::codex_live_auth_matches_managed_request(
+                                &local_account_id,
+                                access_token,
+                            )
+                            .map_err(|error| {
+                                ProxyError::AuthError(format!("Codex OAuth 会话校验失败: {error}"))
+                            })?
+                        }
+                        None => false,
+                    };
+                    (Some(chatgpt_account_id), Some(session_matches))
+                }
+                None => (None, None),
+            };
+            validate_codex_official_authorization(
+                headers,
+                provider,
+                expected_chatgpt_account_id.as_deref(),
+                managed_session_matches,
+            )?;
         }
 
         // 应用模型映射（独立于格式转换）
@@ -2221,6 +2311,13 @@ impl RequestForwarder {
             request_body["model"] = Value::String(model.clone());
         }
 
+        if matches!(app_type, AppType::Codex | AppType::GrokBuild)
+            && !codex_responses_to_chat
+            && !codex_responses_to_anthropic
+        {
+            normalize_codex_service_tier_for_upstream(&mut request_body);
+        }
+
         // Native Responses passthrough to a strict third-party gateway (xAI):
         // flatten Codex's private `namespace`/plugin tool declarations into
         // top-level function tools so the upstream's strict serde parser does
@@ -2228,38 +2325,26 @@ impl RequestForwarder {
         // above already unwrap namespaces, so this only fires on the native
         // passthrough. The response handler restores the flat names using a map
         // re-derived from the same request tools.
+        // Native Responses passthrough to a strict third-party gateway (xAI):
+        // flatten namespaces first, then apply provider-specific request rewrites.
         if matches!(app_type, AppType::Codex | AppType::GrokBuild)
             && !codex_responses_to_chat
             && !codex_responses_to_anthropic
             && super::providers::provider_needs_responses_namespace_flatten(provider)
-            && super::providers::transform_codex_responses_namespace::flatten_request_namespaces(
-                &mut request_body,
-            )?
         {
-            log::debug!(
-                "[Codex] Flattened namespace tools for native Responses upstream (provider={})",
-                provider.id
-            );
-        }
-
-        // Same native-Responses path: scrub the OpenAI-backend-private fields
-        // and tool carriers (`external_web_access`, `prompt_cache_retention`,
-        // `additional_tools`, `tool_search`, …) that xAI's strict serde parser
-        // rejects with 400/422. Deterministic field removals only, gated on the
-        // xAI OAuth path, so the prompt-cache prefix stays stable and no other
-        // provider is affected. Runs after the flatten above so lifted
-        // `namespace` tools survive the tool-type whitelist.
-        if matches!(app_type, AppType::Codex | AppType::GrokBuild)
-            && !codex_responses_to_chat
-            && !codex_responses_to_anthropic
-            && super::providers::provider_needs_responses_namespace_flatten(provider)
-            && super::providers::transform_codex_responses_xai_sanitize::sanitize_xai_responses_request(
+            if super::providers::transform_codex_responses_namespace::flatten_request_namespaces(
                 &mut request_body,
-            )
-        {
-            log::debug!(
-                "[Codex] Sanitized xAI-unsupported Responses fields (provider={})",
-                provider.id
+            )? {
+                log::debug!(
+                    "[Codex] Flattened namespace tools for native Responses upstream (provider={})",
+                    provider.id
+                );
+            }
+            super::providers::transform_codex_responses_xai_sanitize::apply_xai_native_responses_request_compat(
+                &mut request_body,
+                &provider.id,
+                super::providers::codex_provider_upstream_model(provider).as_deref(),
+                &provider.settings_config,
             );
         }
 
@@ -2291,6 +2376,10 @@ impl RequestForwarder {
             .filter(|m| !m.is_empty())
         {
             outbound_model = Some(m.to_string());
+        }
+        if let Some(diagnostic) = extensions.get::<super::diagnostic::DiagnosticContext>() {
+            diagnostic.enforce_output_limits(&mut filtered_body)?;
+            diagnostic.record_model(outbound_model.clone().or_else(|| super::handler_context::extract_gemini_model_from_path(&effective_endpoint)));
         }
         log_prompt_cache_trace(
             app_type,
@@ -2378,14 +2467,20 @@ impl RequestForwarder {
                         .as_ref()
                         .and_then(|m| m.managed_account_id_for("codex_oauth"));
 
-                    let token_result = match &account_id {
+                    let resolved_account_id = match account_id {
+                        Some(id) => Some(id),
+                        None => codex_auth.default_account_id().await,
+                    };
+
+                    let token_result = match &resolved_account_id {
                         Some(id) => {
                             log::debug!("[CodexOAuth] 使用指定账号 {id} 获取 token");
                             codex_auth.get_valid_token_for_account(id).await
                         }
                         None => {
-                            log::debug!("[CodexOAuth] 使用默认账号获取 token");
-                            codex_auth.get_valid_token().await
+                            return Err(ProxyError::AuthError(
+                                "Codex OAuth 认证失败: 无可用的 ChatGPT 账号".to_string(),
+                            ));
                         }
                     };
 
@@ -2393,10 +2488,19 @@ impl RequestForwarder {
                         Ok(token) => {
                             auth = AuthInfo::new(token, AuthStrategy::CodexOAuth);
                             should_send_codex_oauth_session_headers = true;
-                            // 解析使用的 account_id（用于注入 ChatGPT-Account-Id header）
-                            codex_oauth_account_id = match account_id {
-                                Some(id) => Some(id),
-                                None => codex_auth.default_account_id().await,
+                            // 本地账号 ID 只用于绑定；请求头必须使用上游 workspace ID。
+                            codex_oauth_account_id = match resolved_account_id.as_deref() {
+                                Some(id) => Some(
+                                    codex_auth
+                                        .chatgpt_account_id_for_account(id)
+                                        .await
+                                        .map_err(|e| {
+                                            ProxyError::AuthError(format!(
+                                                "Codex OAuth 账号解析失败: {e}"
+                                            ))
+                                        })?,
+                                ),
+                                None => None,
                             };
                             log::debug!(
                                 "[CodexOAuth] 成功获取 access_token (account={})",
@@ -2466,13 +2570,6 @@ impl RequestForwarder {
         } else {
             Vec::new()
         };
-
-        // 注入 Codex OAuth 的 ChatGPT-Account-Id header（如果有 account_id）
-        if let Some(ref account_id) = codex_oauth_account_id {
-            if let Ok(hv) = http::HeaderValue::from_str(account_id) {
-                auth_headers.push((http::HeaderName::from_static("chatgpt-account-id"), hv));
-            }
-        }
 
         let codex_oauth_session_headers =
             if should_send_codex_oauth_session_headers && self.session_client_provided {
@@ -2869,6 +2966,13 @@ impl RequestForwarder {
             is_copilot,
         );
 
+        // 托管 OAuth 的 workspace 由账号绑定决定，覆盖客户端或本地代理配置的旧值。
+        if let Some(ref account_id) = codex_oauth_account_id {
+            if let Ok(value) = http::HeaderValue::from_str(account_id) {
+                ordered_headers.insert("chatgpt-account-id", value);
+            }
+        }
+
         reject_proxy_placeholder_for_managed_account_upstream(&url, &ordered_headers)?;
 
         // 日志目标 URL 的脱敏分两种情形：
@@ -2911,7 +3015,8 @@ impl RequestForwarder {
             pre_output_deadline.remaining_or(transport_timeout, header_phase)?;
 
         // 获取全局代理 URL
-        let upstream_proxy_url: Option<String> = super::http_client::get_current_proxy_url();
+        let diagnostic = extensions.get::<super::diagnostic::DiagnosticContext>();
+        let upstream_proxy_url: Option<String> = if diagnostic.is_some() { None } else { super::http_client::get_current_proxy_url() };
 
         // SOCKS5 代理不支持 CONNECT 隧道，需要用 reqwest
         let is_socks_proxy = upstream_proxy_url
@@ -2927,15 +3032,17 @@ impl RequestForwarder {
         );
 
         // 发送请求
-        let response = if is_socks_proxy || !preserve_exact_header_case {
+        let response = if diagnostic.is_some() || is_socks_proxy || !preserve_exact_header_case {
             // OpenAI / Copilot / Codex 类后端不依赖原始 header 大小写；走 reqwest
             // 连接池，避免 raw TCP/TLS path 每次请求都重新握手。SOCKS5 也只能走 reqwest。
             log::debug!(
                 "[Forwarder] Using pooled reqwest client (preserve_exact_header_case={preserve_exact_header_case}, socks_proxy={is_socks_proxy})"
             );
-            let client = super::http_client::get();
+            let client = diagnostic.map(|context| context.client()).unwrap_or_else(super::http_client::get);
             let mut request = client.request(method.clone(), &url);
-            if request_is_streaming {
+            if diagnostic.is_some() {
+                request = request.timeout(std::time::Duration::from_secs(45));
+            } else if request_is_streaming {
                 // reqwest 的 timeout 是整请求超时；流式请求交给 response_processor
                 // 的首包/静默期超时控制，避免长流被总时长误杀。
                 request = request.timeout(std::time::Duration::from_secs(24 * 60 * 60));
@@ -2977,6 +3084,12 @@ impl RequestForwarder {
                 upstream_proxy_url.as_deref(),
             );
             pre_output_deadline.wait(header_phase, send).await??
+        };
+
+        let response = if let Some(context) = diagnostic {
+            context.limit_response(response)?
+        } else {
+            response
         };
 
         // 检查响应状态
@@ -3592,6 +3705,13 @@ impl RequestForwarder {
     }
 
     fn categorize_proxy_error(&self, error: &ProxyError, provider: &Provider) -> ErrorCategory {
+        if self.key_pool_retries.contains_key(&provider.id) {
+            return if super::provider_retry::key_pool_can_failover(error) {
+                ErrorCategory::Retryable
+            } else {
+                ErrorCategory::NonRetryable
+            };
+        }
         // Authentication belongs to the Codex client for an official route.
         // Every retry would reuse the selected account's inbound Authorization
         // header against another card, so no official-route error may fail over.
@@ -5108,6 +5228,16 @@ fn prepare_upstream_request_body(request_body: Value) -> Value {
     canonicalize_value(filter_private_params_with_whitelist(request_body, &[]))
 }
 
+fn normalize_codex_service_tier_for_upstream(request_body: &mut Value) {
+    let Some(service_tier) = request_body.get("service_tier").and_then(Value::as_str) else {
+        return;
+    };
+
+    if service_tier.eq_ignore_ascii_case("ultrafast") {
+        request_body["service_tier"] = Value::String("fast".to_string());
+    }
+}
+
 fn log_prompt_cache_trace(
     app_type: &AppType,
     provider: &Provider,
@@ -5268,6 +5398,7 @@ mod tests {
             max_attempts: 1,
             provider_retry_enabled: true,
             sync_logical_target: true,
+            key_pool_retries: HashMap::new(),
             bypass_single_provider_circuit_breaker: true,
             outbound_model_overrides: HashMap::new(),
             role_route_owner_id: None,
@@ -5517,6 +5648,7 @@ mod tests {
             use_failover_timeouts: true,
             sync_logical_target: false,
             bypass_single_provider_circuit_breaker: false,
+            key_pool_retries: HashMap::new(),
         }
     }
 
@@ -6236,6 +6368,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn key_pool_forwarding_uses_per_member_budgets_and_stops_on_client_errors() {
+        for (pool_retries, provider_retries, status, first_attempts, should_succeed) in [
+            (0, 0, StatusCode::SERVICE_UNAVAILABLE, 1, true),
+            (2, 0, StatusCode::TOO_MANY_REQUESTS, 3, true),
+            (3, 1, StatusCode::SERVICE_UNAVAILABLE, 2, true),
+            (0, 0, StatusCode::UNAUTHORIZED, 1, true),
+            (2, 0, StatusCode::BAD_REQUEST, 1, false),
+            (2, 0, StatusCode::NOT_FOUND, 1, false),
+            (2, 1, StatusCode::BAD_REQUEST, 2, false),
+        ] {
+            let mut replies =
+                vec![(status, json!({"error":{"message":"request failed"}})); first_attempts];
+            replies.push((
+                StatusCode::OK,
+                json!({"id":"pool-ok","status":"completed","output":[]}),
+            ));
+            let (base, captured, server) = spawn_recording_server("/v1/responses", replies).await;
+            let custom_messages = if status == StatusCode::BAD_REQUEST && provider_retries > 0 {
+                vec!["request failed".into()]
+            } else {
+                vec![]
+            };
+            let mut first = retry_provider(
+                "pool-first",
+                base.clone(),
+                provider_retries,
+                custom_messages,
+                vec![LocalProxyRetryErrorType::Overloaded],
+            );
+            first.settings_config["auth"]["OPENAI_API_KEY"] = json!("key-one");
+            let mut next = retry_provider("pool-next", base, 0, vec![], vec![]);
+            next.settings_config["auth"]["OPENAI_API_KEY"] = json!("key-two");
+            let plan = crate::proxy::provider_router::ProviderRoutePlan {
+                attempts: [first, next]
+                    .into_iter()
+                    .map(
+                        |provider| crate::proxy::provider_router::ProviderRouteAttempt {
+                            provider,
+                            outbound_model_override: None,
+                        },
+                    )
+                    .collect(),
+                use_failover_timeouts: true,
+                sync_logical_target: false,
+                bypass_single_provider_circuit_breaker: false,
+                key_pool_retries: HashMap::from([
+                    ("pool-first".into(), pool_retries),
+                    ("pool-next".into(), pool_retries),
+                ]),
+            };
+            let forwarder = test_forwarder(Duration::from_secs(2), Duration::from_secs(2))
+                .with_route_plan(&plan);
+            seed_role_route_observable_state(&forwarder).await;
+            let result = forwarder
+                .forward_with_retry(
+                    &AppType::Codex,
+                    http::Method::POST,
+                    "/v1/responses",
+                    json!({"model":"test-model","input":"hello","stream":false}),
+                    HeaderMap::new(),
+                    Extensions::new(),
+                    plan.providers(),
+                )
+                .await;
+            assert_eq!(
+                result.is_ok(),
+                should_succeed,
+                "status={status}, pool={pool_retries}, provider={provider_retries}"
+            );
+            if let Ok(result) = result {
+                assert_eq!(result.provider.id, "pool-next");
+            }
+            let requests = captured.lock().await;
+            assert_eq!(requests.len(), first_attempts + usize::from(should_succeed));
+            let sent_keys = requests
+                .iter()
+                .map(|(headers, _)| headers[http::header::AUTHORIZATION].to_str().unwrap())
+                .collect::<Vec<_>>();
+            assert!(sent_keys[..first_attempts].iter().all(|key| *key == "Bearer key-one"), "status={status}, pool={pool_retries}, provider={provider_retries}, fixture keys={sent_keys:?}");
+            if should_succeed {
+                assert_eq!(
+                    requests.last().unwrap().0[http::header::AUTHORIZATION],
+                    "Bearer key-two"
+                );
+            }
+            drop(requests);
+            assert_role_route_observable_state_unchanged(&forwarder).await;
+            abort_and_join_test_task(server).await;
+        }
+    }
+
+    #[tokio::test]
     async fn provider_retry_retries_matching_error_body_on_the_same_provider() {
         let (succeeded, attempts) = run_custom_message_error_body_case(
             format!("upstream says {DEFAULT_LOCAL_PROXY_RETRY_MESSAGE}").into_bytes(),
@@ -6394,6 +6618,26 @@ mod tests {
             serde_json::to_string(&prepared).unwrap(),
             r#"{"a":2,"tools":[{"name":"lookup","parameters":{"properties":{"_id":{"type":"string"},"a":{"type":"string"},"b":{"type":"number"}},"type":"object"}}],"z":1}"#
         );
+    }
+
+    #[test]
+    fn normalize_codex_service_tier_maps_ultrafast_to_upstream_fast() {
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "service_tier": "ultrafast"
+        });
+
+        normalize_codex_service_tier_for_upstream(&mut body);
+
+        assert_eq!(body["service_tier"], "fast");
+
+        let mut supported = json!({ "service_tier": "priority" });
+        normalize_codex_service_tier_for_upstream(&mut supported);
+        assert_eq!(supported["service_tier"], "priority");
+
+        let mut absent = json!({ "model": "gpt-5.6-sol" });
+        normalize_codex_service_tier_for_upstream(&mut absent);
+        assert!(absent.get("service_tier").is_none());
     }
 
     #[test]
@@ -7244,7 +7488,7 @@ mod tests {
         let mut provider = test_provider_with_type(None);
         provider.id = "codex-official".to_string();
         provider.category = Some("official".to_string());
-        let error = validate_codex_official_authorization(&headers, &provider)
+        let error = validate_codex_official_authorization(&headers, &provider, None, None)
             .expect_err("stale placeholder must be rejected");
         assert!(matches!(error, ProxyError::AuthError(message) if message.contains("重启 Codex")));
     }
@@ -7257,7 +7501,7 @@ mod tests {
             Some(crate::provider::AuthBinding {
                 source: crate::provider::AuthBindingSource::ManagedAccount,
                 auth_provider: Some("codex_oauth".to_string()),
-                account_id: Some("account-b".to_string()),
+                account_id: Some("local-account-b".to_string()),
             });
 
         let mut headers = HeaderMap::new();
@@ -7265,14 +7509,26 @@ mod tests {
             http::header::AUTHORIZATION,
             HeaderValue::from_static("Bearer account-a-token"),
         );
-        headers.insert("chatgpt-account-id", HeaderValue::from_static("account-a"));
-        let error = validate_codex_official_authorization(&headers, &provider)
-            .expect_err("a stale Codex session must not cross the account boundary");
+        headers.insert(
+            "chatgpt-account-id",
+            HeaderValue::from_static("workspace-shared"),
+        );
+        let error = validate_codex_official_authorization(
+            &headers,
+            &provider,
+            Some("workspace-shared"),
+            Some(false),
+        )
+        .expect_err("another user's bearer in the same workspace must be rejected");
         assert!(matches!(error, ProxyError::AuthError(message) if message.contains("重启 Codex")));
 
-        headers.insert("chatgpt-account-id", HeaderValue::from_static("account-b"));
-        validate_codex_official_authorization(&headers, &provider)
-            .expect("the selected account may pass through");
+        validate_codex_official_authorization(
+            &headers,
+            &provider,
+            Some("workspace-shared"),
+            Some(true),
+        )
+        .expect("the selected account may pass through");
     }
 
     #[test]

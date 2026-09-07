@@ -42,6 +42,8 @@ import {
 import { ProfileManageDialog } from "./ProfileManageDialog";
 import { APP_PROFILE_SCOPE, hasScopeSnapshot } from "./scope";
 import type { CurrentProfileIds, ProfileScope } from "@/lib/api/profiles";
+import { useAppManagement } from "@/lib/query/appManagement";
+import { AppManagementNotice } from "@/components/management/AppManagementNotice";
 
 const CURRENT_ID_KEY: Record<ProfileScope, keyof CurrentProfileIds> = {
   claude: "claude",
@@ -63,6 +65,7 @@ interface ProfileSwitcherProps {
  */
 export function ProfileSwitcher({ activeApp }: ProfileSwitcherProps) {
   const { t } = useTranslation();
+  const { canWrite } = useAppManagement(activeApp);
   const [open, setOpen] = useState(false);
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [isManageOpen, setIsManageOpen] = useState(false);
@@ -85,6 +88,7 @@ export function ProfileSwitcher({ activeApp }: ProfileSwitcherProps) {
   const currentProfile = profiles.find((p) => p.id === currentId);
 
   const handleApply = (id: string) => {
+    if (!canWrite) return;
     setOpen(false);
     if (id !== currentId) {
       applyMutation.mutate({ id, scope });
@@ -110,6 +114,9 @@ export function ProfileSwitcher({ activeApp }: ProfileSwitcherProps) {
             type="button"
             role="combobox"
             aria-expanded={open}
+            aria-label={t("profiles.switcherAriaLabel", {
+              name: currentProfile?.name ?? t("profiles.none"),
+            })}
             title={t(`profiles.switcherTooltip.${scope}`)}
             className={cn(
               "inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-sm font-medium transition-colors",
@@ -128,9 +135,11 @@ export function ProfileSwitcher({ activeApp }: ProfileSwitcherProps) {
           side="bottom"
           align="start"
           sideOffset={6}
+          aria-label={t(`profiles.switcherTooltip.${scope}`)}
           className="z-[100] w-64 p-0"
         >
           <Command label={t("profiles.searchPlaceholder")}>
+            <AppManagementNotice appId={activeApp} />
             <CommandInput placeholder={t("profiles.searchPlaceholder")} />
             <CommandList>
               <CommandEmpty>{t("profiles.empty")}</CommandEmpty>
@@ -140,6 +149,7 @@ export function ProfileSwitcher({ activeApp }: ProfileSwitcherProps) {
                     <CommandItem
                       key={profile.id}
                       value={profile.id}
+                      disabled={!canWrite}
                       keywords={[profile.name]}
                       onSelect={() => handleApply(profile.id)}
                     >
@@ -177,10 +187,11 @@ export function ProfileSwitcher({ activeApp }: ProfileSwitcherProps) {
                 {currentId && (
                   <CommandItem
                     value="__clear__"
+                    disabled={!canWrite}
                     keywords={[t("profiles.none")]}
                     onSelect={() => {
                       setOpen(false);
-                      clearMutation.mutate(scope);
+                      if (canWrite) clearMutation.mutate(scope);
                     }}
                   >
                     <X className="mr-2 h-4 w-4 shrink-0" />

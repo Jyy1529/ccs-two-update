@@ -23,6 +23,9 @@ import {
   type AppId,
   type ManagedAuthProvider,
 } from "@/lib/api";
+import { extractCodexExperimentalBearerToken } from "@/utils/providerConfigUtils";
+import { useAppManagement } from "@/lib/query/appManagement";
+import { AppManagementNotice } from "@/components/management/AppManagementNotice";
 
 interface EditProviderDialogProps {
   open: boolean;
@@ -38,6 +41,64 @@ interface EditProviderDialogProps {
   escapeEnabled?: boolean;
 }
 
+const asRecord = (value: unknown): Record<string, unknown> | null =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+
+const hasAuthMaterial = (value: unknown): boolean => {
+  if (value === null || value === undefined) return false;
+  if (typeof value === "string") return value.trim().length > 0;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "object") return Object.keys(value).length > 0;
+  return true;
+};
+
+/**
+ * Rebuild the provider auth only for a current Codex provider's live snapshot.
+ *
+ * In official-auth-preservation mode, live config.toml owns the active
+ * provider bearer while the shared auth.json may belong to another provider or
+ * contain the user's ChatGPT login. Stored provider auth remains the template:
+ * this mirrors the backend switch-away backfill and avoids copying shared auth
+ * material into the provider row. DB snapshots and presets must keep their
+ * normal auth-first precedence.
+ */
+const reconcileCodexLiveAuth = (
+  liveSettings: Record<string, unknown>,
+  storedSettings: Record<string, unknown> | null,
+  category: string | undefined,
+): Record<string, unknown> => {
+  if (category === "official") return liveSettings;
+
+  const configText =
+    typeof liveSettings.config === "string" ? liveSettings.config : "";
+  const bearer = extractCodexExperimentalBearerToken(configText);
+  if (!bearer) return liveSettings;
+
+  const storedAuth = asRecord(storedSettings?.auth);
+  const authTemplate = storedAuth ?? asRecord(liveSettings.auth) ?? {};
+  const hasProviderApiKey =
+    typeof authTemplate.OPENAI_API_KEY === "string" &&
+    authTemplate.OPENAI_API_KEY.trim().length > 0;
+  const hasOauthLogin = Object.entries(authTemplate).some(
+    ([key, value]) =>
+      key !== "auth_mode" && key !== "OPENAI_API_KEY" && hasAuthMaterial(value),
+  );
+
+  // Match should_restore_codex_provider_token_for_backfill: an OAuth-only
+  // provider must not be silently converted into an API-key provider.
+  if (hasOauthLogin && !hasProviderApiKey) return liveSettings;
+
+  return {
+    ...liveSettings,
+    auth: {
+      ...authTemplate,
+      OPENAI_API_KEY: bearer,
+    },
+  };
+};
+
 export function EditProviderDialog({
   open,
   provider,
@@ -49,6 +110,7 @@ export function EditProviderDialog({
   escapeEnabled = true,
 }: EditProviderDialogProps) {
   const { t } = useTranslation();
+  const management = useAppManagement(appId, open);
   const formId = useId();
   const [isFormSubmitting, setIsFormSubmitting] = useState(false);
   const [authSettingsTarget, setAuthSettingsTarget] =
@@ -109,6 +171,13 @@ export function EditProviderDialog({
       if (!open || !provider) {
         setLiveSettings(null);
         setHasLoadedLive(false);
+        return;
+      }
+
+      if (management.isPending) return;
+      if (!management.canWrite) {
+        setLiveSettings(null);
+        setHasLoadedLive(true);
         return;
       }
 
@@ -190,13 +259,26 @@ export function EditProviderDialog({
     return () => {
       cancelled = true;
     };
-  }, [open, provider?.id, appId, hasLoadedLive, isProxyTakeover]); // 只依赖 provider.id，不依赖整个 provider 对象
+  }, [
+    open,
+    provider?.id,
+    appId,
+    hasLoadedLive,
+    isProxyTakeover,
+    management.isPending,
+    management.canWrite,
+  ]); // 只依赖 provider.id，不依赖整个 provider 对象
 
   const initialSettingsConfig = useMemo(() => {
-    const base = (liveSettings ?? provider?.settingsConfig ?? {}) as Record<
-      string,
-      unknown
-    >;
+    const storedSettings = asRecord(provider?.settingsConfig);
+    const base =
+      appId === "codex" && liveSettings
+        ? reconcileCodexLiveAuth(
+            liveSettings,
+            storedSettings,
+            provider?.category,
+          )
+        : (liveSettings ?? storedSettings ?? {});
 
     // Codex 的 modelCatalog 是 cc-switch 私有字段，SSOT 在数据库。Live 的 config.toml
     // 仅在写入时投影出 model_catalog_json 指针；Codex.app 改写配置、代理接管/恢复周期、
@@ -217,7 +299,7 @@ export function EditProviderDialog({
     }
 
     return base;
-  }, [liveSettings, provider?.settingsConfig, appId]); // 只依赖 settingsConfig，不依赖整个 provider
+  }, [liveSettings, provider?.settingsConfig, provider?.category, appId]); // 只依赖表单初始化所需字段，不依赖整个 provider
 
   // 固定 initialData，防止 provider 对象更新时重置表单
   const initialData = useMemo(() => {
@@ -297,10 +379,15 @@ export function EditProviderDialog({
           className="bg-primary text-primary-foreground hover:bg-primary/90"
         >
           <Save className="h-4 w-4 mr-2" />
-          {t("common.save")}
+          {t(
+            management.canWrite
+              ? "common.save"
+              : "appManagement.saveDatabaseOnly",
+          )}
         </Button>
       }
     >
+      <AppManagementNotice appId={appId} />
       <ProviderForm
         appId={appId}
         providerId={provider.id}

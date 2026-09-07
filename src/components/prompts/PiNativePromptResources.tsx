@@ -47,6 +47,8 @@ import {
 import { isValidPiPromptTemplateSlug } from "@/lib/piPromptSlug";
 import { cn } from "@/lib/utils";
 import { extractErrorMessage } from "@/utils/errorUtils";
+import { useAppManagement } from "@/lib/query/appManagement";
+import { AppManagementNotice } from "@/components/management/AppManagementNotice";
 
 type EditablePiPromptFileKind = PiPromptFileKind;
 
@@ -91,6 +93,7 @@ function PiInstructionFileEditor({
   onClose: () => void;
 }) {
   const { t } = useTranslation();
+  const { canWrite } = useAppManagement("pi");
   const darkMode = useDarkMode();
   const queryClient = useQueryClient();
   const [baseSnapshot] = useState(() => snapshot);
@@ -138,6 +141,7 @@ function PiInstructionFileEditor({
   const blank = !draft.trim();
 
   const requestSave = () => {
+    if (!canWrite) return;
     if (file.kind === "system_override" && !baseSnapshot.exists) {
       setConfirmCreate(true);
       return;
@@ -158,7 +162,7 @@ function PiInstructionFileEditor({
                 type="button"
                 variant="outline"
                 onClick={() => setConfirmDelete(true)}
-                disabled={busy}
+                disabled={busy || !canWrite}
                 className="mr-auto text-destructive hover:text-destructive"
               >
                 <Trash2 className="h-4 w-4" aria-hidden="true" />
@@ -168,7 +172,7 @@ function PiInstructionFileEditor({
             <Button
               type="button"
               onClick={requestSave}
-              disabled={!changed || blank || busy}
+              disabled={!changed || blank || busy || !canWrite}
             >
               {save.isPending && (
                 <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
@@ -180,6 +184,7 @@ function PiInstructionFileEditor({
           </>
         }
       >
+        <AppManagementNotice appId="pi" />
         <div className="glass w-full space-y-6 rounded-xl border border-white/10 p-6">
           {file.kind === "system_override" && (
             <div className="flex gap-2.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2.5 text-sm">
@@ -224,7 +229,9 @@ function PiInstructionFileEditor({
         confirmText={t("pi.prompts.saveAndConfigure")}
         variant="info"
         zIndex="top"
-        onConfirm={() => save.mutate()}
+        onConfirm={() => {
+          if (canWrite) save.mutate();
+        }}
         onCancel={() => setConfirmCreate(false)}
       />
 
@@ -238,7 +245,9 @@ function PiInstructionFileEditor({
         })}
         confirmText={t("common.delete")}
         zIndex="top"
-        onConfirm={() => remove.mutate()}
+        onConfirm={() => {
+          if (canWrite) remove.mutate();
+        }}
         onCancel={() => setConfirmDelete(false)}
       />
     </>
@@ -392,6 +401,7 @@ function PiPromptTemplateEditor({
   onChanged,
 }: PiPromptTemplateEditorProps) {
   const { t } = useTranslation();
+  const { canWrite } = useAppManagement("pi");
   const darkMode = useDarkMode();
   const initialDescription = getPiPromptTemplateDescription(
     template?.content ?? "",
@@ -441,7 +451,8 @@ function PiPromptTemplateEditor({
   });
 
   const busy = save.isPending;
-  const canSave = slugIsValid && !slugAlreadyExists && changed && !busy;
+  const canSave =
+    canWrite && slugIsValid && !slugAlreadyExists && changed && !busy;
 
   return (
     <>
@@ -457,7 +468,9 @@ function PiPromptTemplateEditor({
           <Button
             type="button"
             disabled={!canSave || busy}
-            onClick={() => save.mutate()}
+            onClick={() => {
+              if (canSave) save.mutate();
+            }}
           >
             {save.isPending && (
               <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
@@ -466,6 +479,7 @@ function PiPromptTemplateEditor({
           </Button>
         }
       >
+        <AppManagementNotice appId="pi" />
         <div className="glass w-full space-y-6 rounded-xl border border-white/10 p-6">
           <div>
             <Label htmlFor="pi-template-slug">
@@ -578,6 +592,7 @@ export interface PiPromptTemplatesHandle {
 export const PiPromptTemplates = forwardRef<PiPromptTemplatesHandle>(
   function PiPromptTemplates(_props, ref) {
     const { t } = useTranslation();
+    const { canWrite } = useAppManagement("pi");
     const queryClient = useQueryClient();
     const [search, setSearch] = useState("");
     const [editor, setEditor] = useState<
@@ -745,6 +760,7 @@ export const PiPromptTemplates = forwardRef<PiPromptTemplatesHandle>(
                         type="button"
                         variant="ghost"
                         size="icon"
+                        disabled={!canWrite}
                         className="shrink-0 hover:text-destructive"
                         onClick={() => setPendingDelete(template)}
                         title={t("common.delete")}
@@ -778,7 +794,7 @@ export const PiPromptTemplates = forwardRef<PiPromptTemplatesHandle>(
           })}
           confirmText={t("common.delete")}
           onConfirm={() => {
-            if (pendingDelete) remove.mutate(pendingDelete);
+            if (pendingDelete && canWrite) remove.mutate(pendingDelete);
           }}
           onCancel={() => setPendingDelete(null)}
         />

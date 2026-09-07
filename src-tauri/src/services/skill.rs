@@ -554,7 +554,7 @@ impl SkillService {
                 crate::config::get_home_dir().join(".agents").join("skills")
             }
         };
-        fs::create_dir_all(&dir)?;
+        if !dir.exists() { let _permission = crate::app_management::permit_path(&dir)?; fs::create_dir_all(&dir)?; }
         Ok(dir)
     }
 
@@ -1061,6 +1061,7 @@ impl SkillService {
                     if overlaps_preserved_pi {
                         log::warn!("Skill {id} 的 SSOT 路径与保留的 Pi 副本重叠，跳过文件删除");
                     } else if skill_path.exists() {
+                        let _permission = crate::app_management::permit_path(&skill_path)?;
                         fs::remove_dir_all(&skill_path)?;
                     }
                     (backup_path, preserved_pi_path, pi_cleanup_incomplete)
@@ -1478,6 +1479,7 @@ impl SkillService {
         let _ = Self::create_uninstall_backup(&skill);
 
         // 删除旧 SSOT 目录并复制新文件
+        let _permission = crate::app_management::permit_path(&dest)?;
         if dest.exists() {
             fs::remove_dir_all(&dest)?;
         }
@@ -1600,6 +1602,8 @@ impl SkillService {
                 crate::config::get_home_dir().join(".agents").join("skills")
             }
         };
+        let _old_permission = crate::app_management::permit_path(&old_dir)?;
+        let _new_permission = crate::app_management::permit_path(&new_dir)?;
         fs::create_dir_all(&new_dir)?;
         Self::validate_skill_storage_destination(&new_dir)?;
 
@@ -1844,7 +1848,9 @@ impl SkillService {
     /// 启用：复制到应用目录
     /// 禁用：从应用目录删除
     pub fn toggle_app(db: &Arc<Database>, id: &str, app: &AppType, enabled: bool) -> Result<()> {
+        let ticket = crate::app_management::WriteTicket::capture(app)?;
         let _state_guard = skill_state_write_guard();
+        ticket.check()?;
         // 获取当前 skill
         let mut skill = db
             .get_installed_skill(id)?
@@ -2247,6 +2253,7 @@ impl SkillService {
     /// - Symlink: 仅使用 symlink
     /// - Copy: 仅使用文件复制
     pub fn sync_to_app_dir(directory: &str, app: &AppType) -> Result<()> {
+        crate::app_management::require_managed(app)?;
         if matches!(app, AppType::ClaudeDesktop) {
             return Ok(());
         }
@@ -2260,6 +2267,7 @@ impl SkillService {
         Self::validate_sync_source_dir(&source, &directory)?;
 
         let app_dir = Self::get_distinct_app_skills_dir(&ssot_dir, app)?;
+        let _permission = crate::app_management::permit_path(&app_dir)?;
         fs::create_dir_all(&app_dir)?;
 
         let dest = app_dir.join(&directory);
@@ -2324,6 +2332,7 @@ impl SkillService {
 
     /// 删除路径（支持 symlink 和真实目录）
     fn remove_path(path: &Path) -> Result<()> {
+        let _permission = crate::app_management::permit_path(path)?;
         if Self::is_symlink(path) {
             // 符号链接：仅删除链接本身，不影响源文件
             #[cfg(unix)]
@@ -2357,6 +2366,7 @@ impl SkillService {
     }
 
     fn replace_dest_with_copy(source: &Path, dest: &Path, directory: &str) -> Result<()> {
+        let _permission = crate::app_management::permit_path(dest)?;
         Self::validate_sync_source_dir(source, directory)?;
 
         let parent = dest
@@ -2426,6 +2436,7 @@ impl SkillService {
 
     /// 从应用目录删除 Skill（支持 symlink 和真实目录）
     pub fn remove_from_app(directory: &str, app: &AppType) -> Result<()> {
+        crate::app_management::require_managed(app)?;
         Self::remove_from_app_preserving(directory, app, None)
     }
 
@@ -2434,6 +2445,7 @@ impl SkillService {
         app: &AppType,
         preserved_path: Option<&Path>,
     ) -> Result<()> {
+        if !crate::app_management::is_managed(app) { log::info!("Skipped Skill removal for {}: unmanaged", app.as_str()); return Ok(()); }
         if matches!(app, AppType::ClaudeDesktop) {
             return Ok(());
         }
@@ -2465,12 +2477,15 @@ impl SkillService {
 
     /// 同步所有已启用的 Skills 到指定应用
     pub fn sync_to_app(db: &Arc<Database>, app: &AppType) -> Result<()> {
+        crate::app_management::require_managed(app)?;
         let _state_guard = skill_state_read_guard();
         Self::sync_to_app_unlocked(db, app)
     }
 
     /// Caller must hold either the Skills state read or write guard.
     fn sync_to_app_unlocked(db: &Arc<Database>, app: &AppType) -> Result<()> {
+        if !crate::app_management::is_managed(app) { return Ok(()); }
+        let _permission = crate::app_management::permit_path(&Self::get_app_skills_dir(app)?)?;
         if matches!(app, AppType::ClaudeDesktop | AppType::Pi) {
             return Ok(());
         }
@@ -3372,6 +3387,7 @@ impl SkillService {
 
     /// 递归复制目录
     fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
+        let _permission = crate::app_management::permit_path(dest)?;
         fs::create_dir_all(dest)?;
 
         for entry in fs::read_dir(src)? {
@@ -3748,6 +3764,7 @@ impl SkillService {
 
             // 复制到 SSOT
             let dest = ssot_dir.join(&install_name);
+            let _permission = crate::app_management::permit_path(&dest)?;
             if dest.exists() {
                 let _ = fs::remove_dir_all(&dest);
             }

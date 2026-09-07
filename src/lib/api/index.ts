@@ -1,6 +1,7 @@
 export type { AppId } from "./types";
 export { piApi } from "./pi";
 export { providersApi, universalProvidersApi } from "./providers";
+export { providerGroupsApi } from "./providerGroups";
 export { settingsApi } from "./settings";
 export { backupsApi } from "./settings";
 export { mcpApi } from "./mcp";
@@ -23,6 +24,7 @@ export type {
   ProviderTransferRequest,
   ProviderTransferResult,
 } from "./providers";
+export type { ProviderGroupPolicy } from "./providerGroups";
 export type { Prompt } from "./prompts";
 export type { Profile, ProfilePayload, ProfilesResponse } from "./profiles";
 export type {

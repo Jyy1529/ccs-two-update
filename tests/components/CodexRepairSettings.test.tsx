@@ -1,4 +1,8 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { screen, waitFor } from "@testing-library/react";
+import {
+  managementFixture,
+  renderManagedUi as render,
+} from "../utils/safetyTestUtils";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -58,6 +62,21 @@ describe("CodexRepairSettings", () => {
       screen.getByRole("switch", { name: /Codex Desktop/i }),
     );
     expect(onEnabledChange).toHaveBeenCalledWith(false);
+  });
+
+  it("keeps read-only detection available but disables repair for unmanaged Codex", async () => {
+    render(
+      <CodexRepairSettings enabled onEnabledChange={vi.fn()} />,
+      managementFixture({ codex: { enabled: false, phase: "unmanaged" } }),
+    );
+    await screen.findByText("config pinned mismatch");
+    expect(
+      screen.getByRole("button", {
+        name: /管理员修复|Repair as administrator/i,
+      }),
+    ).toBeDisabled();
+    expect(statusMock).toHaveBeenCalledTimes(1);
+    expect(launchMock).not.toHaveBeenCalled();
   });
 
   it("requires confirmation before launching the administrator repair", async () => {

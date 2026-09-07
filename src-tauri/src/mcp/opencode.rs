@@ -12,6 +12,7 @@
 //! | `type: "sse"/"http"` | `type: "remote"`    |
 //! | `url`                | `url`               |
 
+use indexmap::IndexMap;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -179,6 +180,24 @@ pub fn convert_from_opencode_format(spec: &Value) -> Result<Value, AppError> {
 // ============================================================================
 // Public API: Sync Functions
 // ============================================================================
+
+pub fn sync_servers_to_opencode(servers: &IndexMap<String, McpServer>) -> Result<(), AppError> {
+    if servers.is_empty() || !should_sync_opencode_mcp() {
+        return Ok(());
+    }
+    let updates = servers
+        .values()
+        .map(|server| {
+            let spec = if server.apps.opencode {
+                Some(convert_to_opencode_format(&server.server)?)
+            } else {
+                None
+            };
+            Ok((server.id.clone(), spec))
+        })
+        .collect::<Result<IndexMap<_, _>, AppError>>()?;
+    opencode_config::update_mcp_servers(updates)
+}
 
 /// Sync a single MCP server to OpenCode live config
 pub fn sync_single_server_to_opencode(

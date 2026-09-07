@@ -149,6 +149,7 @@ fn profile_snapshot_apply_roundtrip_restores_configuration() {
             .expect("serialize p1 settings"),
     )
     .expect("seed live settings.json");
+    support::confirm_existing_configuration(AppType::Claude);
 
     state
         .db
@@ -517,6 +518,7 @@ fn switching_profile_autosaves_previous_profile_state() {
             .expect("serialize p1 settings"),
     )
     .expect("seed live settings.json");
+    support::confirm_existing_configuration(AppType::Claude);
 
     state
         .db

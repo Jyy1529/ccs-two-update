@@ -1,5 +1,6 @@
 //! Claude MCP 同步和导入模块
 
+use indexmap::IndexMap;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -44,6 +45,22 @@ pub fn sync_enabled_to_claude(config: &MultiAppConfig) -> Result<(), AppError> {
     }
     let enabled = collect_enabled_servers(&config.mcp.claude);
     crate::claude_mcp::set_mcp_servers_map(&enabled)
+}
+
+pub fn sync_servers_to_claude(servers: &IndexMap<String, McpServer>) -> Result<(), AppError> {
+    if servers.is_empty() || !should_sync_claude_mcp() {
+        return Ok(());
+    }
+    let mut enabled = HashMap::new();
+    let mut removed = Vec::new();
+    for server in servers.values() {
+        if server.apps.claude {
+            enabled.insert(server.id.clone(), server.server.clone());
+        } else {
+            removed.push(server.id.as_str());
+        }
+    }
+    crate::claude_mcp::update_mcp_servers_map(&enabled, &removed)
 }
 
 /// 从 ~/.claude.json 导入 mcpServers 到统一结构（v3.7.0+）
@@ -123,15 +140,10 @@ pub fn sync_single_server_to_claude(
     if !should_sync_claude_mcp() {
         return Ok(());
     }
-    // 读取现有的 MCP 配置
-    let current = crate::claude_mcp::read_mcp_servers_map()?;
-
-    // 创建新的 HashMap，包含现有的所有服务器 + 当前要同步的服务器
-    let mut updated = current;
-    updated.insert(id.to_string(), server_spec.clone());
-
-    // 写回
-    crate::claude_mcp::set_mcp_servers_map(&updated)
+    crate::claude_mcp::update_mcp_servers_map(
+        &HashMap::from([(id.to_string(), server_spec.clone())]),
+        &[],
+    )
 }
 
 /// 从 Claude live 配置中移除单个 MCP 服务器
@@ -139,12 +151,5 @@ pub fn remove_server_from_claude(id: &str) -> Result<(), AppError> {
     if !should_sync_claude_mcp() {
         return Ok(());
     }
-    // 读取现有的 MCP 配置
-    let mut current = crate::claude_mcp::read_mcp_servers_map()?;
-
-    // 移除指定服务器
-    current.remove(id);
-
-    // 写回
-    crate::claude_mcp::set_mcp_servers_map(&current)
+    crate::claude_mcp::update_mcp_servers_map(&HashMap::new(), &[id])
 }

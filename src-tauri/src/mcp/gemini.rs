@@ -1,5 +1,6 @@
 //! Gemini MCP 同步和导入模块
 
+use indexmap::IndexMap;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -44,6 +45,22 @@ pub fn sync_enabled_to_gemini(config: &MultiAppConfig) -> Result<(), AppError> {
     }
     let enabled = collect_enabled_servers(&config.mcp.gemini);
     crate::gemini_mcp::set_mcp_servers_map(&enabled)
+}
+
+pub fn sync_servers_to_gemini(servers: &IndexMap<String, McpServer>) -> Result<(), AppError> {
+    if servers.is_empty() || !should_sync_gemini_mcp() {
+        return Ok(());
+    }
+    let mut enabled = HashMap::new();
+    let mut removed = Vec::new();
+    for server in servers.values() {
+        if server.apps.gemini {
+            enabled.insert(server.id.clone(), server.server.clone());
+        } else {
+            removed.push(server.id.as_str());
+        }
+    }
+    crate::gemini_mcp::update_mcp_servers_map(&enabled, &removed)
 }
 
 /// 从 Gemini MCP 配置导入到统一结构（v3.7.0+）
@@ -119,14 +136,10 @@ pub fn sync_single_server_to_gemini(
     if !should_sync_gemini_mcp() {
         return Ok(());
     }
-    // 读取现有的 MCP 配置
-    let mut current = crate::gemini_mcp::read_mcp_servers_map()?;
-
-    // 添加/更新当前服务器
-    current.insert(id.to_string(), server_spec.clone());
-
-    // 写回
-    crate::gemini_mcp::set_mcp_servers_map(&current)
+    crate::gemini_mcp::update_mcp_servers_map(
+        &HashMap::from([(id.to_string(), server_spec.clone())]),
+        &[],
+    )
 }
 
 /// 从 Gemini live 配置中移除单个 MCP 服务器
@@ -134,12 +147,5 @@ pub fn remove_server_from_gemini(id: &str) -> Result<(), AppError> {
     if !should_sync_gemini_mcp() {
         return Ok(());
     }
-    // 读取现有的 MCP 配置
-    let mut current = crate::gemini_mcp::read_mcp_servers_map()?;
-
-    // 移除指定服务器
-    current.remove(id);
-
-    // 写回
-    crate::gemini_mcp::set_mcp_servers_map(&current)
+    crate::gemini_mcp::update_mcp_servers_map(&HashMap::new(), &[id])
 }

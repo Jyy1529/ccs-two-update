@@ -116,9 +116,16 @@ where
     F: FnOnce(Arc<AppState>) -> Fut + Send + 'static,
     Fut: Future<Output = Result<T, AppError>> + Send + 'static,
 {
+    let management_revision = crate::app_management::read_policy()?.revision;
     let supervisor = tokio::spawn(async move {
         let _lifecycle = state.lock_codex_provider_lifecycle().await;
         let _proxy_transaction = state.proxy_service.lock_transaction().await;
+        if crate::app_management::read_policy()?.revision != management_revision {
+            return Err(AppError::Config("Management changed while the operation was queued; retry".into()));
+        }
+        if !crate::app_management::is_managed(&AppType::Codex) {
+            return operation(state).await;
+        }
         let mut snapshot = CodexProviderLifecycleSnapshot {
             provider_tables: state.db.snapshot_provider_tables(AppType::Codex.as_str())?,
             local_current_provider: crate::settings::get_current_provider(&AppType::Codex),

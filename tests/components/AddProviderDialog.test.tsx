@@ -1,10 +1,8 @@
+import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import {
-  act,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+  managementFixture,
+  renderManagedUi as render,
+} from "../utils/safetyTestUtils";
 import { useEffect } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AddProviderDialog } from "@/components/providers/AddProviderDialog";
@@ -172,6 +170,27 @@ describe("AddProviderDialog", () => {
         lastUsed: undefined,
       },
     });
+  });
+
+  it("labels unmanaged creation as database-only and explicitly suppresses live addition", async () => {
+    const handleSubmit = vi.fn().mockResolvedValue(undefined);
+    render(
+      <AddProviderDialog
+        open
+        appId="codex"
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+      />,
+      managementFixture({ codex: { enabled: false, phase: "unmanaged" } }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "appManagement.saveDatabaseOnly" }),
+    );
+    await waitFor(() =>
+      expect(handleSubmit).toHaveBeenCalledWith(
+        expect.objectContaining({ addToLive: false }),
+      ),
+    );
   });
 
   it("submits the optional managed account from the Codex Official preset", async () => {

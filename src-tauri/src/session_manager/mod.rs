@@ -124,6 +124,9 @@ pub fn delete_session(
     session_id: &str,
     source_path: &str,
 ) -> Result<bool, String> {
+    let app = <crate::app_config::AppType as std::str::FromStr>::from_str(provider_id).map_err(|e| e.to_string())?;
+    let _permission = crate::app_management::native_mutation_guard().map_err(|e| e.to_string())?;
+    crate::app_management::require_managed(&app).map_err(|e| e.to_string())?;
     // SQLite sessions bypass the file-based deletion path
     if provider_id == "opencode" && source_path.starts_with("sqlite:") {
         return opencode::delete_session_sqlite(session_id, source_path);

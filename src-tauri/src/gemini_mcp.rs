@@ -21,6 +21,7 @@ fn read_json_value(path: &Path) -> Result<Value, AppError> {
 }
 
 fn write_json_value(path: &Path, value: &Value) -> Result<(), AppError> {
+    let _permission = crate::app_management::permit_path(path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
     }
@@ -76,6 +77,20 @@ pub fn read_mcp_servers_map() -> Result<std::collections::HashMap<String, Value>
 pub fn set_mcp_servers_map(
     servers: &std::collections::HashMap<String, Value>,
 ) -> Result<(), AppError> {
+    write_mcp_servers_map(servers, None)
+}
+
+pub(crate) fn update_mcp_servers_map(
+    servers: &std::collections::HashMap<String, Value>,
+    removed: &[&str],
+) -> Result<(), AppError> {
+    write_mcp_servers_map(servers, Some(removed))
+}
+
+fn write_mcp_servers_map(
+    servers: &std::collections::HashMap<String, Value>,
+    removed: Option<&[&str]>,
+) -> Result<(), AppError> {
     let path = user_config_path();
     let mut root = if path.exists() {
         read_json_value(&path)?
@@ -84,7 +99,19 @@ pub fn set_mcp_servers_map(
     };
 
     // 构建 mcpServers 对象：移除 UI 辅助字段（enabled/source），仅保留实际 MCP 规范
-    let mut out: Map<String, Value> = Map::new();
+    let mut out = if let Some(removed) = removed {
+        let mut current = root
+            .get("mcpServers")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for id in removed {
+            current.remove(*id);
+        }
+        current
+    } else {
+        Map::new()
+    };
     for (id, spec) in servers.iter() {
         let mut obj = if let Some(map) = spec.as_object() {
             map.clone()

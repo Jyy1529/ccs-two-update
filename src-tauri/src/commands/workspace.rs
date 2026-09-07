@@ -136,9 +136,11 @@ pub async fn read_daily_memory_file(filename: String) -> Result<Option<String>, 
 /// Write a daily memory file (atomic write).
 #[tauri::command]
 pub async fn write_daily_memory_file(filename: String, content: String) -> Result<(), String> {
+    crate::app_management::require_managed(&crate::app_config::AppType::OpenClaw).map_err(|e| e.to_string())?;
     validate_daily_memory_filename(&filename)?;
 
     let memory_dir = get_openclaw_dir().join("workspace").join("memory");
+    let _permission = crate::app_management::permit_path(&memory_dir).map_err(|e| e.to_string())?;
 
     std::fs::create_dir_all(&memory_dir)
         .map_err(|e| format!("Failed to create memory directory: {e}"))?;
@@ -287,6 +289,8 @@ pub async fn search_daily_memory_files(
 /// Delete a daily memory file (idempotent).
 #[tauri::command]
 pub async fn delete_daily_memory_file(filename: String) -> Result<(), String> {
+    crate::app_management::require_managed(&crate::app_config::AppType::OpenClaw).map_err(|e| e.to_string())?;
+    let _permission = crate::app_management::permit_path(&get_openclaw_dir()).map_err(|e| e.to_string())?;
     validate_daily_memory_filename(&filename)?;
 
     let path = get_openclaw_dir()
@@ -325,6 +329,8 @@ pub async fn read_workspace_file(filename: String) -> Result<Option<String>, Str
 /// Creates the workspace directory if it does not exist.
 #[tauri::command]
 pub async fn write_workspace_file(filename: String, content: String) -> Result<(), String> {
+    crate::app_management::require_managed(&crate::app_config::AppType::OpenClaw).map_err(|e| e.to_string())?;
+    let _permission = crate::app_management::permit_path(&get_openclaw_dir()).map_err(|e| e.to_string())?;
     validate_filename(&filename)?;
 
     let workspace_dir = get_openclaw_dir().join("workspace");
@@ -350,6 +356,7 @@ pub async fn open_workspace_directory(handle: AppHandle, subdir: String) -> Resu
     };
 
     if !dir.exists() {
+        let _permission = crate::app_management::permit_path(&dir).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create directory: {e}"))?;
     }
 

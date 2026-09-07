@@ -1,10 +1,8 @@
+import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import {
-  act,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+  managementFixture,
+  renderManagedUi as render,
+} from "../utils/safetyTestUtils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import PromptFormPanel from "@/components/prompts/PromptFormPanel";
@@ -104,5 +102,25 @@ describe("PromptFormPanel", () => {
     await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
     expect(onClose).not.toHaveBeenCalled();
     expect(screen.getByLabelText("prompts.name")).toBeEnabled();
+  });
+
+  it("allows explicitly database-only prompt editing for an unmanaged app", async () => {
+    const onSave = vi.fn().mockResolvedValue(true);
+    render(
+      <PromptFormPanel appId="codex" onSave={onSave} onClose={vi.fn()} />,
+      managementFixture({ codex: { enabled: false, phase: "unmanaged" } }),
+    );
+    fireEvent.change(screen.getByLabelText("prompts.name"), {
+      target: { value: "Stored prompt" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "appManagement.saveDatabaseOnly" }),
+    );
+    await waitFor(() =>
+      expect(onSave).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ name: "Stored prompt", enabled: false }),
+      ),
+    );
   });
 });

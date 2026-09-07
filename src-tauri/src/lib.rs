@@ -1,4 +1,5 @@
 mod app_config;
+pub(crate) mod app_management;
 mod app_store;
 mod auto_launch;
 mod claude_desktop_config;
@@ -30,6 +31,7 @@ mod pi_config;
 mod prompt;
 mod prompt_files;
 mod provider;
+pub(crate) mod provider_groups;
 mod proxy;
 mod services;
 mod session_manager;
@@ -42,7 +44,8 @@ mod usage_script;
 
 pub use app_config::{AppType, InstalledSkill, McpApps, McpServer, MultiAppConfig, SkillApps};
 pub use codex_config::{
-    get_codex_auth_path, get_codex_config_path, read_codex_live_settings, write_codex_live_atomic,
+    extract_codex_experimental_bearer_token, get_codex_auth_path, get_codex_config_path,
+    read_codex_live_settings, write_codex_live_atomic,
 };
 pub use commands::open_provider_terminal;
 pub use commands::*;
@@ -68,6 +71,7 @@ pub use services::{
     SkillService, SpeedtestService,
 };
 pub use settings::{update_settings, AppSettings};
+pub use services::config_guard::apply as apply_reviewed_configuration_change;
 pub use store::AppState;
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
@@ -1281,6 +1285,11 @@ pub fn run() {
                     const SESSION_SYNC_INTERVAL_SECS: u64 = 60;
 
                     async fn run_session_sync(db: std::sync::Arc<crate::database::Database>, backfill: bool) {
+                        // 手动扫描模式下跳过定时扫描；backfill 轮（启动首轮）仍进入，
+                        // 费用回填只修补数据库既有行（含代理记账行），不读会话文件
+                        if !backfill && !crate::settings::get_settings().session_auto_sync_enabled {
+                            return;
+                        }
                         let _guard = crate::services::session_usage::session_sync_mutex()
                             .lock()
                             .await;
@@ -1289,6 +1298,9 @@ pub fn run() {
                                 if let Err(error) = db.backfill_missing_usage_costs() {
                                     log::warn!("Usage cost startup backfill failed: {error}");
                                 }
+                            }
+                            if !crate::settings::get_settings().session_auto_sync_enabled {
+                                return crate::services::session_usage::SessionSyncResult::default();
                             }
                             crate::services::session_usage::sync_all_unlocked(&db)
                         });
@@ -1382,6 +1394,20 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::prepare_model_validation,
+            commands::fetch_model_validation_models,
+            commands::start_model_validation,
+            commands::get_model_validation,
+            commands::list_model_validations,
+            commands::cancel_model_validation,
+            commands::get_app_management_state,
+            commands::preview_app_management_change,
+            commands::apply_app_management_change,
+            commands::get_config_guard_state,
+            commands::preview_config_restore,
+            commands::set_config_protection,
+            commands::preview_config_change,
+            commands::apply_config_change,
             commands::get_providers,
             commands::get_current_provider,
             commands::get_provider_transfer_preview,
@@ -1389,6 +1415,25 @@ pub fn run() {
             commands::add_provider,
             commands::update_provider,
             commands::delete_provider,
+            commands::list_provider_groups,
+            commands::create_provider_group,
+            commands::update_provider_group,
+            commands::delete_provider_group,
+            commands::move_provider_to_group,
+            commands::reorder_provider_groups,
+            commands::reorder_provider_group_members,
+            commands::set_group_key_pool_policy,
+            commands::set_provider_key_pool_enabled,
+            commands::get_group_key_pool_status,
+            commands::set_provider_auto_grouping,
+            commands::get_provider_auto_grouping,
+            commands::list_balance_query_templates,
+            commands::set_provider_balance_template,
+            commands::save_balance_query_template,
+            commands::delete_balance_query_template,
+            commands::query_balance_by_credentials,
+            commands::query_provider_balance,
+            commands::query_group_balances,
             commands::remove_provider_from_live_config,
             commands::switch_provider,
             commands::import_default_config,
@@ -1687,6 +1732,7 @@ pub fn run() {
             // Generic managed auth commands
             commands::auth_start_login,
             commands::auth_poll_for_account,
+            commands::auth_cancel_login,
             commands::auth_list_accounts,
             commands::auth_get_status,
             commands::auth_remove_account,
@@ -2002,6 +2048,7 @@ const PROXY_STARTUP_APP_TYPES: [&str; 4] = ["claude", "codex", "gemini", "grokbu
 async fn enabled_proxy_apps_on_startup(db: &database::Database) -> Vec<&'static str> {
     let mut apps = Vec::new();
     for app_type in PROXY_STARTUP_APP_TYPES {
+        if !crate::app_management::is_managed(&<AppType as std::str::FromStr>::from_str(app_type).expect("known application")) { continue; }
         if db
             .get_proxy_config_for_app(app_type)
             .await

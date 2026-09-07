@@ -30,6 +30,87 @@ export interface Provider {
   inFailoverQueue?: boolean;
 }
 
+export type ProviderGroupKind = "manual" | "auto_base_url";
+export type KeyPoolStrategy = "failover" | "round_robin";
+
+export interface ProviderGroup {
+  id: string;
+  appType: string;
+  name: string;
+  icon?: string | null;
+  iconColor?: string | null;
+  kind: ProviderGroupKind;
+  normalizedBaseUrl: string | null;
+  sortIndex: number;
+  collapsed: boolean;
+  keyPoolEnabled: boolean;
+  keyPoolStrategy: KeyPoolStrategy;
+  keyPoolMaxRetries: number;
+  keyPoolCooldownMs: number;
+  balanceTemplateId: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ProviderGroupMemberStatus {
+  providerId: string;
+  providerName: string;
+  sortIndex?: number | null;
+  keyPoolEnabled: boolean;
+  eligible: boolean;
+  coolingDown: boolean;
+  cooldownRemainingMs?: number;
+  consecutiveFailures?: number;
+  lastFailureAt?: number | null;
+  earlyProbe?: boolean;
+  error?: string | null;
+}
+
+export interface ProviderGroupStatus {
+  group: ProviderGroup;
+  members: ProviderGroupMemberStatus[];
+  eligibleMemberCount: number;
+  proxyRunning?: boolean;
+}
+
+export interface BalanceQueryTemplate {
+  id: string;
+  name: string;
+  method: "GET" | "POST";
+  path: string;
+  query: Record<string, string>;
+  headers: Record<string, string>;
+  body?: string | null;
+  remainingPath: string;
+  usedPath?: string | null;
+  totalPath?: string | null;
+  resetPath?: string | null;
+  errorPath?: string | null;
+  unit?: string | null;
+  currency?: string | null;
+  timeoutSecs: number;
+  balanceScope?: "unknown" | "per_key" | "account" | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface BalanceQueryResult {
+  providerId: string;
+  providerName: string;
+  status: "success" | "partial" | "failed";
+  data: UsageData[];
+  error?: string | null;
+  currency?: string | null;
+  aggregationKey?: string | null;
+}
+
+export interface BalanceQueryByCredentialsRequest {
+  appType: string;
+  baseUrl: string;
+  apiKey: string;
+  template: BalanceQueryTemplate;
+}
+
 export interface AppConfig {
   providers: Record<string, Provider>;
   current: string;
@@ -219,6 +300,14 @@ export interface CodexAgentRoleRouting {
 export interface ProviderMeta {
   // 自定义端点：以 URL 为键，值为端点信息
   custom_endpoints?: Record<string, CustomEndpoint>;
+  // 应用内 Provider 文件夹 ID
+  providerGroupId?: string;
+  // 文件夹内 Provider 顺序
+  providerGroupSortIndex?: number;
+  providerGroupManual?: boolean;
+  // 是否参与所属文件夹的 Key 池
+  keyPoolEnabled?: boolean;
+  balanceTemplateId?: string;
   // 是否在切换/同步到 live 时应用通用配置片段
   commonConfigEnabled?: boolean;
   // Claude Desktop 3P 配置写入模式
@@ -450,6 +539,8 @@ export interface Settings {
   // User has confirmed the usage query first-run notice
   usageConfirmed?: boolean;
   usageDashboardRefreshIntervalMs?: number;
+  // 会话用量自动扫描开关（默认开启=自动模式；关闭后仅手动同步时扫描会话日志，代理记账不受影响）
+  sessionAutoSyncEnabled?: boolean;
   // Whether to show the failover toggle independently on the main page
   enableFailoverToggle?: boolean;
   // Whether to show the project profile switcher on the main page header
@@ -526,7 +617,7 @@ export interface Settings {
 
   // ===== 终端设置 =====
   // 首选终端应用（可选，默认使用系统默认终端）
-  // macOS: "terminal" | "iterm2" | "warp" | "alacritty" | "kitty" | "ghostty" | "wezterm" | "kaku"
+  // macOS: "terminal" | "iterm2" | "warp" | "alacritty" | "kitty" | "ghostty" | "otty" | "wezterm" | "kaku"
   // Windows: "cmd" | "powershell" | "wt"
   // Linux: "gnome-terminal" | "konsole" | "xfce4-terminal" | "alacritty" | "kitty" | "ghostty"
   preferredTerminal?: string;

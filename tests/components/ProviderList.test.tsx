@@ -1,11 +1,29 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import {
+  render,
+  screen,
+  fireEvent,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { ReactElement } from "react";
+import { useState, type ComponentProps, type ReactElement } from "react";
 import { http, HttpResponse } from "msw";
-import type { Provider } from "@/types";
+import type { Provider, ProviderGroup } from "@/types";
 import { ProviderList } from "@/components/providers/ProviderList";
 import { server } from "../msw/server";
+import { createInstance } from "i18next";
+import { I18nextProvider } from "react-i18next";
+import zh from "@/i18n/locales/zh.json";
+import zhTW from "@/i18n/locales/zh-TW.json";
+import en from "@/i18n/locales/en.json";
+import ja from "@/i18n/locales/ja.json";
+import { managementFixture } from "../utils/safetyTestUtils";
+import { toast } from "sonner";
+
+vi.mock("sonner", () => ({
+  toast: { success: vi.fn(), error: vi.fn(), info: vi.fn() },
+}));
 
 const TAURI_ENDPOINT = "http://tauri.local";
 
@@ -31,6 +49,8 @@ vi.mock("@/components/providers/ProviderCard", () => ({
 
     return (
       <div data-testid={`provider-card-${provider.id}`}>
+        {props.groupActions}
+        {props.balanceSummary}
         <button
           data-testid={`switch-${provider.id}`}
           onClick={() => onSwitch(provider)}
@@ -118,9 +138,24 @@ function renderWithQueryClient(ui: ReactElement) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
+  queryClient.setQueryData(["appManagement"], managementFixture());
 
   return render(
     <QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>,
+  );
+}
+
+function ToolbarProviderList(props: ComponentProps<typeof ProviderList>) {
+  const [toolbar, setToolbar] = useState<HTMLDivElement | null>(null);
+  return (
+    <>
+      <header>
+        <div ref={setToolbar} data-testid="group-toolbar" />
+      </header>
+      <main>
+        <ProviderList {...props} toolbarContainer={toolbar} />
+      </main>
+    </>
   );
 }
 
@@ -131,6 +166,7 @@ beforeEach(() => {
 
   useSortableMock.mockImplementation(({ id }: { id: string }) => ({
     setNodeRef: vi.fn(),
+    setActivatorNodeRef: vi.fn(),
     attributes: { "data-dnd-id": id },
     listeners: { onPointerDown: vi.fn() },
     transform: null,
@@ -268,7 +304,7 @@ describe("ProviderList Component", () => {
     );
   });
 
-  it("filters providers with the search input", () => {
+  it("filters providers without removing the header controls for an empty result", () => {
     const providerAlpha = createProvider({ id: "alpha", name: "Alpha Labs" });
     const providerBeta = createProvider({ id: "beta", name: "Beta Works" });
 
@@ -279,7 +315,7 @@ describe("ProviderList Component", () => {
     });
 
     renderWithQueryClient(
-      <ProviderList
+      <ToolbarProviderList
         providers={{ alpha: providerAlpha, beta: providerBeta }}
         currentProviderId=""
         appId="claude"
@@ -308,6 +344,11 @@ describe("ProviderList Component", () => {
     expect(screen.queryByTestId("provider-card-beta")).not.toBeInTheDocument();
     expect(
       screen.getByText("No providers match your search."),
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByTestId("group-toolbar")).getByRole("switch", {
+        name: "按 Base URL 自动分组",
+      }),
     ).toBeInTheDocument();
   });
 
@@ -544,6 +585,253 @@ describe("ProviderList Component", () => {
         isStateChangeProtected: true,
       });
     });
+  });
+
+  it("keeps provider controls on cards and persists collapse without update notifications", async () => {
+    const grouped = createProvider({
+      id: "grouped",
+      name: "Grouped Provider",
+      meta: {
+        providerGroupId: "group-1",
+        providerGroupSortIndex: 0,
+        keyPoolEnabled: true,
+      },
+    });
+    const ungrouped = createProvider({ id: "ungrouped", name: "Ungrouped" });
+    const collapsedWrites: boolean[] = [];
+    const group: ProviderGroup = {
+      id: "group-1",
+      appType: "codex",
+      name: "AgentRouter",
+      kind: "manual",
+      normalizedBaseUrl: null,
+      sortIndex: 0,
+      collapsed: false,
+      keyPoolEnabled: true,
+      keyPoolStrategy: "failover",
+      keyPoolMaxRetries: 1,
+      keyPoolCooldownMs: 1000,
+      balanceTemplateId: null,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    useDragSortMock.mockReturnValue({
+      sortedProviders: [grouped, ungrouped],
+      sensors: [],
+      handleDragEnd: vi.fn(),
+    });
+    server.use(
+      http.post(`${TAURI_ENDPOINT}/list_provider_groups`, () =>
+        HttpResponse.json([group]),
+      ),
+      http.post(`${TAURI_ENDPOINT}/get_provider_auto_grouping`, () =>
+        HttpResponse.json(true),
+      ),
+      http.post(
+        `${TAURI_ENDPOINT}/update_provider_group`,
+        async ({ request }) => {
+          const body = (await request.json()) as { group: ProviderGroup };
+          Object.assign(group, body.group);
+          collapsedWrites.push(group.collapsed);
+          return HttpResponse.json(group);
+        },
+      ),
+    );
+
+    renderWithQueryClient(
+      <ToolbarProviderList
+        providers={{ grouped, ungrouped }}
+        currentProviderId="grouped"
+        appId="codex"
+        onSwitch={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+        onDuplicate={vi.fn()}
+        onOpenWebsite={vi.fn()}
+      />,
+    );
+
+    expect((await screen.findAllByText("AgentRouter"))[0]).toBeInTheDocument();
+    expect(screen.getByTestId("provider-card-grouped")).toBeInTheDocument();
+    expect(screen.getByTestId("provider-card-ungrouped")).toBeInTheDocument();
+    expect(useSortableMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "provider-group:group-1",
+        data: { type: "provider-group", groupId: "group-1", appId: "codex" },
+      }),
+    );
+    const card = within(screen.getByTestId("provider-card-grouped"));
+    expect(
+      card.getByRole("combobox", { name: "Folder for Grouped Provider" }),
+    ).toBeInTheDocument();
+    expect(
+      card.getByRole("button", { name: "Query balance for Grouped Provider" }),
+    ).toBeInTheDocument();
+    const toolbar = within(screen.getByTestId("group-toolbar"));
+    const groupingSwitch = toolbar.getByRole("switch", {
+      name: "按 Base URL 自动分组",
+    });
+    expect(groupingSwitch).toBeChecked();
+    expect(groupingSwitch.parentElement).toHaveClass(
+      "h-8",
+      "rounded-lg",
+      "bg-muted/50",
+    );
+    expect(groupingSwitch.parentElement?.textContent).toBe("");
+    const newFolderButton = toolbar.getByRole("button", { name: "新建文件夹" });
+    expect(
+      within(screen.getByRole("main")).queryByRole("switch"),
+    ).not.toBeInTheDocument();
+    expect(
+      groupingSwitch.compareDocumentPosition(newFolderButton) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Toggle folder" }));
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId("provider-card-grouped"),
+      ).not.toBeInTheDocument(),
+    );
+    expect(
+      screen.getByRole("combobox", {
+        name: "Balance template for AgentRouter",
+      }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Toggle folder" }));
+    await screen.findByTestId("provider-card-grouped");
+    expect(collapsedWrites).toEqual([true, false]);
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+  it("keeps folder controls available for an app without providers", async () => {
+    renderWithQueryClient(
+      <ToolbarProviderList
+        providers={{}}
+        currentProviderId=""
+        appId="codex"
+        onSwitch={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+        onDuplicate={vi.fn()}
+        onOpenWebsite={vi.fn()}
+      />,
+    );
+
+    const toolbar = within(screen.getByTestId("group-toolbar"));
+    expect(
+      await toolbar.findByRole("switch", { name: "按 Base URL 自动分组" }),
+    ).toBeInTheDocument();
+    fireEvent.click(toolbar.getByRole("button", { name: "新建文件夹" }));
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+  });
+  it.each([
+    ["zh", zh],
+    ["zh-TW", zhTW],
+    ["en", en],
+    ["ja", ja],
+  ] as const)(
+    "localizes header controls and the folder dialog in %s",
+    async (language, translation) => {
+      const i18n = createInstance();
+      await i18n.init({
+        lng: language,
+        resources: { [language]: { translation } },
+      });
+      renderWithQueryClient(
+        <I18nextProvider i18n={i18n}>
+          <ToolbarProviderList
+            providers={{}}
+            currentProviderId=""
+            appId="codex"
+            onSwitch={vi.fn()}
+            onEdit={vi.fn()}
+            onDelete={vi.fn()}
+            onDuplicate={vi.fn()}
+            onOpenWebsite={vi.fn()}
+          />
+        </I18nextProvider>,
+      );
+      const toolbar = within(screen.getByTestId("group-toolbar"));
+      expect(
+        await toolbar.findByRole("switch", {
+          name: translation.providerGroups.autoGrouping,
+        }),
+      ).toBeInTheDocument();
+      fireEvent.click(
+        toolbar.getByRole("button", {
+          name: translation.providerGroups.newFolder,
+        }),
+      );
+      expect(
+        await screen.findByRole("dialog", {
+          name: translation.providerGroups.createTitle,
+        }),
+      ).toBeInTheDocument();
+    },
+  );
+
+  it("keeps automatic grouping changes isolated when switching apps", async () => {
+    const states: Record<string, boolean> = { codex: true, claude: false };
+    server.use(
+      http.post(
+        `${TAURI_ENDPOINT}/get_provider_auto_grouping`,
+        async ({ request }) => {
+          const { app } = (await request.json()) as { app: string };
+          return HttpResponse.json(states[app]);
+        },
+      ),
+      http.post(
+        `${TAURI_ENDPOINT}/set_provider_auto_grouping`,
+        async ({ request }) => {
+          const { app, enabled } = (await request.json()) as {
+            app: string;
+            enabled: boolean;
+          };
+          states[app] = enabled;
+          return HttpResponse.json([]);
+        },
+      ),
+    );
+    function AppHarness() {
+      const [app, setApp] = useState<"codex" | "claude">("codex");
+      return (
+        <>
+          <button onClick={() => setApp(app === "codex" ? "claude" : "codex")}>
+            change-app
+          </button>
+          <ToolbarProviderList
+            providers={{}}
+            currentProviderId=""
+            appId={app}
+            onSwitch={vi.fn()}
+            onEdit={vi.fn()}
+            onDelete={vi.fn()}
+            onDuplicate={vi.fn()}
+            onOpenWebsite={vi.fn()}
+          />
+        </>
+      );
+    }
+    renderWithQueryClient(<AppHarness />);
+    let control = await screen.findByRole("switch", {
+      name: "按 Base URL 自动分组",
+    });
+    await waitFor(() => expect(control).toBeChecked());
+    fireEvent.click(control);
+    await waitFor(() => expect(states.codex).toBe(false));
+    fireEvent.click(screen.getByText("change-app"));
+    control = await screen.findByRole("switch", {
+      name: "按 Base URL 自动分组",
+    });
+    await waitFor(() => expect(control).not.toBeDisabled());
+    expect(control).not.toBeChecked();
+    fireEvent.click(control);
+    await waitFor(() => expect(states.claude).toBe(true));
+    fireEvent.click(screen.getByText("change-app"));
+    control = await screen.findByRole("switch", {
+      name: "按 Base URL 自动分组",
+    });
+    await waitFor(() => expect(control).not.toBeChecked());
+    expect(states).toEqual({ codex: false, claude: true });
   });
 
   it("keeps Pi provider creation on the page-level add action", async () => {

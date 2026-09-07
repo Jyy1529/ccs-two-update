@@ -13,6 +13,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { FullScreenPanel } from "@/components/common/FullScreenPanel";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { useAppManagement } from "@/lib/query/appManagement";
+import { AppManagementNotice } from "@/components/management/AppManagementNotice";
 import MarkdownEditor from "@/components/MarkdownEditor";
 import {
   workspaceApi,
@@ -44,6 +46,7 @@ const DailyMemoryPanel: React.FC<DailyMemoryPanelProps> = ({
   onClose,
 }) => {
   const { t } = useTranslation();
+  const { canWrite } = useAppManagement("openclaw");
 
   // List state
   const [files, setFiles] = useState<DailyMemoryFileInfo[]>([]);
@@ -233,7 +236,7 @@ const DailyMemoryPanel: React.FC<DailyMemoryPanelProps> = ({
 
   // Save current file
   const handleSave = useCallback(async () => {
-    if (!editingFile) return;
+    if (!editingFile || !canWrite) return;
     setSaving(true);
     try {
       await workspaceApi.writeDailyMemoryFile(editingFile, content);
@@ -244,11 +247,11 @@ const DailyMemoryPanel: React.FC<DailyMemoryPanelProps> = ({
     } finally {
       setSaving(false);
     }
-  }, [editingFile, content, t]);
+  }, [editingFile, content, canWrite, t]);
 
   // Delete file
   const handleDelete = useCallback(async () => {
-    if (!deletingFile) return;
+    if (!deletingFile || !canWrite) return;
     try {
       await workspaceApi.deleteDailyMemoryFile(deletingFile);
       toast.success(t("workspace.dailyMemory.deleteSuccess"));
@@ -269,6 +272,7 @@ const DailyMemoryPanel: React.FC<DailyMemoryPanelProps> = ({
     }
   }, [
     deletingFile,
+    canWrite,
     editingFile,
     loadFiles,
     t,
@@ -308,11 +312,15 @@ const DailyMemoryPanel: React.FC<DailyMemoryPanelProps> = ({
           title={t("workspace.editing", { filename: editingFile })}
           onClose={handleBackToList}
           footer={
-            <Button onClick={handleSave} disabled={saving || loadingContent}>
+            <Button
+              onClick={handleSave}
+              disabled={saving || loadingContent || !canWrite}
+            >
               {saving ? t("common.saving") : t("common.save")}
             </Button>
           }
         >
+          <AppManagementNotice appId="openclaw" />
           {loadingContent ? (
             <div className="flex items-center justify-center h-64 text-muted-foreground">
               {t("prompts.loading")}
@@ -475,7 +483,7 @@ const DailyMemoryPanel: React.FC<DailyMemoryPanelProps> = ({
                       className="opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0"
                       onClick={(e) => {
                         e.stopPropagation();
-                        setDeletingFile(result.filename);
+                        if (canWrite) setDeletingFile(result.filename);
                       }}
                     >
                       <Trash2 className="w-4 h-4 text-muted-foreground hover:text-destructive transition-colors" />
@@ -524,7 +532,7 @@ const DailyMemoryPanel: React.FC<DailyMemoryPanelProps> = ({
                     className="opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0"
                     onClick={(e) => {
                       e.stopPropagation();
-                      setDeletingFile(file.filename);
+                      if (canWrite) setDeletingFile(file.filename);
                     }}
                   >
                     <Trash2 className="w-4 h-4 text-muted-foreground hover:text-destructive transition-colors" />

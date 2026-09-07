@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useAppManagement } from "@/lib/query/appManagement";
 import { toast } from "sonner";
 import { ExternalLink } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -29,6 +30,7 @@ const MemoryTabPane: React.FC<MemoryTabPaneProps> = ({
   enabled,
 }) => {
   const { t } = useTranslation();
+  const { canWrite } = useAppManagement("hermes");
   const darkMode = useDarkMode();
   const { data, isLoading } = useHermesMemory(kind, true);
   const saveMutation = useSaveHermesMemory();
@@ -47,6 +49,7 @@ const MemoryTabPane: React.FC<MemoryTabPaneProps> = ({
   }, [data, loaded]);
 
   const handleSave = async () => {
+    if (!canWrite) return;
     try {
       await saveMutation.mutateAsync({ kind, content });
       toast.success(t("hermes.memory.saveSuccess"));
@@ -69,9 +72,9 @@ const MemoryTabPane: React.FC<MemoryTabPaneProps> = ({
         <div className="flex items-center gap-2">
           <Switch
             checked={enabled}
-            disabled={toggleMutation.isPending}
+            disabled={toggleMutation.isPending || !canWrite}
             onCheckedChange={(next) =>
-              toggleMutation.mutate({ kind, enabled: next })
+              canWrite && toggleMutation.mutate({ kind, enabled: next })
             }
           />
           <span className="text-sm">
@@ -116,7 +119,7 @@ const MemoryTabPane: React.FC<MemoryTabPaneProps> = ({
           </span>
           <Button
             onClick={handleSave}
-            disabled={saveMutation.isPending || !loaded}
+            disabled={saveMutation.isPending || !loaded || !canWrite}
           >
             {saveMutation.isPending ? t("common.saving") : t("common.save")}
           </Button>

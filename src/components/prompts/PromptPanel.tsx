@@ -7,6 +7,8 @@ import PiPromptPanel, { type PromptPrimaryAction } from "./PiPromptPanel";
 import PromptFormPanel from "./PromptFormPanel";
 import { PromptLibrary } from "./PromptLibrary";
 import { ConfirmDialog } from "../ConfirmDialog";
+import { useAppManagement } from "@/lib/query/appManagement";
+import { AppManagementNotice } from "@/components/management/AppManagementNotice";
 
 interface PromptPanelProps {
   open: boolean;
@@ -38,6 +40,7 @@ const StandardPromptPanel = React.forwardRef<
     ref,
   ) => {
     const { t } = useTranslation();
+    const { canWrite } = useAppManagement(appId);
     const [isFormOpen, setIsFormOpen] = useState(false);
     const [editingId, setEditingId] = useState<string | null>(null);
     const [searchQuery, setSearchQuery] = useState("");
@@ -211,6 +214,7 @@ const StandardPromptPanel = React.forwardRef<
     };
 
     const handleToggle = async (id: string, enabled: boolean) => {
+      if (!canWrite) return;
       if (!beginWrite()) return;
       try {
         const refreshed = await toggleEnabled(id, enabled);
@@ -258,6 +262,7 @@ const StandardPromptPanel = React.forwardRef<
 
     return (
       <div className="flex flex-col flex-1 min-h-0 px-6">
+        <AppManagementNotice appId={appId} />
         <PromptLibrary
           prompts={prompts}
           loading={loading}
@@ -268,6 +273,7 @@ const StandardPromptPanel = React.forwardRef<
               : t("prompts.noneEnabled")
           }
           disabled={interactionBlocked}
+          toggleDisabled={!canWrite}
           onSearchQueryChange={setSearchQuery}
           onToggle={handleToggle}
           onEdit={handleEdit}

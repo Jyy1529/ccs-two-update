@@ -1,6 +1,7 @@
 import { http, HttpResponse } from "msw";
 import type { AppId } from "@/lib/api/types";
 import { MODELS_DEV_API_URL } from "@/lib/modelsDevPricing";
+import { APP_IDS } from "@/config/appConfig";
 import type { McpServer, Provider, Settings } from "@/types";
 import {
   addProvider,
@@ -41,8 +42,73 @@ const withJson = async <T>(request: Request): Promise<T> => {
 const success = <T>(payload: T) => HttpResponse.json(payload as any);
 
 export const handlers = [
+  http.post(`${TAURI_ENDPOINT}/get_app_management_state`, () =>
+    success({
+      revision: "test-management-1",
+      apps: APP_IDS.map((appId) => ({
+        appId,
+        enabled: true,
+        phase: "managed",
+      })),
+    }),
+  ),
+  http.post(`${TAURI_ENDPOINT}/get_config_guard_state`, async ({ request }) => {
+    const { appId } = await withJson<{ appId: AppId }>(request);
+    return success({ appId, files: [], pendingChanges: [] });
+  }),
+  http.post(`${TAURI_ENDPOINT}/list_model_validations`, () => success([])),
   http.get(MODELS_DEV_API_URL, () => success({})),
   http.post(`${TAURI_ENDPOINT}/get_migration_result`, () => success(false)),
+  http.post(`${TAURI_ENDPOINT}/list_provider_groups`, () => success([])),
+  http.post(`${TAURI_ENDPOINT}/list_balance_query_templates`, () =>
+    success([]),
+  ),
+  http.post(`${TAURI_ENDPOINT}/save_balance_query_template`, () =>
+    success(null),
+  ),
+  http.post(`${TAURI_ENDPOINT}/get_provider_auto_grouping`, () =>
+    success(false),
+  ),
+  http.post(`${TAURI_ENDPOINT}/set_provider_auto_grouping`, () => success([])),
+  http.post(`${TAURI_ENDPOINT}/update_provider_group`, async ({ request }) => {
+    const { group } = await withJson<{ group: unknown }>(request);
+    return success(group);
+  }),
+  http.post(`${TAURI_ENDPOINT}/create_provider_group`, async ({ request }) => {
+    const { group } = await withJson<{ group: Record<string, unknown> }>(
+      request,
+    );
+    return success({ ...group, id: group.id || "group-created" });
+  }),
+  http.post(`${TAURI_ENDPOINT}/delete_provider_group`, () => success(null)),
+  http.post(`${TAURI_ENDPOINT}/move_provider_to_group`, () => success(null)),
+  http.post(`${TAURI_ENDPOINT}/set_provider_key_pool_enabled`, () =>
+    success(null),
+  ),
+  http.post(`${TAURI_ENDPOINT}/set_group_key_pool_policy`, () => success({})),
+  http.post(`${TAURI_ENDPOINT}/get_group_key_pool_status`, () =>
+    success({
+      group: {
+        id: "group-1",
+        appType: "codex",
+        name: "Pool",
+        kind: "manual",
+        normalizedBaseUrl: null,
+        sortIndex: 0,
+        collapsed: false,
+        keyPoolEnabled: false,
+        keyPoolStrategy: "failover",
+        keyPoolMaxRetries: 0,
+        keyPoolCooldownMs: 1000,
+        balanceTemplateId: null,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+      members: [],
+      eligibleMemberCount: 0,
+    }),
+  ),
+  http.post(`${TAURI_ENDPOINT}/query_group_balances`, () => success([])),
   http.post(`${TAURI_ENDPOINT}/get_skills_migration_result`, () =>
     success(null),
   ),

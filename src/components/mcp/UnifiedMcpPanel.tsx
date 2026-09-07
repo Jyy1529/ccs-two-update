@@ -23,6 +23,7 @@ import { AppCountBar } from "@/components/common/AppCountBar";
 import { AppToggleGroup } from "@/components/common/AppToggleGroup";
 import { ListItemRow } from "@/components/common/ListItemRow";
 import { ManagementListSearch } from "@/components/common/ManagementListSearch";
+import { useAppManagementState } from "@/lib/query/appManagement";
 
 function getMcpSearchText(id: string, server: McpServer): string {
   const spec = server.server ?? {};
@@ -65,6 +66,14 @@ const UnifiedMcpPanel = React.forwardRef<
   UnifiedMcpPanelProps
 >(({ onOpenChange: _onOpenChange, onInteractionBlockedChange }, ref) => {
   const { t } = useTranslation();
+  const management = useAppManagementState();
+  const disabledApps = MCP_APP_IDS.filter(
+    (appId) =>
+      !management.isSuccess ||
+      !management.data.apps.some(
+        (app) => app.appId === appId && app.enabled && app.phase === "managed",
+      ),
+  );
   const [isFormOpen, setIsFormOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
@@ -164,7 +173,7 @@ const UnifiedMcpPanel = React.forwardRef<
     app: AppId,
     enabled: boolean,
   ) => {
-    if (!isMcpAppId(app)) return;
+    if (!isMcpAppId(app) || disabledApps.includes(app)) return;
     if (!beginWrite()) return;
     try {
       await toggleAppMutation.mutateAsync({ serverId, app, enabled });
@@ -176,7 +185,7 @@ const UnifiedMcpPanel = React.forwardRef<
   };
 
   const handleToggleAll = async (app: AppId, enabled: boolean) => {
-    if (!isMcpAppId(app)) return;
+    if (!isMcpAppId(app) || disabledApps.includes(app)) return;
     if (!beginWrite()) return;
 
     // AppCountBar summarizes the complete collection, so its bulk action must
@@ -280,6 +289,7 @@ const UnifiedMcpPanel = React.forwardRef<
         totalLabel={t("mcp.serverCount", { count: serverEntries.length })}
         counts={enabledCounts}
         appIds={MCP_APP_IDS}
+        disabledApps={disabledApps}
         totalCount={serverEntries.length}
         onToggleAll={handleToggleAll}
         pendingApp={pendingApp}
@@ -329,6 +339,7 @@ const UnifiedMcpPanel = React.forwardRef<
                     onEdit={handleEdit}
                     onDelete={handleDelete}
                     disabled={interactionBlocked}
+                    disabledApps={disabledApps}
                     isLast={index === filteredServerEntries.length - 1}
                   />
                 ))}
@@ -377,6 +388,7 @@ interface UnifiedMcpListItemProps {
   onEdit: (id: string) => void;
   onDelete: (id: string) => void;
   disabled?: boolean;
+  disabledApps?: AppId[];
   isLast?: boolean;
 }
 
@@ -387,6 +399,7 @@ const UnifiedMcpListItem: React.FC<UnifiedMcpListItemProps> = ({
   onEdit,
   onDelete,
   disabled,
+  disabledApps,
   isLast,
 }) => {
   const { t } = useTranslation();
@@ -442,6 +455,7 @@ const UnifiedMcpListItem: React.FC<UnifiedMcpListItemProps> = ({
       </div>
 
       <AppToggleGroup
+        disabledApps={disabledApps}
         apps={server.apps}
         onToggle={(app, enabled) => onToggleApp(id, app, enabled)}
         appIds={MCP_APP_IDS}

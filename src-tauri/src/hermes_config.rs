@@ -446,6 +446,7 @@ fn write_yaml_section_to_config_locked(
         return Ok(HermesWriteOutcome::default());
     }
 
+    let _permission = crate::app_management::permit_path(&config_path)?;
     let backup_path = if !raw.is_empty() {
         Some(create_hermes_backup(&raw)?)
     } else {

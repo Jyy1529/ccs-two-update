@@ -8,6 +8,8 @@ import { useTauriEvent } from "@/hooks/useTauriEvent";
 import type { Prompt } from "@/lib/api";
 import PromptFormPanel from "./PromptFormPanel";
 import { PromptLibrary } from "./PromptLibrary";
+import { useAppManagement } from "@/lib/query/appManagement";
+import { AppManagementNotice } from "@/components/management/AppManagementNotice";
 import {
   PiPromptTemplates,
   PiSystemPromptFiles,
@@ -45,6 +47,7 @@ const PiPromptPanel = React.forwardRef<PiPromptPanelHandle, PiPromptPanelProps>(
     ref,
   ) => {
     const { t } = useTranslation();
+    const { canWrite } = useAppManagement("pi");
     const [activeTab, setActiveTab] = useState<PiPromptTab>("global");
     const [isFormOpen, setIsFormOpen] = useState(false);
     const [editingId, setEditingId] = useState<string | null>(null);
@@ -144,6 +147,7 @@ const PiPromptPanel = React.forwardRef<PiPromptPanelHandle, PiPromptPanelProps>(
 
     return (
       <div className="flex min-h-0 flex-1 flex-col px-6">
+        <AppManagementNotice appId="pi" />
         <Tabs
           value={activeTab}
           onValueChange={(value) => setActiveTab(value as PiPromptTab)}
@@ -179,8 +183,10 @@ const PiPromptPanel = React.forwardRef<PiPromptPanelHandle, PiPromptPanelProps>(
                     : t("prompts.noneEnabled")
               }
               disabled={interactionBlocked}
+              toggleDisabled={!canWrite}
               onSearchQueryChange={setSearchQuery}
               onToggle={(id, enabled) => {
+                if (!canWrite) return;
                 void toggleEnabled(id, enabled).catch(() => undefined);
               }}
               onEdit={openGlobalPromptForm}

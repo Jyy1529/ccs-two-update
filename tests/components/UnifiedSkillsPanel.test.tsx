@@ -1,5 +1,15 @@
 import { createRef } from "react";
-import { render, screen, waitFor, act, within } from "@testing-library/react";
+import {
+  fireEvent,
+  screen,
+  waitFor,
+  act,
+  within,
+} from "@testing-library/react";
+import {
+  managementFixture,
+  renderManagedUi as render,
+} from "../utils/safetyTestUtils";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
@@ -227,6 +237,23 @@ describe("UnifiedSkillsPanel", () => {
         },
       ]);
     });
+  });
+
+  it("does not enable an unmanaged app through a Skill or its bulk toggle", () => {
+    installedSkillsMock = [makeInstalledSkill()];
+    render(
+      <UnifiedSkillsPanel onOpenDiscovery={vi.fn()} currentApp="claude" />,
+      managementFixture({ codex: { enabled: false, phase: "unmanaged" } }),
+    );
+    expect(screen.getByRole("button", { name: "Codex" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Claude" })).toBeEnabled();
+    const codexBulk = screen
+      .getAllByRole("checkbox")
+      .find((element) => element.textContent?.includes("Codex"));
+    expect(codexBulk).toBeDisabled();
+    fireEvent.click(codexBulk!);
+    expect(bulkToggleSkillAppMock).not.toHaveBeenCalled();
+    expect(toggleSkillAppMock).not.toHaveBeenCalled();
   });
 
   it("passes only the installed Skill ID to uninstall", async () => {

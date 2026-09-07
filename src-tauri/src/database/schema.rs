@@ -22,6 +22,7 @@ impl Database {
 
     /// 在指定连接上创建表（供迁移和测试使用）
     pub(crate) fn create_tables_on_conn(conn: &Connection) -> Result<(), AppError> {
+        super::dao::model_validation::ensure_model_validation_tables(conn)?;
         // 1. Providers 表
         conn.execute(
             "CREATE TABLE IF NOT EXISTS providers (
@@ -54,6 +55,68 @@ impl Database {
                 url TEXT NOT NULL,
                 added_at INTEGER,
                 FOREIGN KEY (provider_id, app_type) REFERENCES providers(id, app_type) ON DELETE CASCADE
+            )",
+            [],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // 2b. Provider groups and reusable balance query templates.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS provider_groups (
+                id TEXT PRIMARY KEY,
+                app_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('manual', 'auto_base_url')),
+                normalized_base_url TEXT,
+                sort_index INTEGER NOT NULL DEFAULT 0,
+                collapsed BOOLEAN NOT NULL DEFAULT 0,
+                key_pool_enabled BOOLEAN NOT NULL DEFAULT 0,
+                key_pool_strategy TEXT NOT NULL DEFAULT 'failover'
+                    CHECK(key_pool_strategy IN ('failover', 'round_robin')),
+                key_pool_max_retries INTEGER NOT NULL DEFAULT 0,
+                key_pool_cooldown_ms INTEGER NOT NULL DEFAULT 0,
+                balance_template_id TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                icon TEXT,
+                icon_color TEXT
+            )",
+            [],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_groups_auto_url
+             ON provider_groups(app_type, kind, normalized_base_url)
+             WHERE kind = 'auto_base_url' AND normalized_base_url IS NOT NULL",
+            [],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_provider_groups_app_order
+             ON provider_groups(app_type, sort_index, id)",
+            [],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS balance_query_templates (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                method TEXT NOT NULL CHECK(method IN ('GET', 'POST')),
+                path TEXT NOT NULL,
+                query_json TEXT NOT NULL DEFAULT '{}',
+                headers_json TEXT NOT NULL DEFAULT '{}',
+                body TEXT,
+                remaining_path TEXT NOT NULL,
+                used_path TEXT,
+                total_path TEXT,
+                reset_path TEXT,
+                error_path TEXT,
+                unit TEXT,
+                currency TEXT,
+                balance_scope TEXT NOT NULL DEFAULT 'unknown' CHECK(balance_scope IN ('unknown', 'per_key', 'account')),
+                timeout_secs INTEGER NOT NULL DEFAULT 10,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
             )",
             [],
         )
@@ -301,12 +364,20 @@ impl Database {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         // 18. Session Log Sync 表 (会话日志同步状态)
+        //
+        // last_byte_offset：Claude 路径的字节游标（seek 增量读）；NULL 表示
+        // 尚无字节游标（旧行号游标或非 Claude 路径行），此时回退全量读。
+        // last_tail_fingerprint：游标边界前尾部字节的指纹，用于识别文件被
+        // 外部重写（同尺寸/更大的替换无法靠 size 检测）；NULL 表示无指纹
+        // 可校验，按纯追加处理。
         conn.execute(
             "CREATE TABLE IF NOT EXISTS session_log_sync (
                 file_path TEXT PRIMARY KEY,
                 last_modified INTEGER NOT NULL,
                 last_line_offset INTEGER NOT NULL DEFAULT 0,
-                last_synced_at INTEGER NOT NULL
+                last_synced_at INTEGER NOT NULL,
+                last_byte_offset INTEGER,
+                last_tail_fingerprint INTEGER
             )",
             [],
         )
@@ -541,9 +612,27 @@ impl Database {
                         Self::set_user_version(conn, 17)?;
                     }
                     17 => {
-                        log::info!("迁移数据库从 v17 到 v18（协调会话去重账本与 DeepSeek/Pi 列）");
+                        log::info!(
+                            "迁移数据库从 v17 到 v18（会话去重、DeepSeek/Pi 列与日志字节游标）"
+                        );
                         Self::migrate_v17_to_v18(conn)?;
                         Self::set_user_version(conn, 18)?;
+                    }
+                    18 => {
+                        log::info!("迁移数据库从 v18 到 v19（Provider 分组与余额查询模板）");
+                        Self::migrate_v18_to_v19(conn)?;
+                        Self::set_user_version(conn, 19)?;
+                    }
+                    19 => {
+                        Self::migrate_v19_to_v20(conn)?;
+                        Self::set_user_version(conn, 20)?;
+                    }
+                    20 => {
+                        // Additive, device-local history only. Existing provider and
+                        // routing data are untouched; downgrade uses the normal
+                        // pre-migration backup, never an automatic DROP TABLE.
+                        super::dao::model_validation::ensure_model_validation_tables(conn)?;
+                        Self::set_user_version(conn, 21)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -1631,6 +1720,71 @@ impl Database {
              ON session_usage_dedup(data_source, semantic_id, has_entry_id);",
         )
         .map_err(|error| AppError::Database(format!("补齐会话用量去重账本失败: {error}")))?;
+        if Self::table_exists(conn, "session_log_sync")? {
+            Self::add_column_if_missing(conn, "session_log_sync", "last_byte_offset", "INTEGER")?;
+            Self::add_column_if_missing(
+                conn,
+                "session_log_sync",
+                "last_tail_fingerprint",
+                "INTEGER",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// v18 -> v19: provider groups and reusable balance query templates.
+    fn migrate_v18_to_v19(conn: &Connection) -> Result<(), AppError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS provider_groups (
+                id TEXT PRIMARY KEY,
+                app_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('manual', 'auto_base_url')),
+                normalized_base_url TEXT,
+                sort_index INTEGER NOT NULL DEFAULT 0,
+                collapsed BOOLEAN NOT NULL DEFAULT 0,
+                key_pool_enabled BOOLEAN NOT NULL DEFAULT 0,
+                key_pool_strategy TEXT NOT NULL DEFAULT 'failover'
+                    CHECK(key_pool_strategy IN ('failover', 'round_robin')),
+                key_pool_max_retries INTEGER NOT NULL DEFAULT 0,
+                key_pool_cooldown_ms INTEGER NOT NULL DEFAULT 0,
+                balance_template_id TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_groups_auto_url
+                ON provider_groups(app_type, kind, normalized_base_url)
+                WHERE kind = 'auto_base_url' AND normalized_base_url IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_provider_groups_app_order
+                ON provider_groups(app_type, sort_index, id);
+            CREATE TABLE IF NOT EXISTS balance_query_templates (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                method TEXT NOT NULL CHECK(method IN ('GET', 'POST')),
+                path TEXT NOT NULL,
+                query_json TEXT NOT NULL DEFAULT '{}',
+                headers_json TEXT NOT NULL DEFAULT '{}',
+                body TEXT,
+                remaining_path TEXT NOT NULL,
+                used_path TEXT,
+                total_path TEXT,
+                reset_path TEXT,
+                error_path TEXT,
+                unit TEXT,
+                currency TEXT,
+                timeout_secs INTEGER NOT NULL DEFAULT 10,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );",
+        )
+        .map_err(|error| AppError::Database(format!("创建 Provider 分组表失败: {error}")))
+    }
+
+    /// Additive migration; old provider/config rows are left untouched.
+    fn migrate_v19_to_v20(conn: &Connection) -> Result<(), AppError> {
+        Self::add_column_if_missing(conn, "provider_groups", "icon", "TEXT")?;
+        Self::add_column_if_missing(conn, "provider_groups", "icon_color", "TEXT")?;
+        Self::add_column_if_missing(conn, "balance_query_templates", "balance_scope", "TEXT NOT NULL DEFAULT 'unknown' CHECK(balance_scope IN ('unknown', 'per_key', 'account'))")?;
         Ok(())
     }
 
@@ -1639,6 +1793,24 @@ impl Database {
     /// 注意: model_id 使用短横线格式（如 claude-haiku-4-5），与 API 返回的模型名称标准化后一致
     fn seed_model_pricing(conn: &Connection) -> Result<(), AppError> {
         let pricing_data = [
+            // Claude Fable 5.1 / Mythos 5.1（2026-09-01 发布；同 Fable 5 价，
+            // 但缓存读为 0.025x = $0.25，非 Fable 5 的 $1）
+            (
+                "claude-fable-5-1",
+                "Claude Fable 5.1",
+                "10",
+                "50",
+                "0.25",
+                "12.50",
+            ),
+            (
+                "claude-mythos-5-1",
+                "Claude Mythos 5.1",
+                "10",
+                "50",
+                "0.25",
+                "12.50",
+            ),
             // Claude Fable 5（Opus 之上的新档）
             (
                 "claude-fable-5",
@@ -1667,14 +1839,15 @@ impl Database {
                 "0.50",
                 "6.25",
             ),
-            // Claude Sonnet 5（list 价，与 Sonnet 4.6 一致；促销 $2/$10 至 2026-08-31 不入表）
+            // Claude Sonnet 5（官方定价页 2026-09 确认：$2/$10 介绍价转为正式价，
+            // 原定 09-01 涨至 $3/$15 取消）
             (
                 "claude-sonnet-5",
                 "Claude Sonnet 5",
-                "3",
-                "15",
-                "0.30",
-                "3.75",
+                "2",
+                "10",
+                "0.20",
+                "2.50",
             ),
             // Claude 4.7 系列
             (
@@ -2632,6 +2805,20 @@ impl Database {
 
     fn repair_current_model_pricing(conn: &Connection) -> Result<(), AppError> {
         let pricing_fixes = [
+            // 2026-09-02 官方定价页确认 Sonnet 5 $2/$10 介绍价转为正式价、原定 09-01 涨至
+            // $3/$15 取消：早先按 list 价 seed 的行改回正式价（用户手改过的行不匹配旧值，不动）
+            (
+                "claude-sonnet-5",
+                "Claude Sonnet 5",
+                "2",
+                "10",
+                "0.20",
+                "2.50",
+                "3",
+                "15",
+                "0.30",
+                "3.75",
+            ),
             // 2026-08-13 models.dev 审计核价：grok-4.5 的 cached input 官方挂牌为 0.30
             // （docs.x.ai 现行价表），与 grok-4.5-build 的实测计费一致；早先按 0.50
             // 录入的行在此校正。注意 0.50 是 grok-4.6 的 cached 价，勿两者互串
@@ -3563,6 +3750,94 @@ mod tests {
              VALUES ('pi_session', 'request', 'semantic', 1)",
             [],
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v17_to_v18_adds_byte_cursor_to_existing_sync_table() -> Result<(), AppError> {
+        // 真实升级路径：v17 库带旧 DDL 的 session_log_sync（无字节游标列，
+        // 字节游标曾短暂搭 v17 车、已执行过 v17 的开发库正是这个形状）
+        // 与存量游标行，迁移后列补上、存量行保持 NULL（首轮按行号转换）
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE session_log_sync (
+                file_path TEXT PRIMARY KEY,
+                last_modified INTEGER NOT NULL,
+                last_line_offset INTEGER NOT NULL DEFAULT 0,
+                last_synced_at INTEGER NOT NULL
+             );
+             INSERT INTO session_log_sync VALUES ('/tmp/a.jsonl', 5, 3, 1);",
+        )?;
+        Database::set_user_version(&conn, 17)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert!(Database::has_column(
+            &conn,
+            "session_log_sync",
+            "last_byte_offset"
+        )?);
+        assert!(Database::has_column(
+            &conn,
+            "session_log_sync",
+            "last_tail_fingerprint"
+        )?);
+        let (byte_offset, fingerprint): (Option<i64>, Option<i64>) = conn.query_row(
+            "SELECT last_byte_offset, last_tail_fingerprint
+             FROM session_log_sync WHERE file_path = '/tmp/a.jsonl'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(byte_offset, None, "存量行的字节游标必须为 NULL");
+        assert_eq!(fingerprint, None, "存量行的尾部指纹必须为 NULL");
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v19_to_v20_preserves_groups_and_is_repeatable() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        Database::migrate_v18_to_v19(&conn)?;
+        conn.execute("INSERT INTO provider_groups (id, app_type, name, kind, created_at, updated_at) VALUES ('old', 'codex', 'Old folder', 'manual', 1, 1)", [])?;
+        conn.execute("INSERT INTO balance_query_templates (id, name, method, path, remaining_path, created_at, updated_at) VALUES ('old', 'Legacy template', 'GET', '/balance', '/balance', 1, 1)", [])?;
+        Database::set_user_version(&conn, 19)?;
+        Database::apply_schema_migrations_on_conn(&conn)?;
+        Database::apply_schema_migrations_on_conn(&conn)?;
+        let (name, icon, color): (String, Option<String>, Option<String>) = conn.query_row(
+            "SELECT name, icon, icon_color FROM provider_groups WHERE id = 'old'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(name, "Old folder");
+        assert_eq!((icon, color), (None, None));
+        let scope: String = conn.query_row(
+            "SELECT balance_scope FROM balance_query_templates WHERE id = 'old'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(scope, "unknown");
+        assert_eq!(Database::get_user_version(&conn)?, 20);
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v18_to_v19_creates_provider_group_tables() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        Database::set_user_version(&conn, 18)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        assert!(Database::table_exists(&conn, "provider_groups")?);
+        assert!(Database::table_exists(&conn, "balance_query_templates")?);
+        let index_exists: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'index' AND name = 'idx_provider_groups_auto_url'
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(index_exists);
         Ok(())
     }
 }

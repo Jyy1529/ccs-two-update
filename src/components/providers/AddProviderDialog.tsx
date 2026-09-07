@@ -32,6 +32,8 @@ import { GROKBUILD_OFFICIAL_PROVIDER_ID } from "@/utils/providerCapabilities";
 import type { OpenClawSuggestedDefaults } from "@/config/openclawProviderPresets";
 import type { UniversalProviderPreset } from "@/config/universalProviderPresets";
 import type { ManagedAuthProvider } from "@/lib/api";
+import { useAppManagement } from "@/lib/query/appManagement";
+import { AppManagementNotice } from "@/components/management/AppManagementNotice";
 
 interface AddProviderDialogProps {
   open: boolean;
@@ -60,6 +62,7 @@ export function AddProviderDialog({
   appSpecificOnly = false,
 }: AddProviderDialogProps) {
   const { t } = useTranslation();
+  const { canWrite } = useAppManagement(appId, open);
   const formId = useId();
   // OpenCode and OpenClaw don't support universal providers
   const showUniversalTab =
@@ -190,6 +193,7 @@ export function AddProviderDialog({
         iconColor: values.iconColor?.trim() || undefined,
         ...(values.presetCategory ? { category: values.presetCategory } : {}),
         ...(values.meta ? { meta: values.meta } : {}),
+        ...(!canWrite ? { addToLive: false } : {}),
       };
       if (appId === "claude-desktop" && values.presetId) {
         const presetIndex = parseInt(
@@ -368,14 +372,16 @@ export function AddProviderDialog({
       await onSubmit(providerData);
       closeDialog();
     },
-    [appId, onSubmit, closeDialog],
+    [appId, canWrite, onSubmit, closeDialog],
   );
 
   const footer =
     !showUniversalTab || activeTab === "app-specific" ? (
       <>
         <span className="mr-auto min-w-0 text-xs text-muted-foreground truncate">
-          {t("provider.addFooterHint")}
+          {t(
+            canWrite ? "provider.addFooterHint" : "appManagement.databaseOnly",
+          )}
         </span>
         <Button
           variant="outline"
@@ -395,7 +401,7 @@ export function AddProviderDialog({
           ) : (
             <Plus className="mr-2 h-4 w-4" />
           )}
-          {t("common.add")}
+          {t(canWrite ? "common.add" : "appManagement.saveDatabaseOnly")}
         </Button>
       </>
     ) : (
@@ -426,6 +432,9 @@ export function AddProviderDialog({
       footer={footer}
       contentClassName={appId === "pi" ? "pt-3 pb-0" : "pt-3"}
     >
+      {(!showUniversalTab || activeTab === "app-specific") && (
+        <AppManagementNotice appId={appId} />
+      )}
       {showUniversalTab ? (
         <Tabs
           value={activeTab}

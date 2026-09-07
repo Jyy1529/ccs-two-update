@@ -14,6 +14,7 @@
 //! - Hermes has extra fields: `enabled`, `timeout`, `connect_timeout`, `tools`, `sampling`
 //! - These Hermes-specific fields are preserved on merge-on-write and stripped on import
 
+use indexmap::IndexMap;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -165,6 +166,29 @@ fn convert_from_hermes_format(id: &str, spec: &Value) -> Result<Value, AppError>
 // ============================================================================
 // Public API: Sync Functions
 // ============================================================================
+
+pub fn sync_servers_to_hermes(servers: &IndexMap<String, McpServer>) -> Result<(), AppError> {
+    if servers.is_empty() || !should_sync_hermes_mcp() {
+        return Ok(());
+    }
+    hermes_config::update_mcp_servers_yaml(|entries| {
+        for server in servers.values() {
+            let id = serde_yaml::Value::String(server.id.clone());
+            if server.apps.hermes {
+                let spec = convert_to_hermes_format(&server.server)?;
+                let merged = if let Some(existing) = entries.get(&id) {
+                    merge_hermes_spec(&hermes_config::yaml_to_json(existing)?, &spec)
+                } else {
+                    spec
+                };
+                entries.insert(id, hermes_config::json_to_yaml(&merged)?);
+            } else {
+                entries.remove(&id);
+            }
+        }
+        Ok(())
+    })
+}
 
 /// Sync a single MCP server to Hermes live config (merge-on-write)
 ///

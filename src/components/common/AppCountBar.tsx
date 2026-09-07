@@ -13,6 +13,7 @@ interface AppCountBarProps {
   onToggleAll?: (app: AppId, enabled: boolean) => void | Promise<void>;
   pendingApp?: AppId | null;
   disabled?: boolean;
+  disabledApps?: AppId[];
 }
 
 export const AppCountBar: React.FC<AppCountBarProps> = ({
@@ -23,6 +24,7 @@ export const AppCountBar: React.FC<AppCountBarProps> = ({
   onToggleAll,
   pendingApp,
   disabled = false,
+  disabledApps = [],
 }) => {
   const { t } = useTranslation();
   const bulkToggleEnabled = totalCount !== undefined && !!onToggleAll;
@@ -73,7 +75,11 @@ export const AppCountBar: React.FC<AppCountBarProps> = ({
                 aria-checked={partiallyEnabled ? "mixed" : allEnabled}
                 aria-busy={pending}
                 aria-label={actionLabel}
-                title={actionLabel}
+                title={
+                  disabledApps.includes(app)
+                    ? t("appManagement.databaseOnly")
+                    : actionLabel
+                }
                 data-selection-state={
                   pending
                     ? "pending"
@@ -84,7 +90,10 @@ export const AppCountBar: React.FC<AppCountBarProps> = ({
                         : "none"
                 }
                 disabled={
-                  disabled || bulkTotalCount === 0 || hasPendingBulkToggle
+                  disabled ||
+                  disabledApps.includes(app) ||
+                  bulkTotalCount === 0 ||
+                  hasPendingBulkToggle
                 }
                 onClick={() => void onToggleAll?.(app, !allEnabled)}
                 className={cn(

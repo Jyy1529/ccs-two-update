@@ -23,6 +23,7 @@ import { Switch } from "@/components/ui/switch";
 import { settingsApi } from "@/lib/api";
 import type { CodexRepairState, CodexRepairStatus } from "@/lib/api/settings";
 import { extractErrorMessage } from "@/utils/errorUtils";
+import { useAppManagement } from "@/lib/query/appManagement";
 
 interface CodexRepairSettingsProps {
   enabled: boolean;
@@ -34,6 +35,7 @@ export function CodexRepairSettings({
   onEnabledChange,
 }: CodexRepairSettingsProps) {
   const { t } = useTranslation();
+  const { canWrite } = useAppManagement("codex");
   const [status, setStatus] = useState<CodexRepairStatus | null>(null);
   const [isChecking, setIsChecking] = useState(false);
   const [isLaunching, setIsLaunching] = useState(false);
@@ -83,6 +85,7 @@ export function CodexRepairSettings({
   }, [enabled, repairRunning]);
 
   const launchRepair = useCallback(async () => {
+    if (!canWrite) return;
     setIsLaunching(true);
     try {
       const result = await settingsApi.launchCodexRepair();
@@ -111,7 +114,7 @@ export function CodexRepairSettings({
     } finally {
       setIsLaunching(false);
     }
-  }, [t]);
+  }, [canWrite, t]);
 
   const stateLabels: Record<CodexRepairState, string> = {
     unsupported: t("settings.codexRepair.state.unsupported", {
@@ -202,7 +205,9 @@ export function CodexRepairSettings({
                 size="sm"
                 variant={isHealthy ? "outline" : "default"}
                 onClick={() => setConfirmOpen(true)}
-                disabled={!canRepair || isLaunching || repairRunning}
+                disabled={
+                  !canRepair || isLaunching || repairRunning || !canWrite
+                }
               >
                 {repairRunning ? (
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -282,7 +287,7 @@ export function CodexRepairSettings({
             <Button
               type="button"
               onClick={() => void launchRepair()}
-              disabled={isLaunching}
+              disabled={isLaunching || !canWrite}
             >
               {isLaunching ? (
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />

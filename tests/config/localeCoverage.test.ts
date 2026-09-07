@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import en from "@/i18n/locales/en.json";
 import ja from "@/i18n/locales/ja.json";
 import zhTW from "@/i18n/locales/zh-TW.json";
@@ -53,6 +55,47 @@ const locales = [
 ] as const;
 
 describe("locale coverage", () => {
+  it.each([["en", en], ...locales] as const)(
+    "covers provider folder controls, dialogs and messages in %s",
+    (_name, tree) => {
+      const files = [
+        "src/components/providers/ProviderGroupSections.tsx",
+        "src/components/providers/ProviderGroupHeader.tsx",
+        "src/components/providers/ProviderGroupDialog.tsx",
+        "src/components/providers/KeyPoolSettingsDialog.tsx",
+        "src/components/providers/BalanceQueryTemplateDialog.tsx",
+        "src/components/providers/ProviderFolderSelect.tsx",
+        "src/components/providers/ProviderBalanceResult.tsx",
+        "src/utils/providerGroupErrors.ts",
+        "src/lib/query/providerGroups.ts",
+      ];
+      const keys = new Set([
+        ...[...reference.keys()].filter((key) =>
+          key.startsWith("providerGroups."),
+        ),
+        "providerGroups.autoGrouping",
+        "providerGroups.newFolder",
+        ...files.flatMap((file) =>
+          Array.from(
+            readFileSync(resolve(file), "utf8").matchAll(
+              /"(providerGroups\.[\w.]+)"/g,
+            ),
+            ([, key]) => key,
+          ),
+        ),
+      ]);
+      const translations = flattenStrings(tree);
+      expect([...keys].filter((key) => !translations.get(key)?.trim())).toEqual(
+        [],
+      );
+      for (const key of keys) {
+        expect(interpolationVariables(translations.get(key)!)).toEqual(
+          interpolationVariables(reference.get(key)!),
+        );
+      }
+    },
+  );
+
   it.each(locales)("covers every Pi translation key in %s", (_name, tree) => {
     const translations = flattenStrings(tree as TranslationTree);
     const missing = [...piReference.keys()].filter(

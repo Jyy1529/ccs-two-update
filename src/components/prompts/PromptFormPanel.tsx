@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
+import { useAppManagement } from "@/lib/query/appManagement";
+import { AppManagementNotice } from "@/components/management/AppManagementNotice";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -24,6 +26,7 @@ const PromptFormPanel: React.FC<PromptFormPanelProps> = ({
   onClose,
 }) => {
   const { t } = useTranslation();
+  const { canWrite } = useAppManagement(appId);
   const appName = t(`apps.${appId}`);
   const filenameMap: Record<AppId, string> = {
     claude: "CLAUDE.md",
@@ -104,10 +107,13 @@ const PromptFormPanel: React.FC<PromptFormPanelProps> = ({
           disabled={!name.trim() || saving}
           className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          {saving ? t("common.saving") : t("common.save")}
+          {saving
+            ? t("common.saving")
+            : t(canWrite ? "common.save" : "appManagement.saveDatabaseOnly")}
         </Button>
       }
     >
+      <AppManagementNotice appId={appId} />
       <div className="glass rounded-xl p-6 border border-white/10 space-y-6">
         <div>
           <Label htmlFor="name" className="text-foreground">

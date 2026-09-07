@@ -225,6 +225,28 @@ pub fn get_mcp_servers() -> Result<Map<String, Value>, AppError> {
         .unwrap_or_default())
 }
 
+pub fn update_mcp_servers(updates: IndexMap<String, Option<Value>>) -> Result<(), AppError> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let _guard = opencode_config_lock().lock()?;
+    let path = get_opencode_config_path();
+    let mut config = read_opencode_config_from_path(&path)?;
+    if updates.values().any(Option::is_some) && !config.get("mcp").is_some_and(Value::is_object) {
+        config["mcp"] = json!({});
+    }
+    if let Some(servers) = config.get_mut("mcp").and_then(Value::as_object_mut) {
+        for (id, spec) in updates {
+            if let Some(spec) = spec {
+                servers.insert(id, spec);
+            } else {
+                servers.remove(&id);
+            }
+        }
+    }
+    write_opencode_config_to_path_with_contents(&path, &config).map(|_| ())
+}
+
 pub fn set_mcp_server(id: &str, config: Value) -> Result<(), AppError> {
     let _guard = opencode_config_lock().lock()?;
     let path = get_opencode_config_path();

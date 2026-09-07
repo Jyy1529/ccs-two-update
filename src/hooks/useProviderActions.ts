@@ -36,6 +36,7 @@ import {
   supportsOfficialProxyTakeover,
 } from "@/utils/providerCapabilities";
 import { isOAuthProviderType } from "@/config/constants";
+import { useAppManagement } from "@/lib/query/appManagement";
 
 /**
  * Hook for managing provider actions (add, update, delete, switch)
@@ -48,6 +49,7 @@ export function useProviderActions(
 ) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const { canWrite } = useAppManagement(activeApp);
 
   const addProviderMutation = useAddProviderMutation(activeApp);
   const updateProviderMutation = useUpdateProviderMutation(activeApp);
@@ -57,7 +59,7 @@ export function useProviderActions(
   // Claude 插件同步逻辑
   const syncClaudePlugin = useCallback(
     async (provider: Provider) => {
-      if (activeApp !== "claude") return;
+      if (activeApp !== "claude" || !canWrite) return;
 
       try {
         const settings = await settingsApi.get();
@@ -78,7 +80,7 @@ export function useProviderActions(
         toast.error(detail, { duration: 4200 });
       }
     },
-    [activeApp, t],
+    [activeApp, canWrite, t],
   );
 
   // 添加供应商
@@ -92,11 +94,14 @@ export function useProviderActions(
         ensureGrokBuildOfficialSeed?: boolean;
       },
     ) => {
-      const enhanced = injectCodingPlanUsageScript(activeApp, provider);
+      const enhanced = injectCodingPlanUsageScript(
+        activeApp,
+        canWrite ? provider : { ...provider, addToLive: false },
+      );
       const createdProvider = await addProviderMutation.mutateAsync(enhanced);
 
       // OpenClaw: register models to allowlist after adding provider
-      if (activeApp === "openclaw" && provider.suggestedDefaults) {
+      if (canWrite && activeApp === "openclaw" && provider.suggestedDefaults) {
         const { model, modelCatalog } = provider.suggestedDefaults;
         let modelsRegistered = false;
 
@@ -143,7 +148,7 @@ export function useProviderActions(
 
       return createdProvider;
     },
-    [addProviderMutation, activeApp, queryClient, t],
+    [addProviderMutation, activeApp, canWrite, queryClient, t],
   );
 
   // 更新供应商
@@ -170,6 +175,10 @@ export function useProviderActions(
   // 切换供应商
   const switchProvider = useCallback(
     async (provider: Provider) => {
+      if (!canWrite) {
+        toast.error(t("appManagement.databaseOnly"));
+        return;
+      }
       const isCopilotProvider =
         activeApp === "claude" &&
         provider.meta?.providerType === "github_copilot";
@@ -300,15 +309,34 @@ export function useProviderActions(
         const result = await switchProviderMutation.mutateAsync(provider.id);
         await syncClaudePlugin(provider);
 
-        // Show backfill warning if present
+        // Surface switch warnings by code — a generic "backfill failed"
+        // message for an auth-cleanup warning would point the user at the
+        // wrong problem entirely.
         if (result?.warnings?.length) {
-          toast.warning(
-            t("notifications.backfillWarning", {
-              defaultValue:
-                "切换成功，但旧供应商配置回填失败，您手动修改的配置可能未保存",
-            }),
-            { duration: 5000 },
+          const authCleanupFailed = result.warnings.some((warning) =>
+            warning.startsWith("codex_auth_cleanup_failed"),
           );
+          const hasOtherWarnings = result.warnings.some(
+            (warning) => !warning.startsWith("codex_auth_cleanup_failed"),
+          );
+          if (authCleanupFailed) {
+            toast.warning(
+              t("notifications.codexAuthCleanupFailed", {
+                defaultValue:
+                  "切换成功，但未能删除 auth.json，官方登录凭据仍留在磁盘上；如需彻底移除请手动删除 Codex 配置目录中的 auth.json",
+              }),
+              { duration: 6000 },
+            );
+          }
+          if (hasOtherWarnings) {
+            toast.warning(
+              t("notifications.backfillWarning", {
+                defaultValue:
+                  "切换成功，但旧供应商配置回填失败，您手动修改的配置可能未保存",
+              }),
+              { duration: 5000 },
+            );
+          }
         }
 
         // 若已弹过 proxyRequired 警告则不再弹 success
@@ -344,6 +372,7 @@ export function useProviderActions(
     },
     [
       switchProviderMutation,
+      canWrite,
       syncClaudePlugin,
       activeApp,
       isProxyRunning,
@@ -409,6 +438,10 @@ export function useProviderActions(
   // Set provider as default model (OpenClaw only)
   const setAsDefaultModel = useCallback(
     async (provider: Provider, modelId?: string) => {
+      if (!canWrite) {
+        toast.error(t("appManagement.databaseOnly"));
+        return;
+      }
       const config = provider.settingsConfig as OpenClawProviderConfig;
       if (!config.models || config.models.length === 0) {
         toast.error(
@@ -466,7 +499,7 @@ export function useProviderActions(
         toast.error(detail);
       }
     },
-    [queryClient, t],
+    [canWrite, queryClient, t],
   );
 
   return {

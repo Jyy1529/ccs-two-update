@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useAppManagement } from "@/lib/query/appManagement";
 import { Plus, Trash2, Save, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 import { useOpenClawTools, useSaveOpenClawTools } from "@/hooks/useOpenClaw";
@@ -31,6 +32,7 @@ interface ListItem {
 
 const ToolsPanel: React.FC = () => {
   const { t } = useTranslation();
+  const { canWrite } = useAppManagement("openclaw");
   const { data: toolsData, isLoading } = useOpenClawTools();
   const saveToolsMutation = useSaveOpenClawTools();
   const [config, setConfig] = useState<OpenClawToolsConfig>({});
@@ -76,6 +78,7 @@ const ToolsPanel: React.FC = () => {
   );
 
   const handleSave = async () => {
+    if (!canWrite) return;
     try {
       const { profile, allow, deny, ...other } = config;
       const newConfig: OpenClawToolsConfig = {
@@ -270,7 +273,8 @@ const ToolsPanel: React.FC = () => {
         <Button
           size="sm"
           onClick={handleSave}
-          disabled={saveToolsMutation.isPending}
+          disabled={saveToolsMutation.isPending || !canWrite}
+          title={!canWrite ? t("appManagement.databaseOnly") : undefined}
         >
           <Save className="w-4 h-4 mr-1" />
           {saveToolsMutation.isPending ? t("common.saving") : t("common.save")}

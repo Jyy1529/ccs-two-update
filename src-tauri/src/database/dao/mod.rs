@@ -4,8 +4,10 @@
 
 pub mod failover;
 pub mod mcp;
+pub mod model_validation;
 pub mod profiles;
 pub mod prompts;
+pub mod provider_groups;
 pub mod providers;
 pub mod providers_seed;
 pub mod proxy;

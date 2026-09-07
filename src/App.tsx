@@ -103,6 +103,7 @@ import {
 } from "@/lib/query/omo";
 import { invalidatePiProviderCaches, usePiCurrentState } from "@/lib/query/pi";
 import WorkspaceFilesPanel from "@/components/workspace/WorkspaceFilesPanel";
+import { AppManagementNotice } from "@/components/management/AppManagementNotice";
 import EnvPanel from "@/components/openclaw/EnvPanel";
 import ToolsPanel from "@/components/openclaw/ToolsPanel";
 import AgentsDefaultsPanel from "@/components/openclaw/AgentsDefaultsPanel";
@@ -182,6 +183,8 @@ function App() {
   const sharedFeatureApp: AppId =
     activeApp === "claude-desktop" ? "claude" : activeApp;
   const [currentView, setCurrentView] = useState<View>(getInitialView);
+  const [providerGroupToolbar, setProviderGroupToolbar] =
+    useState<HTMLDivElement | null>(null);
   const [skillsDiscoverySource, setSkillsDiscoverySource] =
     useState<SkillsPageSource>("repos");
   const [settingsDefaultTab, setSettingsDefaultTab] = useState("general");
@@ -1056,7 +1059,12 @@ function App() {
             />
           );
         case "hermesMemory":
-          return <HermesMemoryPanel />;
+          return (
+            <>
+              <AppManagementNotice appId="hermes" />
+              <HermesMemoryPanel />
+            </>
+          );
         case "skills":
           return (
             <UnifiedSkillsPanel
@@ -1107,13 +1115,33 @@ function App() {
             />
           );
         case "workspace":
-          return <WorkspaceFilesPanel />;
+          return (
+            <>
+              <AppManagementNotice appId="openclaw" />
+              <WorkspaceFilesPanel />
+            </>
+          );
         case "openclawEnv":
-          return <EnvPanel />;
+          return (
+            <>
+              <AppManagementNotice appId="openclaw" />
+              <EnvPanel />
+            </>
+          );
         case "openclawTools":
-          return <ToolsPanel />;
+          return (
+            <>
+              <AppManagementNotice appId="openclaw" />
+              <ToolsPanel />
+            </>
+          );
         case "openclawAgents":
-          return <AgentsDefaultsPanel />;
+          return (
+            <>
+              <AppManagementNotice appId="openclaw" />
+              <AgentsDefaultsPanel />
+            </>
+          );
         default:
           return (
             <div className="px-6 flex flex-col flex-1 min-h-0 overflow-hidden">
@@ -1129,6 +1157,7 @@ function App() {
                   >
                     <ProviderList
                       providers={providers}
+                      toolbarContainer={providerGroupToolbar}
                       currentProviderId={currentProviderId}
                       appId={activeApp}
                       isLoading={isLoading}
@@ -1311,6 +1340,7 @@ function App() {
                   variant="outline"
                   size="icon"
                   disabled={managementBusy}
+                  aria-label={t("common.back")}
                   onClick={() =>
                     setCurrentView(
                       currentView === "skillsDiscovery"
@@ -1416,6 +1446,13 @@ function App() {
                   ) : null}
                 </div>
               )}
+            {currentView === "providers" && (
+              <div
+                ref={setProviderGroupToolbar}
+                className="flex shrink-0 items-center"
+                style={{ WebkitAppRegion: "no-drag" } as any}
+              />
+            )}
             {currentView === "providers" &&
               (settingsData?.showProfileSwitcher ?? true) && (
                 <div

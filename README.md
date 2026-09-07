@@ -11,8 +11,14 @@ CCS Two Update 是面向多种 AI 编程工具的本地配置与代理管理应�
 | 仓库 | [Jyy1529/ccs-two-update](https://github.com/Jyy1529/ccs-two-update) |
 | 归档版本 | 3.18.0、3.19.0、3.19.2 |
 | 桌面框架 | Tauri 2 + React + TypeScript + Rust |
-| 当前推荐版本 | CCS Two Update 3.20.0 |
+| 当前推荐版本 | CCS Two Update 3.20.1 |
 | 主要平台 | Windows、macOS、Linux；Codex Desktop 自动修复面向 Windows |
+
+## 3.20.1 更新
+
+本版补齐供应商文件夹排序、按 Base URL 自动分组、Key 池与逐 Key 余额查询，新增独立应用管理、配置防覆盖和模型能力验证。模型验证可使用当前供应商的 Base URL 与 API Key 获取模型列表；未分组供应商也可以单独选择余额查询模板，无需为查询余额创建文件夹。
+
+Windows x64 安装版、MSI 和便携版见 [v3.20.1 下载页](https://github.com/Jyy1529/ccs-two-update/releases/tag/v3.20.1)。升级前请备份配置。此批手动安装包未签名，不含自动更新签名；验证范围及升级提醒见 [本仓库版本说明](docs/release-notes/v3.20.1-ccs-two-update.md)。
 
 ## 二次开发目标
 

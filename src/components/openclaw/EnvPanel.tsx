@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useAppManagement } from "@/lib/query/appManagement";
 import { Save } from "lucide-react";
 import { toast } from "sonner";
 import { useOpenClawEnv, useSaveOpenClawEnv } from "@/hooks/useOpenClaw";
@@ -10,6 +11,7 @@ import { parseOpenClawEnvEditorValue } from "./utils";
 
 const EnvPanel: React.FC = () => {
   const { t } = useTranslation();
+  const { canWrite } = useAppManagement("openclaw");
   const { data: envData, isLoading } = useOpenClawEnv();
   const saveEnvMutation = useSaveOpenClawEnv();
   const [editorValue, setEditorValue] = useState("{}");
@@ -39,6 +41,7 @@ const EnvPanel: React.FC = () => {
   }, []);
 
   const handleSave = async () => {
+    if (!canWrite) return;
     try {
       const env = parseOpenClawEnvEditorValue(editorValue);
       await saveEnvMutation.mutateAsync(env);
@@ -101,7 +104,8 @@ const EnvPanel: React.FC = () => {
         <Button
           size="sm"
           onClick={handleSave}
-          disabled={saveEnvMutation.isPending}
+          disabled={saveEnvMutation.isPending || !canWrite}
+          title={!canWrite ? t("appManagement.databaseOnly") : undefined}
         >
           <Save className="w-4 h-4 mr-1" />
           {saveEnvMutation.isPending ? t("common.saving") : t("common.save")}

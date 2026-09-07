@@ -3,6 +3,7 @@
 //! Grok Build uses the same top-level `[mcp_servers]` TOML layout as Codex,
 //! stored alongside its model configuration in `~/.grok/config.toml`.
 
+use indexmap::IndexMap;
 use serde_json::{json, Value};
 
 use crate::app_config::{McpApps, McpServer, MultiAppConfig};
@@ -127,6 +128,46 @@ pub fn import_from_grokbuild(config: &mut MultiAppConfig) -> Result<usize, AppEr
         }
     }
     Ok(changed)
+}
+
+pub fn sync_servers_to_grokbuild(servers: &IndexMap<String, McpServer>) -> Result<(), AppError> {
+    if servers.is_empty() || !should_sync_grokbuild_mcp() {
+        return Ok(());
+    }
+    let text = read_config_text()?;
+    let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|error| {
+        AppError::McpValidation(format!("解析 Grok Build config.toml 失败: {error}"))
+    })?;
+    for server in servers.values() {
+        if server.apps.grokbuild {
+            if doc
+                .get("mcp_servers")
+                .is_none_or(|item| item.as_table_like().is_none())
+            {
+                doc["mcp_servers"] = toml_edit::table();
+            }
+            let entries = doc
+                .get_mut("mcp_servers")
+                .and_then(toml_edit::Item::as_table_like_mut)
+                .ok_or_else(|| {
+                    AppError::McpValidation("Grok Build config.toml 的 mcp_servers 不是表".into())
+                })?;
+            entries.insert(
+                &server.id,
+                toml_edit::Item::Table(json_server_to_grokbuild_toml_table(&server.server)?),
+            );
+        } else if let Some(entries) = doc
+            .get_mut("mcp_servers")
+            .and_then(toml_edit::Item::as_table_like_mut)
+        {
+            entries.remove(&server.id);
+        }
+    }
+    let updated = doc.to_string();
+    if updated == text {
+        return Ok(());
+    }
+    crate::config::write_text_file(&crate::grok_config::get_grok_config_path(), &updated)
 }
 
 pub fn sync_single_server_to_grokbuild(

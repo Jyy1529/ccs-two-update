@@ -1,4 +1,4 @@
-import { useMemo, useState, useEffect } from "react";
+import { useMemo, useState, useEffect, type ReactNode } from "react";
 import {
   AlertTriangle,
   GripVertical,
@@ -50,6 +50,8 @@ interface DragHandleProps {
 
 interface ProviderCardProps {
   provider: Provider;
+  groupActions?: ReactNode;
+  balanceSummary?: ReactNode;
   isCurrent: boolean;
   appId: AppId;
   isInConfig?: boolean; // OpenCode: 是否已添加到 opencode.json
@@ -66,6 +68,8 @@ interface ProviderCardProps {
   onDuplicate: (provider: Provider) => void;
   onTransfer?: (provider: Provider) => void;
   onTest?: (provider: Provider) => void;
+  onValidate?: (provider: Provider) => void;
+  isManagementDisabled?: boolean;
   onOpenTerminal?: (provider: Provider) => void;
   isTesting?: boolean;
   isProxyRunning: boolean;
@@ -168,6 +172,8 @@ const extractApiUrl = (provider: Provider, fallbackText: string) => {
 
 export function ProviderCard({
   provider,
+  groupActions,
+  balanceSummary,
   isCurrent,
   appId,
   isInConfig = true,
@@ -184,6 +190,8 @@ export function ProviderCard({
   onDuplicate,
   onTransfer = () => undefined,
   onTest,
+  onValidate,
+  isManagementDisabled,
   onOpenTerminal,
   isTesting,
   isProxyRunning,
@@ -683,8 +691,11 @@ export function ProviderCard({
           </div>
 
           <div className="flex items-center gap-1.5 flex-shrink-0 opacity-0 pointer-events-none group-hover:opacity-100 group-focus-within:opacity-100 group-hover:pointer-events-auto group-focus-within:pointer-events-auto transition-opacity duration-200">
+            {groupActions}
             <ProviderActions
               appId={appId}
+              isManagementDisabled={isManagementDisabled}
+              onValidate={onValidate ? () => onValidate(provider) : undefined}
               isCurrent={isCurrent}
               isInConfig={isInConfig}
               isTesting={isTesting}
@@ -740,6 +751,7 @@ export function ProviderCard({
         </div>
       </div>
 
+      {balanceSummary}
       {isExpanded && hasMultiplePlans && (
         <div className="mt-4 pt-4 border-t border-border-default">
           <UsageFooter

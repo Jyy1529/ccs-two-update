@@ -428,6 +428,7 @@ fn revision(bytes: &[u8]) -> String {
 }
 
 fn ensure_private_models_parent(path: &Path) -> Result<(), AppError> {
+    let _permission = crate::app_management::permit_path(path)?;
     let parent = path.parent().ok_or_else(|| {
         AppError::Config(format!(
             "Pi models path has no parent directory: {}",

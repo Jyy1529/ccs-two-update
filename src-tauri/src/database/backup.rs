@@ -84,6 +84,7 @@ fn import_authorizer(context: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hoo
 
 /// Tables whose data rows are skipped when exporting for WebDAV sync.
 const SYNC_SKIP_TABLES: &[&str] = &[
+    "model_validation_runs",
     "proxy_request_logs",
     "stream_check_logs",
     "provider_health",
@@ -96,6 +97,7 @@ const SYNC_SKIP_TABLES: &[&str] = &[
 /// Tables whose local data is preserved from the live database during WebDAV import.
 /// Excludes ephemeral tables like provider_health that can safely rebuild at runtime.
 const SYNC_PRESERVE_TABLES: &[&str] = &[
+    "model_validation_runs",
     "proxy_request_logs",
     "stream_check_logs",
     "proxy_live_backup",
@@ -153,7 +155,9 @@ impl Database {
 
     /// 从 SQL 字符串导入，返回生成的备份 ID（若无备份则为空字符串）
     pub fn import_sql_string(&self, sql_raw: &str) -> Result<String, AppError> {
-        self.import_sql_string_inner(sql_raw, &[])
+        // Validation evidence belongs to this device even during a manual
+        // configuration import; imported providers cannot replace local results.
+        self.import_sql_string_inner(sql_raw, &["model_validation_runs"])
     }
 
     /// Import SQL generated for sync, then restore local-only tables from the

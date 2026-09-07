@@ -664,6 +664,24 @@ impl ProxyServer {
     }
 
     /// 重置指定 Provider 的熔断器
+    pub async fn fill_key_pool_status(
+        &self,
+        status: &mut crate::provider_groups::ProviderGroupStatus,
+    ) {
+        self.state
+            .provider_router
+            .fill_key_pool_status(status)
+            .await;
+    }
+
+    pub async fn clear_key_pool_runtime(&self, app_type: &str, group_id: &str) {
+        self.state
+            .provider_router
+            .clear_key_pool_runtime(app_type, group_id)
+            .await;
+    }
+
+    /// 重置指定 Provider 的熔断器
     pub async fn reset_provider_circuit_breaker(&self, provider_id: &str, app_type: &str) {
         self.state
             .provider_router

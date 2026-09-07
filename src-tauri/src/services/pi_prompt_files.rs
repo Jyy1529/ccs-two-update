@@ -70,6 +70,8 @@ impl PiAgentsFileGuard {
     }
 
     pub(crate) fn delete(&self, expected_revision: &str) -> Result<(), AppError> {
+        let _permission = crate::app_management::permit_path(&self.path)?;
+        crate::services::config_guard::require_delete(&self.path)?;
         ensure_revision(&self.path, expected_revision, "Pi AGENTS.md")?;
         match fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
@@ -129,6 +131,7 @@ impl PiPromptFileService {
     pub fn delete(kind: PiPromptFileKind, expected_revision: &str) -> Result<bool, AppError> {
         let _guard = lock_prompt_files()?;
         let path = get_pi_agent_dir()?.join(kind.filename());
+        let _permission = crate::app_management::permit_path(&path)?;
         ensure_revision(&path, expected_revision, "Pi prompt file")?;
         match fs::remove_file(&path) {
             Ok(()) => Ok(true),
@@ -202,6 +205,7 @@ impl PiPromptTemplateService {
         let _guard = lock_prompt_files()?;
         let dir = get_pi_agent_dir()?.join("prompts");
         let path = template_path(&dir, slug);
+        let _permission = crate::app_management::permit_path(&path)?;
 
         if let Some(original_slug) = original_slug.filter(|value| *value != slug) {
             let original_path = template_path(&dir, original_slug);
@@ -234,6 +238,7 @@ impl PiPromptTemplateService {
         validate_template_slug(slug)?;
         let _guard = lock_prompt_files()?;
         let path = template_path(&get_pi_agent_dir()?.join("prompts"), slug);
+        let _permission = crate::app_management::permit_path(&path)?;
         ensure_revision(&path, expected_revision, "Pi prompt template")?;
         match fs::remove_file(&path) {
             Ok(()) => Ok(true),

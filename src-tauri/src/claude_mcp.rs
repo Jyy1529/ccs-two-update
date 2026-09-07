@@ -111,6 +111,7 @@ fn read_json_value(path: &Path) -> Result<Value, AppError> {
 }
 
 fn write_json_value(path: &Path, value: &Value) -> Result<(), AppError> {
+    let _permission = crate::app_management::permit_path(path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
     }
@@ -323,27 +324,24 @@ pub fn validate_command_in_path(cmd: &str) -> Result<bool, AppError> {
     Ok(false)
 }
 
-/// 读取 ~/.claude.json 中的 mcpServers 映射
-pub fn read_mcp_servers_map() -> Result<std::collections::HashMap<String, Value>, AppError> {
-    let path = user_config_path();
-    if !path.exists() {
-        return Ok(std::collections::HashMap::new());
-    }
-
-    let root = read_json_value(&path)?;
-    let servers = root
-        .get("mcpServers")
-        .and_then(|v| v.as_object())
-        .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-        .unwrap_or_default();
-
-    Ok(servers)
-}
-
 /// 将给定的启用 MCP 服务器映射写入到用户级 ~/.claude.json 的 mcpServers 字段
 /// 仅覆盖 mcpServers，其他字段保持不变
 pub fn set_mcp_servers_map(
     servers: &std::collections::HashMap<String, Value>,
+) -> Result<(), AppError> {
+    write_mcp_servers_map(servers, None)
+}
+
+pub(crate) fn update_mcp_servers_map(
+    servers: &std::collections::HashMap<String, Value>,
+    removed: &[&str],
+) -> Result<(), AppError> {
+    write_mcp_servers_map(servers, Some(removed))
+}
+
+fn write_mcp_servers_map(
+    servers: &std::collections::HashMap<String, Value>,
+    removed: Option<&[&str]>,
 ) -> Result<(), AppError> {
     let path = user_config_path();
     let mut root = if path.exists() {
@@ -358,7 +356,19 @@ pub fn set_mcp_servers_map(
     if is_wsl_target {
         log::info!("检测到 WSL 路径，跳过 cmd /c 包装: {}", path.display());
     }
-    let mut out: Map<String, Value> = Map::new();
+    let mut out = if let Some(removed) = removed {
+        let mut current = root
+            .get("mcpServers")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for id in removed {
+            current.remove(*id);
+        }
+        current
+    } else {
+        Map::new()
+    };
     for (id, spec) in servers.iter() {
         let mut obj = if let Some(map) = spec.as_object() {
             map.clone()

@@ -24,21 +24,21 @@ enum BalanceProvider {
 }
 
 fn detect_provider(base_url: &str) -> Option<BalanceProvider> {
-    let url = base_url.to_lowercase();
-    if url.contains("api.deepseek.com") {
-        Some(BalanceProvider::DeepSeek)
-    } else if url.contains("api.stepfun.ai") || url.contains("api.stepfun.com") {
-        Some(BalanceProvider::StepFun)
-    } else if url.contains("api.siliconflow.cn") {
-        Some(BalanceProvider::SiliconFlow)
-    } else if url.contains("api.siliconflow.com") {
-        Some(BalanceProvider::SiliconFlowEn)
-    } else if url.contains("openrouter.ai") {
-        Some(BalanceProvider::OpenRouter)
-    } else if url.contains("api.novita.ai") {
-        Some(BalanceProvider::NovitaAI)
-    } else {
-        None
+    let url = reqwest::Url::parse(base_url.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    match url.host_str()? {
+        "api.deepseek.com" => Some(BalanceProvider::DeepSeek),
+        "api.stepfun.ai" | "api.stepfun.com" => Some(BalanceProvider::StepFun),
+        "api.siliconflow.cn" => Some(BalanceProvider::SiliconFlow),
+        "api.siliconflow.com" => Some(BalanceProvider::SiliconFlowEn),
+        "openrouter.ai" => Some(BalanceProvider::OpenRouter),
+        "api.novita.ai" => Some(BalanceProvider::NovitaAI),
+        _ => None,
     }
 }
 
@@ -416,6 +416,7 @@ fn parse_f64_field(obj: &serde_json::Value, field: &str) -> Option<f64> {
     obj.get(field).and_then(|v| {
         v.as_f64()
             .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            .filter(|number| number.is_finite())
     })
 }
 
@@ -450,5 +451,29 @@ pub async fn get_balance(base_url: &str, api_key: &str) -> Result<UsageResult, S
         BalanceProvider::SiliconFlowEn => query_siliconflow(api_key, false).await,
         BalanceProvider::OpenRouter => query_openrouter(api_key).await,
         BalanceProvider::NovitaAI => query_novita(api_key).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn built_in_balance_detection_uses_exact_host_not_path_or_suffix() {
+        for host in [
+            "api.deepseek.com",
+            "api.stepfun.ai",
+            "api.stepfun.com",
+            "api.siliconflow.cn",
+            "api.siliconflow.com",
+            "openrouter.ai",
+            "api.novita.ai",
+        ] {
+            assert!(detect_provider(&format!("https://{host}/v1")).is_some());
+            assert!(detect_provider(&format!("https://{host}.example/v1")).is_none());
+            assert!(detect_provider(&format!("https://relay.example/{host}")).is_none());
+        }
+        assert!(detect_provider("ftp://api.deepseek.com").is_none());
+        assert!(detect_provider("https://key@api.deepseek.com").is_none());
     }
 }

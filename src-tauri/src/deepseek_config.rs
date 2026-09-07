@@ -307,11 +307,21 @@ fn write_provider_live_at(dir: &Path, settings: &JsonValue) -> Result<(), AppErr
         None
     };
 
-    if let Some(credentials) = credentials {
-        write_yaml_mapping(&credentials_path, &credentials)?;
-        secure_secret_file(&credentials_path)?;
+    if dir == get_deepseek_dir() {
+        let mut files = vec![(settings_path, serde_yaml::to_string(&root).map_err(|error| AppError::Config(error.to_string()))?.into_bytes())];
+        if let Some(credentials) = credentials {
+            files.push((credentials_path, serde_yaml::to_string(&credentials).map_err(|error| AppError::Config(error.to_string()))?.into_bytes()));
+        }
+        crate::services::config_guard::commit_files(&crate::app_config::AppType::DeepSeek, &files)
+    } else {
+        // This private path-parameterized helper also serves isolated fixtures;
+        // public native projection always uses the registered directory above.
+        if let Some(credentials) = credentials {
+            write_yaml_mapping(&credentials_path, &credentials)?;
+            secure_secret_file(&credentials_path)?;
+        }
+        write_yaml_mapping(&settings_path, &root)
     }
-    write_yaml_mapping(&settings_path, &root)
 }
 
 pub fn validate_provider_settings(settings: &JsonValue) -> Result<(), AppError> {

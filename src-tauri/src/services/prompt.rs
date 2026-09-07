@@ -30,11 +30,12 @@ fn project_prompt_set_to_path(
 
     if let Some((_, prompt)) = enabled.first() {
         write_text_file(target_path, &prompt.content)?;
-    } else if target_path.exists() {
-        // Match the existing "disable the last prompt" behavior without
-        // creating an otherwise unused application config directory.
-        write_text_file(target_path, "")?;
     }
+    // With nothing enabled, leave the target file untouched. This projection
+    // only runs after a database restore, and the live file is not part of
+    // the sync payload — clearing it here would wipe local content the
+    // restored snapshot never contained. Disabling the last prompt from the
+    // UI still clears the file via `PromptService::upsert_prompt`.
 
     if enabled.len() <= 1 {
         return Ok(None);
@@ -67,6 +68,7 @@ impl PromptService {
         id: &str,
         prompt: Prompt,
     ) -> Result<(), AppError> {
+        if !crate::app_management::is_managed(&app) { return state.db.save_prompt(app.as_str(), &prompt); }
         if matches!(app, AppType::Pi) {
             return upsert_pi_prompt(state, id, prompt);
         }
@@ -98,6 +100,7 @@ impl PromptService {
     }
 
     pub fn delete_prompt(state: &AppState, app: AppType, id: &str) -> Result<(), AppError> {
+        if !crate::app_management::is_managed(&app) { return state.db.delete_prompt(app.as_str(), id); }
         if matches!(app, AppType::Pi) {
             return delete_pi_prompt(state, id);
         }
@@ -114,6 +117,7 @@ impl PromptService {
     }
 
     pub fn enable_prompt(state: &AppState, app: AppType, id: &str) -> Result<(), AppError> {
+        crate::app_management::require_managed(&app)?;
         if matches!(app, AppType::Pi) {
             return enable_pi_prompt(state, id);
         }
@@ -241,6 +245,7 @@ impl PromptService {
     /// This deliberately does not call `enable_prompt`: restore paths must not
     /// read stale live content and write it back into the freshly imported DB.
     pub fn sync_to_live(state: &AppState, app: AppType) -> Result<(), AppError> {
+        crate::app_management::require_managed(&app)?;
         // Pi derives activation from its native AGENTS.md; its persisted prompt
         // rows are intentionally disabled and must not drive generic projection.
         if matches!(app, AppType::ClaudeDesktop | AppType::Pi) {
@@ -259,6 +264,7 @@ impl PromptService {
     pub fn sync_all_to_live(state: &AppState) -> Result<(), AppError> {
         let mut failures = Vec::new();
         for app in AppType::all() {
+            if !crate::app_management::is_managed(&app) { log::info!("Skipped Prompt sync for {}: unmanaged", app.as_str()); continue; }
             if matches!(app, AppType::ClaudeDesktop) {
                 continue;
             }
@@ -523,15 +529,21 @@ mod tests {
     }
 
     #[test]
-    fn restored_prompt_projection_clears_a_stale_file_when_none_are_enabled() {
+    fn restored_prompt_projection_preserves_the_live_file_when_none_are_enabled() {
         let temp = tempdir().expect("tempdir");
         let path = temp.path().join("AGENTS.md");
-        std::fs::write(&path, "stale").expect("seed stale prompt");
-        let prompts = IndexMap::new();
+        std::fs::write(&path, "local content").expect("seed live prompt file");
+        let mut prompts = IndexMap::new();
+        prompts.insert("off".to_string(), prompt("off", "managed", false));
 
-        let warning = project_prompt_set_to_path(&prompts, &path).expect("clear prompt");
+        let warning = project_prompt_set_to_path(&prompts, &path).expect("project prompt");
         assert!(warning.is_none());
-        assert_eq!(std::fs::read_to_string(path).expect("read prompt"), "");
+        // The live file is not part of the sync payload, so a restore with no
+        // enabled prompt must not wipe local content it never contained.
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read prompt"),
+            "local content"
+        );
     }
 
     #[test]

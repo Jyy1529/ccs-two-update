@@ -1,10 +1,5 @@
-import {
-  act,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { act, fireEvent, screen, waitFor } from "@testing-library/react";
+import { renderManagedUi as render } from "../utils/safetyTestUtils";
 import { createRef } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 

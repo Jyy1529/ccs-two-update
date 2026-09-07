@@ -115,6 +115,9 @@ pub struct CodexProviderTemplateBucketMigrationOutcome {
 pub fn maybe_migrate_codex_third_party_history_provider_bucket(
     db: &Database,
 ) -> Result<CodexHistoryProviderBucketMigrationOutcome, AppError> {
+    if !crate::app_management::is_managed(&crate::app_config::AppType::Codex) {
+        return Ok(CodexHistoryProviderBucketMigrationOutcome { skipped_reason: Some("app_unmanaged".into()), ..Default::default() });
+    }
     if crate::settings::is_codex_third_party_history_provider_bucket_migrated() {
         return Ok(CodexHistoryProviderBucketMigrationOutcome {
             skipped_reason: Some("already_migrated".to_string()),
@@ -197,6 +200,9 @@ pub fn maybe_migrate_codex_provider_template_bucket(
 /// 迁移前 jsonl / state DB 均备份到 `~/.cc-switch/backups/codex-official-history-unify-v1/`。
 pub fn maybe_migrate_codex_official_history_to_unified_bucket(
 ) -> Result<CodexHistoryProviderBucketMigrationOutcome, AppError> {
+    if !crate::app_management::is_managed(&crate::app_config::AppType::Codex) {
+        return Ok(CodexHistoryProviderBucketMigrationOutcome { skipped_reason: Some("app_unmanaged".into()), ..Default::default() });
+    }
     if !crate::settings::unify_codex_session_history() {
         return Ok(CodexHistoryProviderBucketMigrationOutcome {
             skipped_reason: Some("unify_toggle_off".to_string()),
@@ -353,6 +359,7 @@ fn has_official_history_unify_backup_for_dir(ledger_parent: &Path, codex_dir_key
 /// 且只改写当前仍为 custom 的目标，重复执行无害。
 pub fn restore_codex_official_history_from_backups(
 ) -> Result<CodexOfficialHistoryRestoreOutcome, AppError> {
+    crate::app_management::require_managed(&crate::app_config::AppType::Codex)?;
     let _op_guard = lock_codex_official_history_op();
     // 开关已（重新）开启时拒绝还原：live 正路由 custom，把账本会话翻回
     // openai 桶等于亲手制造分裂。覆盖"关闭保存成功后用户立刻重新开启，
@@ -596,6 +603,7 @@ fn restore_codex_state_db_official_threads(
     official_thread_ids: &BTreeSet<String>,
     backup_root: &Path,
 ) -> Result<usize, AppError> {
+    let _permission = crate::app_management::permit_path(db_path)?;
     if !db_path.exists() || official_thread_ids.is_empty() {
         return Ok(0);
     }
@@ -1122,6 +1130,7 @@ fn migrate_codex_state_db_provider_bucket(
     source_provider_ids: &BTreeSet<String>,
     backup_root: &Path,
 ) -> Result<usize, AppError> {
+    let _permission = crate::app_management::permit_path(db_path)?;
     if !db_path.exists() || source_provider_ids.is_empty() {
         return Ok(0);
     }

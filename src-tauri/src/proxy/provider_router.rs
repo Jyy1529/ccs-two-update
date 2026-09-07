@@ -7,10 +7,11 @@ use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::Provider;
 use crate::proxy::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, RwLock};
 
 /// Codex Official requests carry the selected account's native Authorization
 /// header. Reusing that request against another account card would cross the
@@ -32,6 +33,7 @@ pub struct ProviderRoutePlan {
     pub use_failover_timeouts: bool,
     pub sync_logical_target: bool,
     pub bypass_single_provider_circuit_breaker: bool,
+    pub key_pool_retries: HashMap<String, u32>,
 }
 
 impl ProviderRoutePlan {
@@ -47,6 +49,7 @@ impl ProviderRoutePlan {
             use_failover_timeouts,
             sync_logical_target: true,
             bypass_single_provider_circuit_breaker: true,
+            key_pool_retries: HashMap::new(),
         }
     }
 
@@ -92,6 +95,23 @@ pub struct ProviderRouter {
     db: Arc<Database>,
     /// 熔断器管理器 - key 格式: "app_type:provider_id"
     circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
+    /// Ephemeral key-pool cursor and cooldown state. Credentials are never
+    /// stored here; members are addressed only by app/group/provider IDs.
+    key_pool_runtime: Arc<Mutex<HashMap<String, KeyPoolRuntime>>>,
+}
+
+#[derive(Default)]
+struct KeyPoolRuntime {
+    next_index: usize,
+    members: HashMap<String, KeyPoolMemberRuntime>,
+}
+
+#[derive(Default)]
+struct KeyPoolMemberRuntime {
+    cooldown_until: Option<Instant>,
+    consecutive_failures: u32,
+    last_failure_at: Option<i64>,
+    early_probe: bool,
 }
 
 impl ProviderRouter {
@@ -100,15 +120,207 @@ impl ProviderRouter {
         Self {
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
+            key_pool_runtime: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// 选择可用的供应商（支持故障转移）
+    /// Select a route plan, including an optional per-group key pool.
+    pub async fn select_route_plan(&self, app_type: &str) -> Result<ProviderRoutePlan, AppError> {
+        let auto_failover_enabled = self.auto_failover_enabled(app_type).await;
+        if let Some((group, mut providers)) = self.select_key_pool_members(app_type).await? {
+            let key_pool_retries = providers
+                .iter()
+                .map(|provider| (provider.id.clone(), group.key_pool_max_retries))
+                .collect();
+            // A key pool is the preferred route. When the app-level queue is
+            // also enabled, retain its compatible non-pool fallbacks without
+            // duplicating members already selected from the pool.
+            if auto_failover_enabled {
+                if let Ok(fallbacks) = self.select_providers_base(app_type).await {
+                    let mut seen: HashSet<String> = providers
+                        .iter()
+                        .map(|provider| provider.id.clone())
+                        .collect();
+                    for provider in fallbacks {
+                        if provider
+                            .meta
+                            .as_ref()
+                            .and_then(|meta| meta.provider_group_id.as_deref())
+                            == Some(group.id.as_str())
+                        {
+                            continue;
+                        }
+                        if seen.insert(provider.id.clone()) {
+                            providers.push(provider);
+                        }
+                    }
+                }
+            }
+            let mut plan = ProviderRoutePlan::standard(providers, true);
+            plan.sync_logical_target = false;
+            plan.bypass_single_provider_circuit_breaker = false;
+            plan.key_pool_retries = key_pool_retries;
+            return Ok(plan);
+        }
+
+        let providers = self.select_providers_base(app_type).await?;
+        Ok(ProviderRoutePlan::standard(
+            providers,
+            auto_failover_enabled,
+        ))
+    }
+
+    async fn auto_failover_enabled(&self, app_type: &str) -> bool {
+        match self.db.get_proxy_config_for_app(app_type).await {
+            Ok(config) => config.auto_failover_enabled,
+            Err(error) => {
+                log::error!("[{app_type}] 读取 proxy_config 失败: {error}，默认禁用故障转移");
+                false
+            }
+        }
+    }
+
+    /// Select members for the current provider's enabled key pool.
+    /// `None` means the current provider is not an active pool anchor and the
+    /// caller should use the legacy provider route.
+    async fn select_key_pool_members(
+        &self,
+        app_type: &str,
+    ) -> Result<Option<(crate::provider_groups::ProviderGroup, Vec<Provider>)>, AppError> {
+        let app = AppType::from_str(app_type)?;
+        if !app.supports_local_proxy() {
+            return Ok(None);
+        }
+        let current_id = crate::settings::get_effective_current_provider(&self.db, &app)
+            .ok()
+            .flatten()
+            .or_else(|| self.db.get_current_provider(app_type).ok().flatten());
+        let Some(current_id) = current_id else {
+            return Ok(None);
+        };
+        let Some(current) = self.db.get_provider_by_id(&current_id, app_type)? else {
+            return Ok(None);
+        };
+        if !current
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.key_pool_enabled)
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+        let Some(group_id) = current
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.provider_group_id.as_deref())
+        else {
+            return Ok(None);
+        };
+        let Some(group) = self.db.get_provider_group(group_id)? else {
+            return Ok(None);
+        };
+        if group.app_type != app_type || !group.key_pool_enabled {
+            return Ok(None);
+        }
+
+        let mut members =
+            crate::services::provider_groups::ProviderGroupService::validate_pool_members(
+                &self.db, &group.id,
+            )?;
+        members.sort_by(|left, right| {
+            let left_index = left
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.provider_group_sort_index)
+                .unwrap_or(usize::MAX);
+            let right_index = right
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.provider_group_sort_index)
+                .unwrap_or(usize::MAX);
+            left_index
+                .cmp(&right_index)
+                .then_with(|| {
+                    left.sort_index
+                        .unwrap_or(usize::MAX)
+                        .cmp(&right.sort_index.unwrap_or(usize::MAX))
+                })
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        let runtime_key = format!("{app_type}:{}", group.id);
+        let now = Instant::now();
+        let mut runtime = self.key_pool_runtime.lock().await;
+        let state = runtime.entry(runtime_key).or_default();
+        state
+            .members
+            .retain(|id, _| members.iter().any(|member| &member.id == id));
+        let start = match group.key_pool_strategy {
+            crate::provider_groups::KeyPoolStrategy::Failover => 0,
+            crate::provider_groups::KeyPoolStrategy::RoundRobin => state.next_index % members.len(),
+        };
+
+        let mut selected = Vec::with_capacity(members.len());
+        for offset in 0..members.len() {
+            let index = (start + offset) % members.len();
+            let provider = &members[index];
+            if state
+                .members
+                .get(&provider.id)
+                .and_then(|member| member.cooldown_until)
+                .is_some_and(|until| until > now)
+            {
+                continue;
+            }
+            selected.push(provider.clone());
+        }
+        if selected.is_empty() {
+            // Avoid making a request hang indefinitely. Probe the member whose
+            // cooldown expires first and remove only that member's cooldown.
+            if let Some((provider, _)) = members
+                .iter()
+                .filter_map(|provider| {
+                    state
+                        .members
+                        .get(&provider.id)
+                        .and_then(|member| member.cooldown_until.map(|until| (provider, until)))
+                })
+                .min_by_key(|(_, until)| *until)
+            {
+                let member = state.members.entry(provider.id.clone()).or_default();
+                member.cooldown_until = None;
+                member.early_probe = true;
+                log::warn!(
+                    "[KeyPool] app={} group={} provider={} probing earliest cooldown member",
+                    app_type,
+                    group.id,
+                    provider.id
+                );
+                selected.push(provider.clone());
+            }
+        }
+        if let Some(first) = selected.first() {
+            state.next_index = (members
+                .iter()
+                .position(|member| member.id == first.id)
+                .unwrap_or(0)
+                + 1)
+                % members.len();
+        }
+        Ok(Some((group, selected)))
+    }
+
+    /// 选择可用的供应商（支持故障转移）。保留此 API 供非上下文调用方使用。
+    pub async fn select_providers(&self, app_type: &str) -> Result<Vec<Provider>, AppError> {
+        Ok(self.select_route_plan(app_type).await?.providers())
+    }
+
+    /// 旧的全局故障转移选择逻辑；池路由在 `select_route_plan` 中优先处理。
     ///
     /// 返回按优先级排序的可用供应商列表：
     /// - 故障转移关闭时：仅返回当前供应商
     /// - 故障转移开启时：仅使用故障转移队列，按队列顺序依次尝试（P1 → P2 → ...）
-    pub async fn select_providers(&self, app_type: &str) -> Result<Vec<Provider>, AppError> {
+    async fn select_providers_base(&self, app_type: &str) -> Result<Vec<Provider>, AppError> {
         let mut result = Vec::new();
         let mut total_providers = 0usize;
         let mut circuit_open_count = 0usize;
@@ -229,6 +441,7 @@ impl ProviderRouter {
                 use_failover_timeouts: true,
                 sync_logical_target: false,
                 bypass_single_provider_circuit_breaker: false,
+                key_pool_retries: HashMap::new(),
             }));
         };
 
@@ -333,6 +546,7 @@ impl ProviderRouter {
             use_failover_timeouts: true,
             sync_logical_target: false,
             bypass_single_provider_circuit_breaker: false,
+            key_pool_retries: HashMap::new(),
         }))
     }
 
@@ -354,6 +568,76 @@ impl ProviderRouter {
             allowed: result.allowed,
             breaker: result.used_half_open_permit.then_some(breaker),
         }
+    }
+
+    /// Record pool state against the provider snapshot that issued the request.
+    pub async fn record_result_for_provider(
+        &self,
+        provider: &Provider,
+        app_type: &str,
+        used_half_open_permit: bool,
+        success: bool,
+        error_msg: Option<String>,
+    ) -> Result<(), AppError> {
+        self.record_result(
+            &provider.id,
+            app_type,
+            used_half_open_permit,
+            success,
+            error_msg,
+        )
+        .await?;
+        let Some(meta) = provider
+            .meta
+            .as_ref()
+            .filter(|meta| meta.key_pool_enabled == Some(true))
+        else {
+            return Ok(());
+        };
+        let Some(group_id) = meta.provider_group_id.as_deref() else {
+            return Ok(());
+        };
+        let Some(current) = self.db.get_provider_by_id(&provider.id, app_type)? else {
+            return Ok(());
+        };
+        if current.settings_config != provider.settings_config
+            || current
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.provider_group_id.as_deref())
+                != Some(group_id)
+            || current.meta.as_ref().and_then(|meta| meta.key_pool_enabled) != Some(true)
+        {
+            return Ok(());
+        }
+        let Some(group) = self.db.get_provider_group(group_id)? else {
+            return Ok(());
+        };
+        if !group.key_pool_enabled || group.app_type != app_type {
+            return Ok(());
+        }
+        let key = format!("{app_type}:{group_id}");
+        let mut runtime = self.key_pool_runtime.lock().await;
+        if success {
+            if let Some(state) = runtime.get_mut(&key) {
+                state
+                    .members
+                    .insert(provider.id.clone(), KeyPoolMemberRuntime::default());
+            }
+        } else {
+            let member = runtime
+                .entry(key)
+                .or_default()
+                .members
+                .entry(provider.id.clone())
+                .or_default();
+            member.cooldown_until =
+                Some(Instant::now() + Duration::from_millis(group.key_pool_cooldown_ms));
+            member.consecutive_failures = member.consecutive_failures.saturating_add(1);
+            member.last_failure_at = Some(chrono::Utc::now().timestamp_millis());
+            member.early_probe = false;
+        }
+        Ok(())
     }
 
     /// 记录供应商请求结果
@@ -393,6 +677,37 @@ impl ProviderRouter {
             .await?;
 
         Ok(())
+    }
+
+    pub async fn clear_key_pool_runtime(&self, app_type: &str, group_id: &str) {
+        self.key_pool_runtime
+            .lock()
+            .await
+            .remove(&format!("{app_type}:{group_id}"));
+    }
+
+    pub async fn fill_key_pool_status(
+        &self,
+        status: &mut crate::provider_groups::ProviderGroupStatus,
+    ) {
+        status.proxy_running = true;
+        let key = format!("{}:{}", status.group.app_type, status.group.id);
+        let runtime = self.key_pool_runtime.lock().await;
+        let Some(state) = runtime.get(&key).filter(|_| status.group.key_pool_enabled) else {
+            return;
+        };
+        for member in status.members.iter_mut().filter(|member| member.eligible) {
+            if let Some(live) = state.members.get(&member.provider_id) {
+                member.cooldown_remaining_ms = live
+                    .cooldown_until
+                    .map(|until| until.saturating_duration_since(Instant::now()).as_millis() as u64)
+                    .unwrap_or(0);
+                member.cooling_down = member.cooldown_remaining_ms > 0;
+                member.consecutive_failures = live.consecutive_failures;
+                member.last_failure_at = live.last_failure_at;
+                member.early_probe = live.early_probe;
+            }
+        }
     }
 
     /// 重置熔断器（手动恢复）
@@ -1290,5 +1605,318 @@ mod tests {
 
         let blocked_by_next = router.allow_provider_request("a", "claude").await;
         assert!(!blocked_by_next.allowed());
+    }
+
+    fn key_pool_fixture() -> (Arc<Database>, ProviderRouter) {
+        let db = Arc::new(Database::memory().expect("memory db"));
+        let group = crate::provider_groups::ProviderGroup {
+            id: "group-1".to_string(),
+            app_type: "codex".to_string(),
+            name: "Relay".to_string(),
+            kind: crate::provider_groups::ProviderGroupKind::Manual,
+            normalized_base_url: Some("https://relay.example/v1".to_string()),
+            sort_index: 0,
+            collapsed: false,
+            key_pool_enabled: true,
+            key_pool_strategy: crate::provider_groups::KeyPoolStrategy::RoundRobin,
+            icon: None,
+            icon_color: None,
+            key_pool_max_retries: 0,
+            key_pool_cooldown_ms: 1000,
+            balance_template_id: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        db.create_provider_group(&group).expect("create group");
+
+        for (index, id) in ["p1", "p2", "p3"].into_iter().enumerate() {
+            let mut provider = Provider::with_id(
+                id.to_string(),
+                format!("Relay {id}"),
+                json!({
+                    "auth": {"OPENAI_API_KEY": format!("key-{id}")},
+                    "config": format!(
+                        "model_provider = \"relay\"\n[model_providers.relay]\nbase_url = \"https://relay.example/v1\"\n"
+                    )
+                }),
+                None,
+            );
+            provider.meta = Some(ProviderMeta {
+                provider_group_id: Some(group.id.clone()),
+                provider_group_sort_index: Some(index),
+                key_pool_enabled: Some(true),
+                ..Default::default()
+            });
+            db.save_provider("codex", &provider).expect("save provider");
+        }
+        db.set_current_provider("codex", "p1")
+            .expect("set current provider");
+        let saved = db
+            .get_provider_by_id("p1", "codex")
+            .expect("read saved provider")
+            .expect("saved provider exists");
+        let (saved_base_url, saved_key) = saved.resolve_usage_credentials(&AppType::Codex);
+        assert_eq!(saved_base_url, "https://relay.example/v1");
+        assert!(!saved_key.is_empty());
+        assert_eq!(
+            saved
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.provider_group_id.as_deref()),
+            Some("group-1")
+        );
+
+        let router = ProviderRouter::new(db.clone());
+        (db, router)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn round_robin_pool_rotates_without_changing_logical_current() {
+        let _home = TempHome::new();
+        let (db, router) = key_pool_fixture();
+        let first = router
+            .select_route_plan("codex")
+            .await
+            .expect("first route plan");
+        let second = router
+            .select_route_plan("codex")
+            .await
+            .expect("second route plan");
+
+        assert_eq!(
+            first.attempts.len(),
+            3,
+            "zero member retries must still allow every key"
+        );
+        assert_eq!(first.key_pool_retries.len(), 3);
+
+        assert_ne!(
+            first.attempts[0].provider.id,
+            second.attempts[0].provider.id
+        );
+        assert!(!first.sync_logical_target);
+        assert_eq!(
+            db.get_current_provider("codex")
+                .expect("read current provider")
+                .as_deref(),
+            Some("p1")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn key_pool_failover_order_cooldown_and_early_probe_are_observable() {
+        let _home = TempHome::new();
+        let (db, router) = key_pool_fixture();
+        let mut group = db.get_provider_group("group-1").unwrap().unwrap();
+        group.key_pool_strategy = crate::provider_groups::KeyPoolStrategy::Failover;
+        group.key_pool_cooldown_ms = 60_000;
+        db.update_provider_group(&group).unwrap();
+        db.set_current_provider("codex", "p3").unwrap();
+        assert_eq!(
+            router.select_route_plan("codex").await.unwrap().attempts[0]
+                .provider
+                .id,
+            "p1"
+        );
+        router
+            .record_result_for_provider(
+                &db.get_provider_by_id("p1", "codex").unwrap().unwrap(),
+                "codex",
+                false,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let selected = router.select_route_plan("codex").await.unwrap();
+        assert_eq!(
+            selected
+                .providers()
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["p2", "p3"]
+        );
+        let mut status =
+            crate::services::provider_groups::ProviderGroupService::group_status(&db, "group-1")
+                .unwrap();
+        assert!(!status.proxy_running);
+        router.fill_key_pool_status(&mut status).await;
+        assert!(status.proxy_running && status.members[0].cooling_down);
+        assert!(status.members[0].cooldown_remaining_ms > 0);
+        assert_eq!(status.members[0].consecutive_failures, 1);
+        assert!(status.members[0].last_failure_at.is_some());
+        router
+            .record_result_for_provider(
+                &db.get_provider_by_id("p2", "codex").unwrap().unwrap(),
+                "codex",
+                false,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        router
+            .record_result_for_provider(
+                &db.get_provider_by_id("p3", "codex").unwrap().unwrap(),
+                "codex",
+                false,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let probe = router.select_route_plan("codex").await.unwrap();
+        assert_eq!(probe.attempts.len(), 1);
+        assert_eq!(probe.attempts[0].provider.id, "p1");
+        router.fill_key_pool_status(&mut status).await;
+        assert!(status.members[0].early_probe);
+        router
+            .record_result_for_provider(
+                &db.get_provider_by_id("p1", "codex").unwrap().unwrap(),
+                "codex",
+                false,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        router.fill_key_pool_status(&mut status).await;
+        assert!(!status.members[0].cooling_down && !status.members[0].early_probe);
+        assert_eq!(status.members[0].consecutive_failures, 0);
+        router.clear_key_pool_runtime("codex", "group-1").await;
+        assert!(router.key_pool_runtime.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn key_pool_round_robin_skips_cooling_key_without_repeating_next_key() {
+        let _home = TempHome::new();
+        let (db, router) = key_pool_fixture();
+        assert_eq!(
+            router.select_route_plan("codex").await.unwrap().attempts[0]
+                .provider
+                .id,
+            "p1"
+        );
+        router
+            .record_result_for_provider(
+                &db.get_provider_by_id("p2", "codex").unwrap().unwrap(),
+                "codex",
+                false,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            router.select_route_plan("codex").await.unwrap().attempts[0]
+                .provider
+                .id,
+            "p3"
+        );
+        assert_eq!(
+            router.select_route_plan("codex").await.unwrap().attempts[0]
+                .provider
+                .id,
+            "p1"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn key_pool_excluded_anchor_uses_legacy_independent_route() {
+        let _home = TempHome::new();
+        let (db, router) = key_pool_fixture();
+        db.assign_provider_group("codex", "p1", Some("group-1"), None, Some(false), None)
+            .unwrap();
+        let plan = router.select_route_plan("codex").await.unwrap();
+        assert!(plan.key_pool_retries.is_empty() && plan.sync_logical_target);
+        assert_eq!(plan.attempts.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn key_pool_late_result_does_not_cool_a_new_folder_after_member_move() {
+        let _home = TempHome::new();
+        let (db, router) = key_pool_fixture();
+        let original = router.select_route_plan("codex").await.unwrap().attempts[0]
+            .provider
+            .clone();
+        let mut other = db.get_provider_group("group-1").unwrap().unwrap();
+        other.id = "group-2".into();
+        other.name = "Second pool".into();
+        other.key_pool_enabled = false;
+        db.create_provider_group(&other).unwrap();
+        db.assign_provider_group(
+            "codex",
+            &original.id,
+            Some(&other.id),
+            None,
+            Some(true),
+            Some(true),
+        )
+        .unwrap();
+        other.key_pool_enabled = true;
+        db.update_provider_group(&other).unwrap();
+        router.select_route_plan("codex").await.unwrap();
+
+        router
+            .record_result_for_provider(&original, "codex", false, false, None)
+            .await
+            .unwrap();
+
+        let mut status =
+            crate::services::provider_groups::ProviderGroupService::group_status(&db, &other.id)
+                .unwrap();
+        router.fill_key_pool_status(&mut status).await;
+        assert_eq!(status.members.len(), 1);
+        assert!(
+            !status.members[0].cooling_down,
+            "an old request must not cool its member's new pool"
+        );
+        assert_eq!(status.members[0].consecutive_failures, 0);
+        let current = db
+            .get_provider_by_id(&original.id, "codex")
+            .unwrap()
+            .unwrap();
+        router
+            .record_result_for_provider(&current, "codex", false, false, None)
+            .await
+            .unwrap();
+        router
+            .record_result_for_provider(&original, "codex", false, true, None)
+            .await
+            .unwrap();
+        router.fill_key_pool_status(&mut status).await;
+        assert!(
+            status.members[0].cooling_down,
+            "an old success must not clear the new pool's cooldown"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn key_pool_late_failure_does_not_cool_replaced_credentials() {
+        let _home = TempHome::new();
+        let (db, router) = key_pool_fixture();
+        let original = router.select_route_plan("codex").await.unwrap().attempts[0]
+            .provider
+            .clone();
+        let mut current = original.clone();
+        current.settings_config["auth"]["OPENAI_API_KEY"] = json!("replacement-fixture-key");
+        db.save_provider("codex", &current).unwrap();
+        router
+            .record_result_for_provider(&original, "codex", false, false, None)
+            .await
+            .unwrap();
+        let mut status =
+            crate::services::provider_groups::ProviderGroupService::group_status(&db, "group-1")
+                .unwrap();
+        router.fill_key_pool_status(&mut status).await;
+        assert!(!status.members[0].cooling_down);
+        assert_eq!(status.members[0].consecutive_failures, 0);
     }
 }

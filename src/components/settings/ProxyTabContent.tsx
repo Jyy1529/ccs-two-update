@@ -27,6 +27,7 @@ import { ToggleRow } from "@/components/ui/toggle-row";
 import { useProxyStatus } from "@/hooks/useProxyStatus";
 import type { SettingsFormState } from "@/hooks/useSettings";
 import { getAppLabel, PROXY_APP_IDS } from "@/config/appConfig";
+import { useAppManagementState } from "@/lib/query/appManagement";
 
 interface ProxyTabContentProps {
   settings: SettingsFormState;
@@ -43,6 +44,7 @@ export function ProxyTabContent({
   onAutoSave,
 }: ProxyTabContentProps) {
   const { t } = useTranslation();
+  const management = useAppManagementState();
   const [showProxyConfirm, setShowProxyConfirm] = useState(false);
   const [showFailoverConfirm, setShowFailoverConfirm] = useState(false);
 
@@ -215,7 +217,15 @@ export function ProxyTabContent({
                 </TabsList>
                 {FAILOVER_APPS.map(({ id: appType }) => {
                   const failoverDisabled =
-                    !isRunning || !(takeoverStatus?.[appType] ?? false);
+                    !isRunning ||
+                    !(takeoverStatus?.[appType] ?? false) ||
+                    !management.isSuccess ||
+                    !management.data.apps.some(
+                      (app) =>
+                        app.appId === appType &&
+                        app.enabled &&
+                        app.phase === "managed",
+                    );
                   return (
                     <TabsContent
                       key={appType}

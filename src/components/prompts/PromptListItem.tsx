@@ -12,6 +12,7 @@ interface PromptListItemProps {
   onEdit: (id: string) => void;
   onDelete: (id: string) => void;
   disabled?: boolean;
+  toggleDisabled?: boolean;
   deleteDisabled?: boolean;
   deleteTitle?: string;
 }
@@ -23,6 +24,7 @@ const PromptListItem: React.FC<PromptListItemProps> = ({
   onEdit,
   onDelete,
   disabled = false,
+  toggleDisabled = false,
   deleteDisabled = false,
   deleteTitle,
 }) => {
@@ -34,11 +36,14 @@ const PromptListItem: React.FC<PromptListItemProps> = ({
     <div className="group relative h-16 rounded-xl border border-border-default bg-muted/50 p-4 transition-all duration-300 hover:bg-muted hover:border-border-default/80 hover:shadow-sm">
       <div className="flex items-center gap-4 h-full">
         {/* Toggle 开关 */}
-        <div className="flex-shrink-0">
+        <div
+          className="flex-shrink-0"
+          title={toggleDisabled ? t("appManagement.databaseOnly") : undefined}
+        >
           <PromptToggle
             enabled={enabled}
             onChange={(newEnabled) => onToggle(id, newEnabled)}
-            disabled={disabled}
+            disabled={disabled || toggleDisabled}
           />
         </div>
 

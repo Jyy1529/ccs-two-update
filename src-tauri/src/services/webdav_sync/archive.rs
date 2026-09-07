@@ -141,6 +141,7 @@ pub(crate) fn restore_skills_zip(raw: &[u8]) -> Result<(), AppError> {
         )
     })?;
     let bak = ssot.with_extension("bak");
+    let _permission = crate::app_management::permit_path(&ssot)?;
 
     if ssot.exists() {
         if bak.exists() {
@@ -193,6 +194,7 @@ pub(crate) fn backup_current_skills() -> Result<SkillsBackup, AppError> {
 }
 
 pub(crate) fn restore_skills_from_backup(backup: &SkillsBackup) -> Result<(), AppError> {
+    let _permission = crate::app_management::permit_path(&backup.ssot_path)?;
     if backup.ssot_path.exists() {
         fs::remove_dir_all(&backup.ssot_path).map_err(|e| AppError::io(&backup.ssot_path, e))?;
     }

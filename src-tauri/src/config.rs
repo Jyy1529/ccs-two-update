@@ -206,6 +206,9 @@ pub fn get_app_config_dir() -> PathBuf {
     }
 
     let default_dir = get_home_dir().join(".cc-switch");
+    // An explicit test home must never discover a real legacy database through
+    // an ambient HOME value on Windows.
+    if std::env::var_os("CC_SWITCH_TEST_HOME").is_some() { return default_dir; }
 
     // 兼容 v3.10.3：当用户环境存在 `HOME` 且与真实用户目录不同，
     // v3.10.3 可能在 `HOME/.cc-switch/` 下创建/使用了数据库。
@@ -274,7 +277,7 @@ pub fn read_json_file<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<T, AppE
 }
 
 /// 递归排序 JSON 对象的键（按字母顺序），确保序列化输出是确定性的
-fn sort_json_keys(value: &Value) -> Value {
+pub(crate) fn sort_json_keys(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
             let mut sorted_map = Map::new();
@@ -295,6 +298,7 @@ pub fn write_json_file_with_contents<T: Serialize>(
     path: &Path,
     data: &T,
 ) -> Result<Vec<u8>, AppError> {
+    let _permission = crate::app_management::permit_path(path)?;
     // 确保目录存在
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
@@ -307,7 +311,7 @@ pub fn write_json_file_with_contents<T: Serialize>(
 
     let contents = json.into_bytes();
     atomic_write(path, &contents)?;
-    Ok(contents)
+    fs::read(path).map_err(|error| AppError::io(path, error))
 }
 
 /// 写入 JSON 配置文件（键按字母排序，确保确定性输出）
@@ -317,6 +321,7 @@ pub fn write_json_file<T: Serialize>(path: &Path, data: &T) -> Result<(), AppErr
 
 /// 原子写入文本文件（用于 TOML/纯文本）
 pub fn write_text_file(path: &Path, data: &str) -> Result<(), AppError> {
+    let _permission = crate::app_management::permit_path(path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
     }
@@ -325,11 +330,18 @@ pub fn write_text_file(path: &Path, data: &str) -> Result<(), AppError> {
 
 /// 原子写入：写入临时文件后 rename 替换，避免半写状态
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
-    atomic_write_with_unix_mode(path, data, None)
+    let _permission = crate::app_management::permit_path(path)?;
+    crate::services::config_guard::guarded_write(path, data, |bytes| atomic_write_with_unix_mode(path, bytes, None))
 }
 
 /// 原子写入包含凭据的文件。Unix 上新文件和替换文件始终使用 0600。
 pub fn atomic_write_private(path: &Path, data: &[u8]) -> Result<(), AppError> {
+    let _permission = crate::app_management::permit_path(path)?;
+    crate::services::config_guard::guarded_write(path, data, |bytes| atomic_write_with_unix_mode(path, bytes, Some(0o600)))
+}
+
+/// Device-local control metadata only; native writers use the guarded APIs.
+pub(crate) fn atomic_write_private_raw(path: &Path, data: &[u8]) -> Result<(), AppError> {
     atomic_write_with_unix_mode(path, data, Some(0o600))
 }
 
@@ -338,7 +350,7 @@ fn atomic_write_with_unix_mode(
     data: &[u8],
     unix_mode: Option<u32>,
 ) -> Result<(), AppError> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let _ = unix_mode;
 
     if let Some(parent) = path.parent() {
@@ -385,6 +397,20 @@ fn atomic_write_with_unix_mode(
         let (candidate, source) = last_collision.expect("temporary filename loop must run");
         Err(AppError::io(&candidate, source))
     })()?;
+
+    #[cfg(windows)]
+    if unix_mode.is_some() {
+        // Apply the protected DACL before any secret bytes enter the temporary
+        // file. ReplaceFile preserves the old destination DACL, so restrict an
+        // existing destination before replacing it as well.
+        if let Err(error) = restrict_private_file(&tmp).and_then(|_| {
+            if path.exists() { restrict_private_file(path) } else { Ok(()) }
+        }) {
+            drop(file);
+            let _ = fs::remove_file(&tmp);
+            return Err(error);
+        }
+    }
 
     if let Err(source) = file.write_all(data).and_then(|_| file.flush()) {
         drop(file);
@@ -496,6 +522,28 @@ fn atomic_write_with_unix_mode(
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn restrict_private_file(path: &Path) -> Result<(), AppError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            SetFileSecurityW, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION},
+    };
+    // OW = the file owner, SY = LocalSystem. No inherited Users/Everyone ACEs.
+    let sddl: Vec<u16> = "D:P(A;;FA;;;OW)(A;;FA;;;SY)".encode_utf16().chain(Some(0)).collect();
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: NUL-terminated buffers live throughout these calls; descriptor is
+    // allocated by Windows and released exactly once with LocalFree.
+    let converted = unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), 1, &mut descriptor, std::ptr::null_mut()) };
+    if converted == 0 { return Err(AppError::io(path, std::io::Error::last_os_error())); }
+    let success = unsafe { SetFileSecurityW(wide.as_ptr(), DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, descriptor) };
+    let error = if success == 0 { Some(std::io::Error::last_os_error()) } else { None };
+    unsafe { LocalFree(descriptor); }
+    match error { Some(error) => Err(AppError::io(path, error)), None => Ok(()) }
 }
 
 #[cfg(test)]
@@ -755,15 +803,14 @@ mod tests {
 
 /// 复制文件
 pub fn copy_file(from: &Path, to: &Path) -> Result<(), AppError> {
-    fs::copy(from, to).map_err(|e| AppError::IoContext {
-        context: format!("复制文件失败 ({} -> {})", from.display(), to.display()),
-        source: e,
-    })?;
-    Ok(())
+    let bytes = fs::read(from).map_err(|error| AppError::io(from, error))?;
+    atomic_write(to, &bytes)
 }
 
 /// 删除文件
 pub fn delete_file(path: &Path) -> Result<(), AppError> {
+    let _permission = crate::app_management::permit_path(path)?;
+    crate::services::config_guard::require_delete(path)?;
     if path.exists() {
         fs::remove_file(path).map_err(|e| AppError::io(path, e))?;
     }

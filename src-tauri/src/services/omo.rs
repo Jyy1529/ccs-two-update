@@ -1,4 +1,5 @@
 use crate::config::{atomic_write, get_home_dir, write_json_file_with_contents};
+use crate::app_config::AppType;
 use crate::error::AppError;
 use crate::opencode_config::get_opencode_dir;
 use crate::provider::Provider;
@@ -863,6 +864,7 @@ impl OmoService {
     }
 
     fn restore_config_file(path: &Path, snapshot: Option<&[u8]>) -> Result<(), AppError> {
+        let _permission = crate::app_management::permit_path(path)?;
         match snapshot {
             Some(bytes) => atomic_write(path, bytes),
             None => match std::fs::remove_file(path) {
@@ -902,8 +904,10 @@ impl OmoService {
         let merged = Self::build_config(v, profile_data);
         let location = Self::config_location(v, &home_dir, legacy_dir)?;
         let config_path = location.path().to_path_buf();
+        crate::app_management::require_managed(&AppType::OpenCode)?;
 
         if let Some(parent) = config_path.parent() {
+            let _permission = crate::app_management::permit_path(&config_path)?;
             std::fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
         }
 
@@ -950,6 +954,7 @@ impl OmoService {
     // ── Public API (variant-parameterized) ─────────────────
 
     pub fn delete_config_file(v: &OmoVariant) -> Result<(), AppError> {
+        crate::app_management::require_managed(&AppType::OpenCode)?;
         let _operation_guard = omo_operation_lock().lock()?;
         let plugin_config_path = crate::opencode_config::get_opencode_config_path();
         let base_dir = plugin_config_path
@@ -978,6 +983,7 @@ impl OmoService {
             }
             for path in &legacy_paths {
                 let _guard = omo_write_lock().lock()?;
+                let _permission = crate::app_management::permit_path(path)?;
                 let snapshot = Self::snapshot_config_file(path)?;
                 if snapshot.is_none() {
                     continue;

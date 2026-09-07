@@ -54,7 +54,7 @@ use std::sync::Mutex;
 
 /// 当前 Schema 版本号
 /// 每次修改表结构时递增，并在 schema.rs 中添加相应的迁移逻辑
-pub(crate) const SCHEMA_VERSION: i32 = 18;
+pub(crate) const SCHEMA_VERSION: i32 = 21;
 
 /// 安全地序列化 JSON，避免 unwrap panic
 pub(crate) fn to_json_string<T: Serialize>(value: &T) -> Result<String, AppError> {
@@ -80,6 +80,7 @@ pub(crate) use lock_conn;
 /// rusqlite::Connection 本身不是 Sync 的，因此需要这层包装。
 pub struct Database {
     pub(crate) conn: Mutex<Connection>,
+    diagnostic: bool,
 }
 
 fn register_db_change_hook(conn: &Connection) {
@@ -122,6 +123,7 @@ impl Database {
 
         let db = Self {
             conn: Mutex::new(conn),
+            diagnostic: false,
         };
         db.create_tables()?;
 
@@ -196,12 +198,24 @@ impl Database {
 
         let db = Self {
             conn: Mutex::new(conn),
+            diagnostic: false,
         };
         db.create_tables()?;
         db.ensure_model_pricing_seeded()?;
 
         Ok(db)
     }
+
+    /// Isolated runtime state with no cloud-sync hooks or filesystem initialization.
+    pub(crate) fn diagnostic_memory() -> Result<Self, AppError> {
+        let conn = Connection::open_in_memory().map_err(|error| AppError::Database(error.to_string()))?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;").map_err(|error| AppError::Database(error.to_string()))?;
+        let db = Self { conn: Mutex::new(conn), diagnostic: true };
+        db.create_tables()?;
+        Ok(db)
+    }
+
+    pub(crate) fn is_diagnostic(&self) -> bool { self.diagnostic }
 
     pub(crate) fn get_auto_vacuum_mode(conn: &Connection) -> Result<i32, AppError> {
         conn.query_row("PRAGMA auto_vacuum;", [], |row| row.get(0))

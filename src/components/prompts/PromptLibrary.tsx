@@ -12,6 +12,7 @@ interface PromptLibraryProps {
   searchQuery: string;
   statusText: string;
   disabled?: boolean;
+  toggleDisabled?: boolean;
   onSearchQueryChange: (value: string) => void;
   onToggle: (id: string, enabled: boolean) => void;
   onEdit: (id: string) => void;
@@ -26,6 +27,7 @@ export function PromptLibrary({
   searchQuery,
   statusText,
   disabled = false,
+  toggleDisabled = false,
   onSearchQueryChange,
   onToggle,
   onEdit,
@@ -102,6 +104,7 @@ export function PromptLibrary({
                   onEdit={onEdit}
                   onDelete={onDelete}
                   disabled={disabled}
+                  toggleDisabled={toggleDisabled}
                   deleteDisabled={isDeleteDisabled?.(id, prompt)}
                   deleteTitle={getDeleteTitle?.(id, prompt)}
                 />

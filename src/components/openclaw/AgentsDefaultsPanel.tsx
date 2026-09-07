@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import { useAppManagement } from "@/lib/query/appManagement";
 import { Save, Plus, Trash2, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -26,6 +27,7 @@ const UNSET_SENTINEL = "__unset__";
 
 const AgentsDefaultsPanel: React.FC = () => {
   const { t } = useTranslation();
+  const { canWrite } = useAppManagement("openclaw");
   const { data: agentsData, isLoading } = useOpenClawAgentsDefaults();
   const saveAgentsMutation = useSaveOpenClawAgentsDefaults();
   const { options: modelOptions, isLoading: modelsLoading } =
@@ -128,6 +130,7 @@ const AgentsDefaultsPanel: React.FC = () => {
   };
 
   const handleSave = async () => {
+    if (!canWrite) return;
     try {
       // Preserve all unknown fields from original data
       const updated: OpenClawAgentsDefaults = { ...defaults };
@@ -400,7 +403,8 @@ const AgentsDefaultsPanel: React.FC = () => {
         <Button
           size="sm"
           onClick={handleSave}
-          disabled={saveAgentsMutation.isPending}
+          disabled={saveAgentsMutation.isPending || !canWrite}
+          title={!canWrite ? t("appManagement.databaseOnly") : undefined}
         >
           <Save className="w-4 h-4 mr-1" />
           {saveAgentsMutation.isPending ? t("common.saving") : t("common.save")}

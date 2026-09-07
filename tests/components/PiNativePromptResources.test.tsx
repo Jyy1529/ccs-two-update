@@ -15,6 +15,7 @@ import {
   type PiPromptTemplatesHandle,
 } from "@/components/prompts/PiNativePromptResources";
 import { promptsApi, type PiPromptFileKind } from "@/lib/api/prompts";
+import { managementFixture } from "../utils/safetyTestUtils";
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
@@ -67,13 +68,16 @@ vi.mock("@/components/common/FullScreenPanel", () => ({
     ) : null,
 }));
 
-const createClient = () =>
-  new QueryClient({
+const createClient = () => {
+  const client = new QueryClient({
     defaultOptions: {
       queries: { retry: false },
       mutations: { retry: false },
     },
   });
+  client.setQueryData(["appManagement"], managementFixture());
+  return client;
+};
 
 const renderWithQueryClient = (
   ui: ReactNode,

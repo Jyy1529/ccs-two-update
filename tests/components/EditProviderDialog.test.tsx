@@ -1,10 +1,8 @@
+import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import {
-  act,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+  managementFixture,
+  renderManagedUi as render,
+} from "../utils/safetyTestUtils";
 import { useEffect } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Provider } from "@/types";
@@ -157,6 +155,42 @@ describe("EditProviderDialog", () => {
     apiMocks.getOpenClawLiveProvider.mockReset();
   });
 
+  it("keeps database-only editing available without importing live settings while unmanaged", async () => {
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    const provider: Provider = {
+      id: "unmanaged-db",
+      name: "Stored provider",
+      settingsConfig: { config: "model = 'stored-model'", auth: {} },
+    };
+    render(
+      <EditProviderDialog
+        open
+        appId="codex"
+        provider={provider}
+        onOpenChange={vi.fn()}
+        onSubmit={onSubmit}
+      />,
+      managementFixture({ codex: { enabled: false, phase: "unmanaged" } }),
+    );
+    expect(await screen.findByTestId("settings-config")).toHaveTextContent(
+      "stored-model",
+    );
+    expect(apiMocks.getCurrent).not.toHaveBeenCalled();
+    expect(apiMocks.getLiveProviderSettings).not.toHaveBeenCalled();
+    fireEvent.click(
+      screen.getByRole("button", { name: "appManagement.saveDatabaseOnly" }),
+    );
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenCalledWith({
+        provider: expect.objectContaining({
+          id: provider.id,
+          settingsConfig: provider.settingsConfig,
+        }),
+        originalId: provider.id,
+      }),
+    );
+  });
+
   it("保留 Codex 数据库中的 modelCatalog，避免 live 配置缺字段时清空模型映射", async () => {
     const dbModelCatalog = {
       models: [
@@ -216,6 +250,147 @@ describe("EditProviderDialog", () => {
       ...liveSettings,
       modelCatalog: dbModelCatalog,
     });
+  });
+
+  it("uses the current Codex live bearer with the stored provider auth template", async () => {
+    const provider: Provider = {
+      id: "provider-a",
+      name: "Provider A",
+      category: "custom",
+      settingsConfig: {
+        auth: {
+          OPENAI_API_KEY: "sk-db-stale",
+          provider_note: "keep-me",
+        },
+        config:
+          'model_provider = "custom"\n[model_providers.custom]\nbase_url = "https://proxy.example/v1"\n',
+      },
+    };
+    const liveSettings = {
+      // Shared auth.json belongs to another provider / official login cache.
+      auth: {
+        OPENAI_API_KEY: "sk-shared-other-provider",
+        tokens: { account_id: "shared-account" },
+      },
+      config:
+        'model_provider = "custom"\n[model_providers.custom]\nbase_url = "https://proxy.example/v1"\nexperimental_bearer_token = "sk-provider-a"\n',
+    };
+    const handleSubmit = vi.fn().mockResolvedValue(undefined);
+
+    apiMocks.getCurrent.mockResolvedValue(provider.id);
+    apiMocks.getLiveProviderSettings.mockResolvedValue(liveSettings);
+
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+        appId="codex"
+      />,
+    );
+
+    const expectedSettings = {
+      ...liveSettings,
+      auth: {
+        OPENAI_API_KEY: "sk-provider-a",
+        provider_note: "keep-me",
+      },
+    };
+
+    await waitFor(() => {
+      expect(
+        JSON.parse(screen.getByTestId("settings-config").textContent ?? "{}"),
+      ).toEqual(expectedSettings);
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "common.save" }));
+
+    await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
+    expect(handleSubmit.mock.calls[0][0].provider.settingsConfig).toEqual(
+      expectedSettings,
+    );
+  });
+
+  it("does not convert an OAuth-only Codex provider into an API-key provider", async () => {
+    const provider: Provider = {
+      id: "oauth-provider",
+      name: "OAuth Provider",
+      category: "custom",
+      settingsConfig: {
+        auth: {
+          auth_mode: "chatgpt",
+          tokens: { account_id: "stored-account" },
+        },
+        config: 'model_provider = "custom"\n',
+      },
+    };
+    const liveSettings = {
+      auth: {
+        auth_mode: "chatgpt",
+        tokens: { account_id: "live-account" },
+      },
+      config:
+        'model_provider = "custom"\nexperimental_bearer_token = "sk-route-only"\n',
+    };
+
+    apiMocks.getCurrent.mockResolvedValue(provider.id);
+    apiMocks.getLiveProviderSettings.mockResolvedValue(liveSettings);
+
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+        appId="codex"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(
+        JSON.parse(screen.getByTestId("settings-config").textContent ?? "{}"),
+      ).toEqual(liveSettings);
+    });
+  });
+
+  it("does not let a stored bearer override a non-current Codex provider auth", async () => {
+    const provider: Provider = {
+      id: "provider-a",
+      name: "Provider A",
+      category: "custom",
+      settingsConfig: {
+        auth: { OPENAI_API_KEY: "sk-db-authoritative" },
+        config:
+          'model_provider = "custom"\nexperimental_bearer_token = "sk-leftover-live"\n',
+      },
+    };
+    const handleSubmit = vi.fn().mockResolvedValue(undefined);
+
+    apiMocks.getCurrent.mockResolvedValue("provider-b");
+
+    render(
+      <EditProviderDialog
+        open
+        provider={provider}
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+        appId="codex"
+      />,
+    );
+
+    await waitFor(() => expect(apiMocks.getCurrent).toHaveBeenCalledTimes(1));
+    expect(apiMocks.getLiveProviderSettings).not.toHaveBeenCalled();
+    expect(
+      JSON.parse(screen.getByTestId("settings-config").textContent ?? "{}"),
+    ).toEqual(provider.settingsConfig);
+
+    fireEvent.click(screen.getByRole("button", { name: "common.save" }));
+
+    await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
+    expect(handleSubmit.mock.calls[0][0].provider.settingsConfig).toEqual(
+      provider.settingsConfig,
+    );
   });
 
   it("代理接管中编辑 Codex 供应商时展示数据库配置而不是读取 live 代理配置", async () => {

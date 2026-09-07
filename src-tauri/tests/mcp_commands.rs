@@ -1308,7 +1308,8 @@ fn sync_all_enabled_removes_known_disabled_but_preserves_unknown_live_entries() 
         })
         .expect("save enabled server");
 
-    McpService::sync_all_enabled(&state).expect("reconcile mcp");
+    assert!(McpService::sync_all_enabled(&state).is_err(), "unbaselined removal requires review");
+    support::approve_configuration_conflicts(AppType::Claude, Some(&state));
 
     let text = fs::read_to_string(&mcp_path).expect("read claude mcp");
     let value: serde_json::Value = serde_json::from_str(&text).expect("parse claude mcp");
@@ -1329,4 +1330,82 @@ fn sync_all_enabled_removes_known_disabled_but_preserves_unknown_live_entries() 
         servers.contains_key("external-only"),
         "live entries unknown to DB should be preserved"
     );
+}
+
+#[test]
+fn batch_mcp_review_applies_every_change_for_all_six_supported_apps() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    for (app, filename, section) in [
+        (AppType::Claude, ".claude.json", "mcpServers"),
+        (AppType::Codex, "config.toml", "mcp_servers"),
+        (AppType::Gemini, "settings.json", "mcpServers"),
+        (AppType::GrokBuild, "config.toml", "mcp_servers"),
+        (AppType::OpenCode, "opencode.json", "mcp"),
+        (AppType::Hermes, "config.yaml", "mcp_servers"),
+    ] {
+        reset_test_fs();
+        let state = create_test_state().expect("create test state");
+        let path = cc_switch_lib::get_config_guard_state(app.as_str().to_string())
+            .expect("read registered files")
+            .files
+            .into_iter()
+            .map(|file| std::path::PathBuf::from(file.path))
+            .find(|path| path.file_name().is_some_and(|name| name == filename))
+            .expect("registered MCP path");
+        fs::create_dir_all(path.parent().expect("MCP parent")).expect("create MCP directory");
+        let external = if app == AppType::OpenCode {
+            json!({"type": "local", "command": ["npx", "synthetic-mcp"], "localOption": 7})
+        } else {
+            json!({"command": "npx", "args": ["synthetic-mcp"], "localOption": 7})
+        };
+        let initial = json!({
+            "user_setting": {"keep": true},
+            (section): {
+                "managed-disabled": external.clone(),
+                "external-only": external.clone()
+            }
+        });
+        let initial_text = match app {
+            AppType::Codex | AppType::GrokBuild => toml::to_string(&initial).expect("serialize TOML"),
+            AppType::Hermes => serde_yaml::to_string(&initial).expect("serialize YAML"),
+            _ => serde_json::to_string_pretty(&initial).expect("serialize JSON"),
+        };
+        fs::write(&path, &initial_text).expect("seed client MCP config");
+        for (id, enabled) in [
+            ("managed-disabled", false),
+            ("managed-enabled-a", true),
+            ("managed-enabled-b", true),
+        ] {
+            let mut apps = McpApps::default();
+            apps.set_enabled_for(&app, enabled);
+            state.db.save_mcp_server(&McpServer {
+                id: id.into(),
+                name: id.into(),
+                server: json!({"type": "stdio", "command": "echo", "args": [id]}),
+                apps,
+                description: None,
+                homepage: None,
+                docs: None,
+                tags: vec![],
+            }).expect("save known MCP server");
+        }
+        assert!(McpService::sync_enabled_for_app(&state, &app).is_err(), "{app:?} must require review");
+        assert_eq!(fs::read_to_string(&path).unwrap(), initial_text, "{app:?} wrote before review");
+        support::approve_configuration_conflicts(app.clone(), Some(&state));
+        let updated = fs::read_to_string(&path).expect("read approved config");
+        let value: serde_json::Value = match app {
+            AppType::Codex | AppType::GrokBuild => toml::from_str(&updated).expect("parse TOML"),
+            AppType::Hermes => serde_yaml::from_str(&updated).expect("parse YAML"),
+            _ => serde_json::from_str(&updated).expect("parse JSON"),
+        };
+        let servers = value[section].as_object().expect("MCP servers map");
+        assert!(!servers.contains_key("managed-disabled"), "{app:?} kept a disabled server");
+        assert!(servers.contains_key("managed-enabled-a"), "{app:?} missed first enabled server");
+        assert!(servers.contains_key("managed-enabled-b"), "{app:?} missed second enabled server");
+        assert_eq!(servers["external-only"], external, "{app:?} changed an unknown server");
+        assert_eq!(value["user_setting"], initial["user_setting"]);
+        McpService::sync_enabled_for_app(&state, &app).expect("repeating the approved projection");
+        assert!(cc_switch_lib::get_config_guard_state(app.as_str().to_string())
+            .unwrap().pending_changes.is_empty());
+    }
 }

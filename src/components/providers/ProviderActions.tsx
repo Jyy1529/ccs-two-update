@@ -6,6 +6,7 @@ import {
   ChevronDown,
   Copy,
   Edit,
+  FlaskConical,
   Loader2,
   Minus,
   Play,
@@ -44,6 +45,8 @@ interface ProviderActionsProps {
   onDuplicate?: () => void;
   onTransfer?: () => void;
   onTest?: () => void;
+  onValidate?: () => void;
+  isManagementDisabled?: boolean;
   onConfigureUsage?: () => void;
   onDelete: () => void;
   onRemoveFromConfig?: () => void;
@@ -87,6 +90,8 @@ export function ProviderActions({
   onDuplicate,
   onTransfer,
   onTest,
+  onValidate,
+  isManagementDisabled = false,
   onConfigureUsage,
   onDelete,
   onRemoveFromConfig,
@@ -119,6 +124,7 @@ export function ProviderActions({
   const piStateChangeHint = t("pi.current.stateUnavailableHint");
 
   const handleMainButtonClick = () => {
+    if (isManagementDisabled) return;
     if (isOmo) {
       if (isCurrent) {
         onDisableOmo?.();
@@ -144,6 +150,16 @@ export function ProviderActions({
   };
 
   const getMainButtonState = (): MainButtonState => {
+    if (isManagementDisabled) {
+      return {
+        disabled: true,
+        variant: "secondary",
+        className: "opacity-60 cursor-not-allowed",
+        icon: <Minus className="h-4 w-4" />,
+        text: t("appManagement.phases.unmanaged"),
+        title: t("appManagement.databaseOnly"),
+      };
+    }
     if (isOmo) {
       if (isCurrent) {
         return {
@@ -312,6 +328,7 @@ export function ProviderActions({
                     size="sm"
                     variant="default"
                     className={defaultButtonClassName}
+                    disabled={isManagementDisabled}
                   >
                     <Zap className="h-4 w-4" />
                     {inactiveLabel}
@@ -330,6 +347,7 @@ export function ProviderActions({
                   {defaultModelOptions.map((model) => (
                     <DropdownMenuItem
                       key={model.id}
+                      disabled={isManagementDisabled}
                       onSelect={() => onSetAsDefault(model.id)}
                       className="flex min-w-0 flex-col items-start gap-0.5"
                     >
@@ -357,7 +375,7 @@ export function ProviderActions({
                   ? undefined
                   : () => onSetAsDefault(defaultModelOptions[0]?.id)
               }
-              disabled={isDefaultModel}
+              disabled={isDefaultModel || isManagementDisabled}
               className={defaultButtonClassName}
             >
               <Zap className="h-4 w-4" />
@@ -388,6 +406,18 @@ export function ProviderActions({
       </span>
 
       <div className="flex items-center gap-1">
+        {onValidate && (
+          <Button
+            size="icon"
+            variant="ghost"
+            onClick={onValidate}
+            aria-label={t("modelValidation.action")}
+            title={t("modelValidation.action")}
+            className={iconButtonClass}
+          >
+            <FlaskConical className="h-4 w-4" />
+          </Button>
+        )}
         <Button
           size="icon"
           variant="ghost"

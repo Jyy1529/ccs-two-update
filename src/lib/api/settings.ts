@@ -67,7 +67,10 @@ export const settingsApi = {
   },
 
   async save(settings: Settings): Promise<boolean> {
-    return await invoke("save_settings", { settings });
+    // A stale settings form must not overwrite device-local management state.
+    const payload = { ...settings } as Settings & { managedApps?: unknown };
+    delete payload.managedApps;
+    return await invoke("save_settings", { settings: payload });
   },
 
   /** 是否存在统一 Codex 会话历史的迁移备份（关闭弹窗据此显示"恢复备份"勾选） */
