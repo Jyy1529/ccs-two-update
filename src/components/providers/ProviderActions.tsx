@@ -11,6 +11,7 @@ import {
   Minus,
   Play,
   Plus,
+  SquareTerminal,
   Terminal,
   Trash2,
   Zap,
@@ -45,6 +46,7 @@ interface ProviderActionsProps {
   onDuplicate?: () => void;
   onTransfer?: () => void;
   onTest?: () => void;
+  onApiRequest?: () => void;
   onValidate?: () => void;
   isManagementDisabled?: boolean;
   onConfigureUsage?: () => void;
@@ -90,6 +92,7 @@ export function ProviderActions({
   onDuplicate,
   onTransfer,
   onTest,
+  onApiRequest,
   onValidate,
   isManagementDisabled = false,
   onConfigureUsage,
@@ -476,6 +479,19 @@ export function ProviderActions({
             <Activity className="h-4 w-4" />
           )}
         </Button>
+
+        {onApiRequest && (
+          <Button
+            size="icon"
+            variant="ghost"
+            onClick={onApiRequest}
+            aria-label={t("apiRequest.title", "API 请求调试")}
+            title={t("apiRequest.title", "API 请求调试")}
+            className={iconButtonClass}
+          >
+            <SquareTerminal className="h-4 w-4" />
+          </Button>
+        )}
 
         <Button
           size="icon"

@@ -16,8 +16,8 @@ export interface ModelFetchOptions {
 /**
  * 从供应商获取可用模型列表
  *
- * 使用 OpenAI 兼容的 GET /v1/models 端点。优先用 `modelsUrl` 精确覆写；
- * 否则后端会对 baseURL 生成候选列表并按序尝试（含"剥离 /anthropic 等兼容子路径"兜底）。
+ * OpenAI / Anthropic 使用 /v1/models 候选列表；原生 Gemini 使用其模型端点和分页。
+ * `modelsUrl` 可精确覆写列表 URL；apiFormat 决定鉴权与原生协议。
  */
 export async function fetchModelsForConfig(
   baseUrl: string,

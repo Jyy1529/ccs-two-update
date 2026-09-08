@@ -89,8 +89,8 @@ fn parse_opencode_models(output: &str) -> Vec<OpenCodeModelRef> {
 
 /// 获取供应商的可用模型列表
 ///
-/// 使用 OpenAI 兼容的 GET /v1/models 端点。优先使用 `models_url` 精确覆写；
-/// 否则对 baseURL 生成候选列表（含「剥离 Anthropic 兼容子路径」兜底），按序尝试。
+/// OpenAI / Anthropic 使用 /v1/models 候选列表；原生 Gemini 使用其模型端点和分页。
+/// `models_url` 可以精确覆写模型列表 URL。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fetch_models_for_config(
     base_url: String,

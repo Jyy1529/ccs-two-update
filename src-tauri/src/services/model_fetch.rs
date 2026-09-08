@@ -1,6 +1,6 @@
 //! 模型列表获取服务
 //!
-//! 通过 OpenAI 兼容的 GET /v1/models 端点获取供应商可用模型列表。
+//! 通过 OpenAI / Anthropic 兼容的 GET /v1/models 或原生 Gemini 模型端点获取列表。
 //! 主要面向第三方聚合站（硅基流动、OpenRouter 等），以及把 Anthropic
 //! 协议挂在兼容子路径上的官方供应商（DeepSeek、Kimi、智谱 GLM 等）。
 
@@ -195,7 +195,7 @@ const KNOWN_COMPAT_SUFFIXES: &[&str] = &[
 
 /// 获取供应商的可用模型列表
 ///
-/// 使用 OpenAI 兼容的 GET /v1/models 端点，按候选列表顺序尝试。
+/// OpenAI / Anthropic 使用候选端点；原生 Gemini 使用自己的路径和分页格式。
 pub async fn fetch_models(
     base_url: &str,
     api_key: &str,
@@ -205,15 +205,18 @@ pub async fn fetch_models(
     api_format: Option<&str>,
     request_headers: Option<&BTreeMap<String, String>>,
 ) -> Result<Vec<FetchedModel>, String> {
-    let candidates = build_models_url_candidates(base_url, is_full_url, models_url_override)?;
     let headers =
         build_model_fetch_headers(api_key, api_format, user_agent.as_ref(), request_headers)?;
-    let client = crate::proxy::http_client::get();
-    let mut last_err: Option<String> = None;
     let mut known_secrets = vec![api_key.to_string()];
     if let Some(request_headers) = request_headers {
         known_secrets.extend(request_headers.values().cloned());
     }
+    if api_format == Some("google-generative-ai") {
+        return fetch_google_models(base_url, models_url_override, headers, &known_secrets).await;
+    }
+    let candidates = build_models_url_candidates(base_url, is_full_url, models_url_override)?;
+    let client = crate::proxy::http_client::get();
+    let mut last_err: Option<String> = None;
 
     for url in &candidates {
         log::debug!(
@@ -278,6 +281,137 @@ pub async fn fetch_models(
     ))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleModelsResponse {
+    #[serde(default)]
+    models: Vec<GoogleModel>,
+    next_page_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleModel {
+    name: String,
+    input_token_limit: Option<u64>,
+    supported_generation_methods: Option<Vec<String>>,
+}
+
+fn google_models_url(base_url: &str, override_url: Option<&str>) -> Result<Url, String> {
+    let explicit = override_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut url =
+        Url::parse(explicit.unwrap_or(base_url).trim()).map_err(|_| "Invalid Gemini models URL")?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("Invalid Gemini models URL".to_string());
+    }
+    if explicit.is_none() {
+        let path = url.path().trim_end_matches('/');
+        let prefix =
+            if path.ends_with(":generateContent") || path.ends_with(":streamGenerateContent") {
+                path.rsplit_once("/models/")
+                    .map_or(path, |(prefix, _)| prefix)
+            } else {
+                path.strip_suffix("/models").unwrap_or(path)
+            };
+        let versioned = prefix.ends_with("/v1beta") || prefix.ends_with("/v1");
+        let path = format!("{prefix}{}/models", if versioned { "" } else { "/v1beta" });
+        url.set_path(&path);
+        let params: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(name, _)| name != "alt")
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect();
+        url.set_query(None);
+        if !params.is_empty() {
+            url.query_pairs_mut().extend_pairs(params);
+        }
+    }
+    Ok(url)
+}
+
+async fn fetch_google_models(
+    base_url: &str,
+    override_url: Option<&str>,
+    headers: HeaderMap,
+    known_secrets: &[String],
+) -> Result<Vec<FetchedModel>, String> {
+    let base = google_models_url(base_url, override_url)?;
+    let client =
+        crate::proxy::http_client::create_with_redirect_policy(reqwest::redirect::Policy::none())?;
+    tokio::time::timeout(Duration::from_secs(FETCH_TIMEOUT_SECS), async {
+        let mut url = base.clone();
+        let mut tokens = std::collections::HashSet::new();
+        let mut models = Vec::new();
+        loop {
+            let response = client
+                .get(url.clone())
+                .headers(headers.clone())
+                .send()
+                .await
+                .map_err(|error| format!("Request failed: {}", error.without_url()))?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = redact_model_fetch_error_body(
+                    response.text().await.unwrap_or_default(),
+                    known_secrets,
+                );
+                return Err(format!("HTTP {status}: {body}"));
+            }
+            let response: GoogleModelsResponse = response
+                .json()
+                .await
+                .map_err(|error| format!("Failed to parse response: {}", error.without_url()))?;
+            models.extend(
+                response
+                    .models
+                    .into_iter()
+                    .filter(|model| {
+                        model
+                            .supported_generation_methods
+                            .as_ref()
+                            .is_none_or(|methods| {
+                                methods.iter().any(|method| {
+                                    method == "generateContent" || method == "streamGenerateContent"
+                                })
+                            })
+                    })
+                    .map(|model| FetchedModel {
+                        id: model
+                            .name
+                            .strip_prefix("models/")
+                            .unwrap_or(&model.name)
+                            .to_string(),
+                        owned_by: Some("Google".to_string()),
+                        context_window: model.input_token_limit,
+                    }),
+            );
+            let Some(token) = response.next_page_token.filter(|token| !token.is_empty()) else {
+                break;
+            };
+            if tokens.len() >= 20 || !tokens.insert(token.clone()) {
+                return Err("Invalid or excessive Gemini model pagination".to_string());
+            }
+            url = base.clone();
+            let params: Vec<(String, String)> = url
+                .query_pairs()
+                .filter(|(name, _)| name != "pageToken")
+                .map(|(name, value)| (name.into_owned(), value.into_owned()))
+                .collect();
+            url.set_query(None);
+            url.query_pairs_mut()
+                .extend_pairs(params)
+                .append_pair("pageToken", &token);
+        }
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        models.dedup_by(|a, b| a.id == b.id);
+        Ok(models)
+    })
+    .await
+    .map_err(|_| "Model fetch timed out".to_string())?
+}
+
 fn redact_model_fetch_error_body(body: String, known_secrets: &[String]) -> String {
     truncate_body(crate::redact_known_secrets_strict(&body, known_secrets))
 }
@@ -320,6 +454,9 @@ fn build_model_fetch_headers(
         headers.insert(name, value);
     }
 
+    if api_format == Some("anthropic-messages") {
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    }
     if let Some(user_agent) = user_agent {
         headers.insert(USER_AGENT, user_agent.clone());
     }
@@ -456,6 +593,138 @@ fn ends_with_version_segment(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{extract::Query, routing::get, Json, Router};
+    use std::sync::{Arc, Mutex};
+
+    struct TestServer {
+        url: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl TestServer {
+        async fn new(router: Router) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            });
+            Self { url, task }
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    #[test]
+    fn google_model_urls_preserve_gateway_versions_and_query_parameters() {
+        for (input, expected) in [
+            ("https://example.com", "https://example.com/v1beta/models"),
+            ("https://example.com/gateway/v1beta/", "https://example.com/gateway/v1beta/models"),
+            ("https://example.com/gateway/v1", "https://example.com/gateway/v1/models"),
+            ("https://example.com/gateway/v1beta/models", "https://example.com/gateway/v1beta/models"),
+            ("https://example.com/gateway/v1beta/models/model-a:generateContent?tenant=a%2Fb", "https://example.com/gateway/v1beta/models?tenant=a%2Fb"),
+            ("https://example.com/gateway/v1beta/models/model-a:streamGenerateContent?alt=sse&tenant=one", "https://example.com/gateway/v1beta/models?tenant=one"),
+        ] {
+            assert_eq!(google_models_url(input, None).unwrap().as_str(), expected);
+        }
+        assert_eq!(
+            google_models_url(
+                "https://example.com",
+                Some("https://relay.example/catalog?tenant=one")
+            )
+            .unwrap()
+            .as_str(),
+            "https://relay.example/catalog?tenant=one"
+        );
+        assert!(google_models_url("file:///models", None).is_err());
+    }
+
+    #[tokio::test]
+    async fn google_models_use_native_auth_pagination_and_generation_filtering() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let observed = requests.clone();
+        let server = TestServer::new(Router::new().route(
+            "/gateway/v1beta/models",
+            get(move |headers: HeaderMap, Query(params): Query<HashMap<String, String>>| {
+                observed.lock().unwrap().push((headers, params.clone()));
+                async move {
+                    if params.contains_key("pageToken") {
+                        Json(serde_json::json!({ "models": [
+                            { "name": "models/model-a", "inputTokenLimit": 131072, "supportedGenerationMethods": ["generateContent"] },
+                            { "name": "models/model-b", "inputTokenLimit": 65536, "supportedGenerationMethods": ["streamGenerateContent"] },
+                            { "name": "models/model-c" }
+                        ] }))
+                    } else {
+                        Json(serde_json::json!({ "models": [
+                            { "name": "models/model-a", "inputTokenLimit": 131072, "supportedGenerationMethods": ["generateContent"] },
+                            { "name": "models/embedding-only", "supportedGenerationMethods": ["embedContent"] }
+                        ], "nextPageToken": "page 2/+?=" }))
+                    }
+                }
+            }),
+        )).await;
+        let models = fetch_models(
+            &format!("{}/gateway/v1beta?tenant=one", server.url),
+            "fake-google-key",
+            false,
+            None,
+            None,
+            Some("google-generative-ai"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["model-a", "model-b", "model-c"]
+        );
+        assert_eq!(models[0].context_window, Some(131072));
+        assert_eq!(models[1].context_window, Some(65536));
+        assert!(models
+            .iter()
+            .all(|model| model.owned_by.as_deref() == Some("Google")));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for (headers, params) in requests.iter() {
+            assert_eq!(headers["x-goog-api-key"], "fake-google-key");
+            assert!(!headers.contains_key(AUTHORIZATION));
+            assert_eq!(params.get("tenant").map(String::as_str), Some("one"));
+        }
+        assert!(!requests[0].1.contains_key("pageToken"));
+        assert_eq!(
+            requests[1].1.get("pageToken").map(String::as_str),
+            Some("page 2/+?=")
+        );
+    }
+
+    #[tokio::test]
+    async fn google_models_reject_repeating_page_tokens() {
+        let server = TestServer::new(Router::new().route(
+            "/v1beta/models",
+            get(|| async {
+                Json(serde_json::json!({ "models": [], "nextPageToken": "same-page" }))
+            }),
+        ))
+        .await;
+        let error = fetch_models(
+            &server.url,
+            "fake-key",
+            false,
+            None,
+            None,
+            Some("google-generative-ai"),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "Invalid or excessive Gemini model pagination");
+    }
 
     #[test]
     fn model_fetch_headers_follow_pi_api_format() {
@@ -463,6 +732,7 @@ mod tests {
             build_model_fetch_headers("anthropic-key", Some("anthropic-messages"), None, None)
                 .unwrap();
         assert_eq!(anthropic["x-api-key"], "anthropic-key");
+        assert_eq!(anthropic["anthropic-version"], "2023-06-01");
         assert!(!anthropic.contains_key(AUTHORIZATION));
 
         let google =

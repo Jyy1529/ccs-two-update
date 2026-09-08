@@ -214,7 +214,21 @@ pub fn is_proxy_enabled() -> bool {
 
 /// 构建 HTTP 客户端
 fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
+    build_client_with_redirect_policy(proxy_url, reqwest::redirect::Policy::default())
+}
+
+/// Isolated client with the current proxy settings and an explicit redirect policy.
+/// API debugging must expose redirects without forwarding a provider's API key.
+pub fn create_with_redirect_policy(policy: reqwest::redirect::Policy) -> Result<Client, String> {
+    build_client_with_redirect_policy(get_current_proxy_url().as_deref(), policy)
+}
+
+fn build_client_with_redirect_policy(
+    proxy_url: Option<&str>,
+    policy: reqwest::redirect::Policy,
+) -> Result<Client, String> {
     let mut builder = Client::builder()
+        .redirect(policy)
         .timeout(Duration::from_secs(600))
         .connect_timeout(Duration::from_secs(30))
         .pool_max_idle_per_host(10)

@@ -6,6 +6,7 @@ pub use model_validation::*;
 pub use app_management::*;
 pub use config_guard::*;
 
+mod api_request;
 mod auth;
 mod balance;
 mod codex_oauth;
@@ -45,6 +46,7 @@ mod usage;
 mod webdav_sync;
 mod workspace;
 
+pub use api_request::*;
 pub use auth::*;
 pub use balance::*;
 pub use codex_oauth::*;

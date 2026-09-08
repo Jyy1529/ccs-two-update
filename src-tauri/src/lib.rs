@@ -357,7 +357,7 @@ pub fn run() {
     // 设置 panic hook，在应用崩溃时记录日志到 <app_config_dir>/crash.log（默认 ~/.cc-switch/crash.log）
     panic_hook::setup_panic_hook();
 
-    let mut builder = tauri::Builder::default();
+    let mut builder = tauri::Builder::default().manage(commands::ApiRequestState::default());
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     {
@@ -1675,6 +1675,9 @@ pub fn run() {
             commands::stream_check_all_providers,
             commands::get_stream_check_config,
             commands::save_stream_check_config,
+            // Explicit provider API debugging
+            commands::execute_api_request,
+            commands::cancel_api_request,
             // Session manager
             commands::list_sessions,
             commands::get_session_messages,

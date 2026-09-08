@@ -16,6 +16,8 @@ import type { AppId } from "@/lib/api";
 import { authApi } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { ProviderActions } from "@/components/providers/ProviderActions";
+import { ApiRequestDialog } from "@/components/providers/ApiRequestDialog";
+import { API_REQUEST_APPS } from "@/utils/apiRequest";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import UsageFooter from "@/components/UsageFooter";
 import SubscriptionQuotaFooter from "@/components/SubscriptionQuotaFooter";
@@ -209,6 +211,7 @@ export function ProviderCard({
   onSetAsDefault,
 }: ProviderCardProps) {
   const { t } = useTranslation();
+  const [apiRequestOpen, setApiRequestOpen] = useState(false);
   const codexOfficialIdentity = resolveCodexOfficialIdentity(appId, provider);
   const managedCodexAccountId = resolveManagedAccountId(
     provider.meta,
@@ -717,6 +720,17 @@ export function ProviderCard({
                   ? () => onTest(provider)
                   : undefined
               }
+              onApiRequest={
+                API_REQUEST_APPS.includes(appId) &&
+                provider.category !== "official" &&
+                provider.category !== "cloud_provider" &&
+                !isAnyOmo &&
+                !isCopilot &&
+                !isCodexOauth &&
+                !isXaiOauth
+                  ? () => setApiRequestOpen(true)
+                  : undefined
+              }
               onConfigureUsage={
                 (isOfficial && !supportsOfficialSubscription) ||
                 isCopilot ||
@@ -764,6 +778,14 @@ export function ProviderCard({
             inline={false}
           />
         </div>
+      )}
+      {apiRequestOpen && (
+        <ApiRequestDialog
+          key={`${appId}:${provider.id}`}
+          provider={provider}
+          appId={appId}
+          onClose={() => setApiRequestOpen(false)}
+        />
       )}
     </div>
   );

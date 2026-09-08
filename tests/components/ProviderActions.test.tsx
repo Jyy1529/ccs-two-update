@@ -52,6 +52,28 @@ function renderPiActions({
 }
 
 describe("ProviderActions Pi provider switching", () => {
+  it("opens the API debugger without switching providers or running reachability checks", async () => {
+    const user = userEvent.setup();
+    const onApiRequest = vi.fn();
+    const onSwitch = vi.fn();
+    const onTest = vi.fn();
+    render(
+      <ProviderActions
+        appId="codex"
+        isCurrent
+        onSwitch={onSwitch}
+        onTest={onTest}
+        onApiRequest={onApiRequest}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "API 请求调试" }));
+    expect(onApiRequest).toHaveBeenCalledOnce();
+    expect(onSwitch).not.toHaveBeenCalled();
+    expect(onTest).not.toHaveBeenCalled();
+  });
+
   it("omits duplication when the caller disallows it", () => {
     render(
       <ProviderActions
